@@ -170,31 +170,30 @@ function showPlayerJoinScreen() {
   const nameInput = $('#nickname-input');
   const numInput = $('#student-number-input');
   const btn = $('#btn-join');
+  const errEl = $('#name-error');
 
   // Clear old state
   nameInput.value = '';
   numInput.value = '';
   btn.disabled = true;
-  const errEl = $('#name-error');
+  btn.textContent = 'Join Game';
   if (errEl) errEl.hidden = true;
 
   function checkReady() {
     btn.disabled = !(nameInput.value.trim() && numInput.value.trim());
   }
 
-  // Remove old listeners by cloning
-  const newName = nameInput.cloneNode(true);
-  const newNum = numInput.cloneNode(true);
-  const newBtn = btn.cloneNode(true);
-  nameInput.replaceWith(newName);
-  numInput.replaceWith(newNum);
-  btn.replaceWith(newBtn);
-
-  newName.addEventListener('input', checkReady);
-  newNum.addEventListener('input', checkReady);
-  newName.addEventListener('keydown', (e) => { if (e.key === 'Enter') newNum.focus(); });
-  newNum.addEventListener('keydown', (e) => { if (e.key === 'Enter' && newName.value.trim() && newNum.value.trim()) joinAsPlayer(); });
-  newBtn.addEventListener('click', joinAsPlayer);
+  nameInput.oninput = checkReady;
+  numInput.oninput = checkReady;
+  nameInput.onkeydown = (e) => {
+    if (e.key === 'Enter') numInput.focus();
+  };
+  numInput.onkeydown = (e) => {
+    if (e.key === 'Enter' && nameInput.value.trim() && numInput.value.trim()) {
+      joinAsPlayer();
+    }
+  };
+  btn.onclick = joinAsPlayer;
 
   // Back button
   $('#btn-back-subject').onclick = () => {
@@ -202,7 +201,7 @@ function showPlayerJoinScreen() {
     showScreen('screen-subject');
   };
 
-  newName.focus();
+  nameInput.focus();
 }
 
 var myPlayerName = '';
