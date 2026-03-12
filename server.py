@@ -568,12 +568,34 @@ class HybridTestRepository:
         self.local_custom_tests: dict[str, dict[str, dict[str, Any]]] = {}
         self.local_drafts: dict[tuple[str, str], dict[str, Any]] = {}
         self.local_lecturers: dict[str, dict[str, Any]] = {}
+        self.supabase_configured = False
+        self.supabase_error: str | None = None
         self._seed_builtin_tests()
 
         url = os.environ.get("SUPABASE_URL", "").strip()
         key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-        self.remote = SupabaseStore(url, key) if url and key else None
+        self.supabase_configured = bool(url and key)
+        self.remote = SupabaseStore(url, key) if self.supabase_configured else None
         self.storage_mode = "supabase" if self.remote else "in-memory"
+
+    def _handle_supabase_error(self, exc: RuntimeError) -> bool:
+        message = str(exc)
+        if "PGRST205" in message or "schema cache" in message:
+            self.supabase_error = message
+            self.remote = None
+            self.storage_mode = "in-memory"
+            return True
+        return False
+
+    def _call_remote(self, fn, fallback):
+        if self.remote is None:
+            return fallback()
+        try:
+            return fn()
+        except RuntimeError as exc:
+            if self._handle_supabase_error(exc):
+                return fallback()
+            raise
 
     def _seed_builtin_tests(self) -> None:
         for code, info in self.subjects.items():
@@ -598,10 +620,18 @@ class HybridTestRepository:
                 }
 
     def get_storage_status(self) -> dict[str, Any]:
+        if self.remote is None:
+            if self.supabase_configured and self.supabase_error:
+                note = "Supabase configured but schema is missing. Running in-memory until the schema is applied."
+            else:
+                note = "In-memory storage resets on redeploy/restart."
+        else:
+            note = "Supabase storage is active."
         return {
             "mode": self.storage_mode,
-            "supabaseConfigured": self.remote is not None,
-            "note": "Supabase storage is durable. In-memory storage resets on redeploy/restart." if self.remote is None else "Supabase storage is active.",
+            "supabaseConfigured": self.supabase_configured,
+            "note": note,
+            "supabaseError": self.supabase_error,
         }
 
     def _summary(self, row: dict[str, Any], lecturer_id: str | None = None) -> dict[str, Any]:
@@ -627,34 +657,41 @@ class HybridTestRepository:
 
     def get_lecturer_by_email(self, email: str) -> dict[str, Any] | None:
         email = email.strip().lower()
-        if self.remote is not None:
-            return self.remote.get_lecturer_by_email(email)
-        return self.local_lecturers.get(email)
+        return self._call_remote(
+            lambda: self.remote.get_lecturer_by_email(email),
+            lambda: self.local_lecturers.get(email)
+        )
 
     def get_lecturer_by_id(self, lecturer_id: str) -> dict[str, Any] | None:
-        if self.remote is not None:
-            return self.remote.get_lecturer_by_id(lecturer_id)
-        for row in self.local_lecturers.values():
-            if row["id"] == lecturer_id:
-                return {k: v for k, v in row.items() if k != "password_hash"}
-        return None
+        def _local_lookup():
+            for row in self.local_lecturers.values():
+                if row["id"] == lecturer_id:
+                    return {k: v for k, v in row.items() if k != "password_hash"}
+            return None
+        return self._call_remote(
+            lambda: self.remote.get_lecturer_by_id(lecturer_id),
+            _local_lookup
+        )
 
     def create_lecturer(self, payload: LecturerSignupPayload) -> dict[str, Any]:
         if self.get_lecturer_by_email(payload.email):
             raise ValueError("An account with that email already exists.")
         password_hash = hash_password(payload.password)
-        if self.remote is not None:
-            return self.remote.create_lecturer(payload.name, payload.email, password_hash)
-        row = {
-            "id": str(uuid.uuid4()),
-            "name": payload.name,
-            "email": payload.email,
-            "password_hash": password_hash,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat(),
-        }
-        self.local_lecturers[payload.email] = row
-        return {k: v for k, v in row.items() if k != "password_hash"}
+        def _local_create():
+            row = {
+                "id": str(uuid.uuid4()),
+                "name": payload.name,
+                "email": payload.email,
+                "password_hash": password_hash,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            self.local_lecturers[payload.email] = row
+            return {k: v for k, v in row.items() if k != "password_hash"}
+        return self._call_remote(
+            lambda: self.remote.create_lecturer(payload.name, payload.email, password_hash),
+            _local_create
+        )
 
     def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
         if subject_code not in self.subjects:
@@ -664,9 +701,10 @@ class HybridTestRepository:
         builtin_rows = list(self.builtin_tests.get(subject_code, {}).values())
         tests.extend(self._summary(row, lecturer_id) for row in builtin_rows)
 
-        remote_rows: list[dict[str, Any]] = []
-        if self.remote is not None:
-            remote_rows = self.remote.list_tests(subject_code, lecturer_id)
+        remote_rows = self._call_remote(
+            lambda: self.remote.list_tests(subject_code, lecturer_id),
+            lambda: []
+        )
         local_rows = list(self.local_custom_tests.get(subject_code, {}).values())
 
         tests.extend(self._summary(row, lecturer_id) for row in remote_rows)
@@ -682,92 +720,103 @@ class HybridTestRepository:
             row = self.local_custom_tests[subject_code][test_id]
             row["can_edit"] = bool(lecturer_id and row.get("created_by") == lecturer_id)
             return row
-        if self.remote is not None:
-            return self.remote.get_test(subject_code, test_id, lecturer_id)
-        return None
+        return self._call_remote(
+            lambda: self.remote.get_test(subject_code, test_id, lecturer_id),
+            lambda: None
+        )
 
     def create_test(self, subject_code: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
         if subject_code not in self.subjects:
             raise KeyError(subject_code)
-        if self.remote is not None:
+        def _local_create():
+            test_id = f"local:{uuid.uuid4()}"
+            row = {
+                "id": test_id,
+                "subject_code": subject_code,
+                "title": payload.title,
+                "chapter": payload.chapter,
+                "description": payload.description,
+                "question_count": len(payload.questions),
+                "questions": [q.model_dump() for q in payload.questions],
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+                "source": "in-memory",
+                "created_by": lecturer["id"],
+                "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
+            }
+            self.local_custom_tests.setdefault(subject_code, {})[test_id] = row
+            return row
+        def _remote_create():
             row = self.remote.create_test(subject_code, payload, lecturer)
             row.setdefault("question_count", len(payload.questions))
             row.setdefault("questions", [q.model_dump() for q in payload.questions])
             row.setdefault("owner_name", lecturer.get("name") or lecturer.get("email") or "Lecturer")
             row.setdefault("created_by", lecturer["id"])
             return row
-        test_id = f"local:{uuid.uuid4()}"
-        row = {
-            "id": test_id,
-            "subject_code": subject_code,
-            "title": payload.title,
-            "chapter": payload.chapter,
-            "description": payload.description,
-            "question_count": len(payload.questions),
-            "questions": [q.model_dump() for q in payload.questions],
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat(),
-            "source": "in-memory",
-            "created_by": lecturer["id"],
-            "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
-        }
-        self.local_custom_tests.setdefault(subject_code, {})[test_id] = row
-        return row
+        return self._call_remote(_remote_create, _local_create)
 
     def update_test(self, subject_code: str, test_id: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
         if test_id in self.builtin_tests.get(subject_code, {}):
             raise PermissionError("Built-in tests cannot be edited.")
-        if self.remote is not None:
+        def _local_update():
+            row = self.local_custom_tests.get(subject_code, {}).get(test_id)
+            if not row:
+                raise KeyError("Test not found")
+            if row.get("created_by") and row.get("created_by") != lecturer["id"]:
+                raise PermissionError("Only the lecturer who created this test can edit it.")
+            row.update({
+                "title": payload.title,
+                "chapter": payload.chapter,
+                "description": payload.description,
+                "question_count": len(payload.questions),
+                "questions": [q.model_dump() for q in payload.questions],
+                "updated_at": datetime.utcnow().isoformat(),
+            })
+            return row
+        def _remote_update():
             row = self.remote.update_test(subject_code, test_id, payload, lecturer)
             row.setdefault("question_count", len(payload.questions))
             row.setdefault("questions", [q.model_dump() for q in payload.questions])
             row.setdefault("owner_name", lecturer.get("name") or lecturer.get("email") or "Lecturer")
             row.setdefault("created_by", lecturer["id"])
             return row
-        row = self.local_custom_tests.get(subject_code, {}).get(test_id)
-        if not row:
-            raise KeyError("Test not found")
-        if row.get("created_by") and row.get("created_by") != lecturer["id"]:
-            raise PermissionError("Only the lecturer who created this test can edit it.")
-        row.update({
-            "title": payload.title,
-            "chapter": payload.chapter,
-            "description": payload.description,
-            "question_count": len(payload.questions),
-            "questions": [q.model_dump() for q in payload.questions],
-            "updated_at": datetime.utcnow().isoformat(),
-        })
-        return row
+        return self._call_remote(_remote_update, _local_update)
 
     def get_draft(self, subject_code: str, lecturer: dict[str, Any]) -> dict[str, Any] | None:
-        if self.remote is not None:
-            return self.remote.get_draft(subject_code, lecturer["id"])
-        return self.local_drafts.get((lecturer["id"], subject_code))
+        return self._call_remote(
+            lambda: self.remote.get_draft(subject_code, lecturer["id"]),
+            lambda: self.local_drafts.get((lecturer["id"], subject_code))
+        )
 
     def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> dict[str, Any]:
-        if self.remote is not None:
-            return self.remote.save_draft(subject_code, lecturer, payload)
-        row = {
-            "id": self.local_drafts.get((lecturer["id"], subject_code), {}).get("id", f"draft:{uuid.uuid4()}"),
-            "lecturer_id": lecturer["id"],
-            "subject_code": subject_code,
-            "title": payload.title,
-            "chapter": payload.chapter,
-            "description": payload.description,
-            "question_count": len(payload.questions),
-            "questions": [q.model_dump() for q in payload.questions],
-            "editing_test_id": payload.editingTestId,
-            "updated_at": datetime.utcnow().isoformat(),
-            "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
-        }
-        self.local_drafts[(lecturer["id"], subject_code)] = row
-        return row
+        def _local_save():
+            row = {
+                "id": self.local_drafts.get((lecturer["id"], subject_code), {}).get("id", f"draft:{uuid.uuid4()}"),
+                "lecturer_id": lecturer["id"],
+                "subject_code": subject_code,
+                "title": payload.title,
+                "chapter": payload.chapter,
+                "description": payload.description,
+                "question_count": len(payload.questions),
+                "questions": [q.model_dump() for q in payload.questions],
+                "editing_test_id": payload.editingTestId,
+                "updated_at": datetime.utcnow().isoformat(),
+                "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
+            }
+            self.local_drafts[(lecturer["id"], subject_code)] = row
+            return row
+        return self._call_remote(
+            lambda: self.remote.save_draft(subject_code, lecturer, payload),
+            _local_save
+        )
 
     def clear_draft(self, subject_code: str, lecturer: dict[str, Any]) -> None:
-        if self.remote is not None:
-            self.remote.clear_draft(subject_code, lecturer["id"])
-            return
-        self.local_drafts.pop((lecturer["id"], subject_code), None)
+        def _local_clear():
+            self.local_drafts.pop((lecturer["id"], subject_code), None)
+        return self._call_remote(
+            lambda: self.remote.clear_draft(subject_code, lecturer["id"]),
+            _local_clear
+        )
 
 
 repo = HybridTestRepository(SUBJECTS)
