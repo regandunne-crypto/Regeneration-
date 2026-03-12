@@ -700,6 +700,23 @@ async def websocket_endpoint(websocket: WebSocket):
                     "players": get_player_list(room)
                 })
 
+            elif action == "player_leave":
+                if role != "player" or room is None:
+                    continue
+
+                if visitor_id in room.players:
+                    room.players.pop(visitor_id, None)
+
+                await websocket.send_text(json.dumps({
+                    "type": "left"
+                }))
+                await send_to_host(room, {
+                    "type": "player_update",
+                    "players": get_player_list(room)
+                })
+                await websocket.close()
+                break
+
             elif action == "answer":
                 if role != "player" or room is None or room.phase != "question":
                     continue

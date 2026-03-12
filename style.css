@@ -1471,3 +1471,9 @@ body::before {
   0%, 100% { opacity: 0.7; }
   50% { opacity: 1; }
 }
+
+
+.lobby-leave-link {
+  margin-top: 0;
+  font-size: var(--text-sm);
+}

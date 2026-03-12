@@ -17,6 +17,7 @@ const API_BASE = location.origin;
 
 const $ = (sel) => document.querySelector(sel);
 let ws = null;
+let wsAllowReconnect = true;
 let isHost = false;
 let myPlayerId = null;
 let timerInterval = null;
@@ -50,6 +51,8 @@ function connectWS(onOpen) {
   if (onOpen) wsOnOpen = onOpen;
   if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
 
+  wsAllowReconnect = true;
+
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     if (ws.readyState === WebSocket.OPEN && wsOnOpen) wsOnOpen();
     return;
@@ -68,9 +71,12 @@ function connectWS(onOpen) {
   };
 
   ws.onclose = () => {
-    console.log('WS disconnected, reconnecting in 3s...');
+    console.log('WS disconnected');
     ws = null;
-    wsReconnectTimer = setTimeout(() => connectWS(), 3000);
+    if (wsAllowReconnect) {
+      console.log('Reconnecting in 3s...');
+      wsReconnectTimer = setTimeout(() => connectWS(), 3000);
+    }
   };
 
   ws.onerror = () => {};
@@ -80,6 +86,22 @@ function send(msg) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(msg));
   }
+}
+
+function closeWS({ reconnect = false } = {}) {
+  wsAllowReconnect = reconnect;
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+  if (ws) {
+    try {
+      ws.onclose = null;
+      ws.close();
+    } catch (e) {}
+    ws = null;
+  }
+  wsOnOpen = null;
 }
 
 
@@ -180,11 +202,20 @@ function showPlayerJoinScreen() {
   if (errEl) errEl.hidden = true;
 
   function checkReady() {
-    btn.disabled = !(nameInput.value.trim() && numInput.value.trim());
+    const ready = !!(nameInput.value.trim() && numInput.value.trim());
+    btn.disabled = !ready;
+    btn.setAttribute('aria-disabled', String(!ready));
   }
 
-  nameInput.oninput = checkReady;
-  numInput.oninput = checkReady;
+  const bindCheck = (el) => {
+    ['input', 'change', 'keyup', 'blur'].forEach(evt => {
+      el.addEventListener(evt, checkReady);
+    });
+  };
+
+  bindCheck(nameInput);
+  bindCheck(numInput);
+
   nameInput.onkeydown = (e) => {
     if (e.key === 'Enter') numInput.focus();
   };
@@ -200,6 +231,13 @@ function showPlayerJoinScreen() {
     selectedSubject = null;
     showScreen('screen-subject');
   };
+
+  // Some browsers restore/autofill values after the screen appears,
+  // so run a few delayed checks as well.
+  checkReady();
+  setTimeout(checkReady, 0);
+  setTimeout(checkReady, 150);
+  setTimeout(checkReady, 600);
 
   nameInput.focus();
 }
@@ -229,6 +267,20 @@ function joinAsPlayer() {
   });
 }
 
+function leaveLobby() {
+  try {
+    send({ action: 'player_leave' });
+  } catch (e) {}
+
+  closeWS({ reconnect: false });
+  myPlayerId = null;
+  myPlayerName = '';
+  myStudentNumber = '';
+  selectedSubject = null;
+  showScreen('screen-subject');
+  initPlayer();
+}
+
 function handlePlayerMessage(msg) {
   switch (msg.type) {
     case 'name_taken':
@@ -249,6 +301,10 @@ function handlePlayerMessage(msg) {
       $('#lobby-player-name').textContent = myPlayerName;
       $('#lobby-p-count').textContent = msg.playerCount;
       $('#lobby-subject-badge').textContent = `${selectedSubject.name} (${selectedSubject.code})`;
+      const leaveBtn = $('#btn-leave-lobby');
+      if (leaveBtn) {
+        leaveBtn.onclick = leaveLobby;
+      }
       if (msg.phase === 'lobby') {
         showScreen('screen-lobby-player');
       }
@@ -426,11 +482,7 @@ async function initHost() {
 
   // Close any existing WS when re-entering host subject selection
   if (ws) {
-    if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
-    const oldWs = ws;
-    ws = null;
-    oldWs.onclose = null;
-    oldWs.close();
+    closeWS({ reconnect: false });
   }
 
   showScreen('screen-host-subject');
