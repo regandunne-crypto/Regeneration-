@@ -559,6 +559,62 @@ def get_leaderboard(room: GameRoom):
     return players
 
 
+async def cancel_question_timer(room: GameRoom):
+    if room.question_timer_task and not room.question_timer_task.done():
+        room.question_timer_task.cancel()
+        try:
+            await room.question_timer_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+    room.question_timer_task = None
+
+
+async def return_room_to_lobby(room: GameRoom, *, keep_players: bool):
+    await cancel_question_timer(room)
+
+    room.phase = "lobby"
+    room.current_q = 0
+    room.question_start_time = 0
+    room.answers_this_round = {}
+
+    if keep_players:
+        for player in room.players.values():
+            player["score"] = 0
+            player["streak"] = 0
+            player["answers"] = []
+        await broadcast_to_players(room, {
+            "type": "reset",
+            "phase": "lobby",
+            "playerCount": len(room.players)
+        })
+    else:
+        await broadcast_to_players(room, {"type": "reset", "phase": "lobby", "playerCount": 0})
+        room.players = {}
+
+    await send_to_host(room, {
+        "type": "host_joined",
+        "phase": "lobby",
+        "players": get_player_list(room),
+        "currentQ": 0,
+        "totalQ": room.total_q,
+        "subjectCode": room.subject_code,
+        "subjectName": room.subject_name,
+        "hasQuestions": room.total_q > 0,
+        "hasStats": room.last_game_stats is not None
+    })
+
+
+async def force_end_game(room: GameRoom):
+    await cancel_question_timer(room)
+    room.phase = "final"
+    room.archive_stats()
+    lb = get_leaderboard(room)
+    await broadcast_to_players(room, {"type": "final", "leaderboard": lb})
+    await send_to_host(room, {"type": "final", "leaderboard": lb, "hasStats": True})
+
+
 # ─── WebSocket Endpoint ───
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -627,26 +683,19 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == "reset_game":
                 if role != "host" or room is None:
                     continue
-                if room.question_timer_task and not room.question_timer_task.done():
-                    room.question_timer_task.cancel()
-                # Archive stats before clearing
+                # Archive stats before clearing the room completely
                 room.archive_stats()
-                await broadcast_to_players(room, {"type": "reset", "phase": "lobby"})
-                room.phase = "lobby"
-                room.current_q = 0
-                room.players = {}
-                room.answers_this_round = {}
-                await send_to_host(room, {
-                    "type": "host_joined",
-                    "phase": "lobby",
-                    "players": get_player_list(room),
-                    "currentQ": 0,
-                    "totalQ": room.total_q,
-                    "subjectCode": room.subject_code,
-                    "subjectName": room.subject_name,
-                    "hasQuestions": room.total_q > 0,
-                    "hasStats": room.last_game_stats is not None
-                })
+                await return_room_to_lobby(room, keep_players=False)
+
+            elif action == "cancel_game":
+                if role != "host" or room is None:
+                    continue
+                await return_room_to_lobby(room, keep_players=True)
+
+            elif action == "end_game":
+                if role != "host" or room is None:
+                    continue
+                await force_end_game(room)
 
             # ─── PLAYER actions ───
             elif action == "player_join":
@@ -787,7 +836,10 @@ async def websocket_endpoint(websocket: WebSocket):
         if role == "host" and room:
             room.host_ws = None
         elif role == "player" and room and visitor_id in room.players:
-            room.players[visitor_id]["ws"] = None
+            if room.phase == "lobby":
+                room.players.pop(visitor_id, None)
+            else:
+                room.players[visitor_id]["ws"] = None
             await send_to_host(room, {
                 "type": "player_update",
                 "players": get_player_list(room)
@@ -796,7 +848,10 @@ async def websocket_endpoint(websocket: WebSocket):
         if role == "host" and room:
             room.host_ws = None
         elif role == "player" and room and visitor_id in room.players:
-            room.players[visitor_id]["ws"] = None
+            if room.phase == "lobby":
+                room.players.pop(visitor_id, None)
+            else:
+                room.players[visitor_id]["ws"] = None
 
 
 async def send_question(room: GameRoom):
@@ -882,12 +937,7 @@ async def auto_reveal(room: GameRoom):
 async def advance_to_next(room: GameRoom):
     room.current_q += 1
     if room.current_q >= room.total_q:
-        room.phase = "final"
-        # Archive stats automatically when game ends
-        room.archive_stats()
-        lb = get_leaderboard(room)
-        await broadcast_to_players(room, {"type": "final", "leaderboard": lb})
-        await send_to_host(room, {"type": "final", "leaderboard": lb, "hasStats": True})
+        await force_end_game(room)
     else:
         room.phase = "get_ready"
         await broadcast_to_players(room, {"type": "get_ready", "qNum": room.current_q + 1, "totalQ": room.total_q})

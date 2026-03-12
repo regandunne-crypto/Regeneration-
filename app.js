@@ -272,13 +272,15 @@ function leaveLobby() {
     send({ action: 'player_leave' });
   } catch (e) {}
 
-  closeWS({ reconnect: false });
-  myPlayerId = null;
-  myPlayerName = '';
-  myStudentNumber = '';
-  selectedSubject = null;
-  showScreen('screen-subject');
-  initPlayer();
+  setTimeout(() => {
+    closeWS({ reconnect: false });
+    myPlayerId = null;
+    myPlayerName = '';
+    myStudentNumber = '';
+    selectedSubject = null;
+    showScreen('screen-subject');
+    initPlayer();
+  }, 150);
 }
 
 function handlePlayerMessage(msg) {
@@ -339,6 +341,12 @@ function handlePlayerMessage(msg) {
       break;
 
     case 'reset':
+      if (typeof msg.playerCount === 'number') {
+        $('#lobby-p-count').textContent = msg.playerCount;
+      }
+      if (selectedSubject) {
+        $('#lobby-subject-badge').textContent = `${selectedSubject.name} (${selectedSubject.code})`;
+      }
       showScreen('screen-lobby-player');
       break;
   }
@@ -547,6 +555,35 @@ function startHostForSubject() {
     send({ action: 'next_question' });
   });
 
+  const bindEndGame = (selector) => {
+    const btn = $(selector);
+    if (!btn) return;
+    const newBtn = btn.cloneNode(true);
+    btn.replaceWith(newBtn);
+    newBtn.addEventListener('click', () => {
+      if (confirm('End the game now and show the final leaderboard?')) {
+        send({ action: 'end_game' });
+      }
+    });
+  };
+
+  const bindCancelGame = (selector) => {
+    const btn = $(selector);
+    if (!btn) return;
+    const newBtn = btn.cloneNode(true);
+    btn.replaceWith(newBtn);
+    newBtn.addEventListener('click', () => {
+      if (confirm('Cancel this game and return everyone to the lobby?')) {
+        send({ action: 'cancel_game' });
+      }
+    });
+  };
+
+  bindCancelGame('#btn-cancel-game');
+  bindCancelGame('#btn-cancel-game-reveal');
+  bindEndGame('#btn-end-game');
+  bindEndGame('#btn-end-game-reveal');
+
   const playAgainBtn = $('#btn-play-again');
   const newPlayAgain = playAgainBtn.cloneNode(true);
   playAgainBtn.replaceWith(newPlayAgain);
@@ -646,6 +683,10 @@ function handleHostMessage(msg) {
 
     case 'final':
       hostShowFinal(msg.leaderboard);
+      const finalStatsBtn = $('#btn-download-stats-final');
+      if (finalStatsBtn && msg.hasStats !== undefined) {
+        finalStatsBtn.hidden = !msg.hasStats;
+      }
       break;
   }
 }
@@ -680,6 +721,8 @@ function updateHostLobby(players) {
 
 function hostGetReady(qNum, totalQ) {
   showScreen('screen-host-question');
+  const controls = $('#host-live-controls');
+  if (controls) controls.style.display = 'flex';
   $('#host-q-num').textContent = `Q${qNum} / ${totalQ}`;
   $('#host-timer').textContent = '...';
   $('#host-q-text').textContent = 'Get Ready...';
@@ -696,6 +739,8 @@ var hostCurrentQuestion = '';
 
 function hostShowQuestion(msg) {
   showScreen('screen-host-question');
+  const controls = $('#host-live-controls');
+  if (controls) controls.style.display = 'flex';
   $('#host-q-num').textContent = `Q${msg.qNum} / ${msg.totalQ}`;
   $('#host-q-text').textContent = msg.question;
   $('#host-answered-count').textContent = '0';
@@ -730,6 +775,8 @@ function hostShowQuestion(msg) {
 function hostShowReveal(msg) {
   if (hostTimerInterval) { clearInterval(hostTimerInterval); hostTimerInterval = null; }
   showScreen('screen-host-reveal');
+  const controls = $('#host-reveal-controls');
+  if (controls) controls.style.display = 'flex';
 
   const answerEl = $('#host-reveal-answer');
   if (answerEl && hostCurrentOptions.length > 0) {
