@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<!--
+   ______                            __
+  / ____/___  ____ ___  ____  __  __/ /____  _____
+ / /   / __ \/ __ `__ \/ __ \/ / / / __/ _ \/ ___/
+/ /___/ /_/ / / / / / / /_/ / /_/ / /_/  __/ /
+\____/\____/_/ /_/ /_/ .___/\__,_/\__/\___/_/
+                    /_/
+        Created with Perplexity Computer
+        https://www.perplexity.ai/computer
+-->
+<meta name="generator" content="Perplexity Computer">
+<meta name="author" content="Perplexity Computer">
+<meta property="og:see_also" content="https://www.perplexity.ai/computer">
+<link rel="author" href="https://www.perplexity.ai/computer">
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Engineering Quiz</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- ==================== SUBJECT SELECTION ==================== -->
+  <div id="screen-subject" class="screen active">
+    <div class="subject-container">
+      <div class="logo-area">
+        <svg class="logo-icon" viewBox="0 0 64 64" width="72" height="72" fill="none" aria-label="Engineering Quiz Logo">
+          <rect x="8" y="48" width="48" height="6" rx="2" fill="var(--accent-blue)"/>
+          <polygon points="32,8 12,48 52,48" stroke="var(--accent-yellow)" stroke-width="3" fill="none" stroke-linejoin="round"/>
+          <line x1="32" y1="8" x2="32" y2="48" stroke="var(--accent-red)" stroke-width="2" stroke-dasharray="4 3"/>
+          <circle cx="32" cy="32" r="4" fill="var(--accent-green)"/>
+        </svg>
+        <h1 class="game-title">Engineering Quiz</h1>
+        <p class="game-subtitle">Select your subject to begin</p>
+      </div>
+      <div class="subject-list" id="subject-list">
+        <!-- Populated by JS -->
+      </div>
+      <button id="btn-host-link" class="host-link">Lecturer? Host a game</button>
+    </div>
+  </div>
+
+  <!-- ==================== PLAYER SCREENS ==================== -->
+
+  <!-- PLAYER: Join (name + student number) -->
+  <div id="screen-join" class="screen">
+    <div class="join-container">
+      <div class="logo-area">
+        <h2 class="join-subject-title" id="join-subject-title"></h2>
+        <p class="join-subject-code" id="join-subject-code"></p>
+      </div>
+      <div class="join-form">
+        <label for="nickname-input" class="input-label">Your Name</label>
+        <input type="text" id="nickname-input" class="nickname-input" placeholder="e.g. John" maxlength="20" autocomplete="off" spellcheck="false">
+
+        <label for="student-number-input" class="input-label">Student Number</label>
+        <input type="text" id="student-number-input" class="nickname-input" placeholder="e.g. 221012345" maxlength="20" autocomplete="off" spellcheck="false">
+
+        <p id="name-error" class="name-error" hidden></p>
+        <button id="btn-join" class="btn btn-primary" disabled>Join Game</button>
+      </div>
+      <button id="btn-back-subject" class="back-link">&larr; Change subject</button>
+    </div>
+  </div>
+
+  <!-- PLAYER: Waiting in lobby -->
+  <div id="screen-lobby-player" class="screen">
+    <div class="lobby-player-container">
+      <div class="pulse-ring"></div>
+      <h2 class="lobby-player-name" id="lobby-player-name"></h2>
+      <p class="lobby-player-msg">You're in. Waiting for the lecturer to start the game...</p>
+      <p class="lobby-player-count"><span id="lobby-p-count">0</span> players connected</p>
+      <p class="lobby-subject-badge" id="lobby-subject-badge"></p>
+    </div>
+  </div>
+
+  <!-- PLAYER: Get Ready countdown -->
+  <div id="screen-ready" class="screen">
+    <div class="ready-container">
+      <p class="ready-label">Get Ready</p>
+      <div class="ready-count" id="ready-count">3</div>
+      <p class="ready-question-num" id="ready-q-num">Question 1 of 15</p>
+    </div>
+  </div>
+
+  <!-- PLAYER: Question -->
+  <div id="screen-question" class="screen">
+    <div class="question-header">
+      <div class="q-progress">
+        <span id="q-number">1</span> / <span id="q-total">15</span>
+      </div>
+      <div class="timer-bar-wrapper">
+        <div class="timer-bar" id="timer-bar"></div>
+      </div>
+      <div class="timer-text" id="timer-text">30</div>
+    </div>
+    <div class="question-body">
+      <h2 class="question-text" id="question-text"></h2>
+    </div>
+    <div class="answers-grid" id="answers-grid"></div>
+  </div>
+
+  <!-- PLAYER: Answer Result -->
+  <div id="screen-result" class="screen">
+    <div class="result-container">
+      <div class="result-icon" id="result-icon"></div>
+      <h2 class="result-text" id="result-text"></h2>
+      <p class="result-detail" id="result-detail"></p>
+      <div class="result-score">
+        <span class="score-label">Your Score</span>
+        <span class="score-value" id="result-score-value">0</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- PLAYER: Leaderboard (between questions) -->
+  <div id="screen-leaderboard" class="screen">
+    <div class="leaderboard-container">
+      <h2 class="leaderboard-title">Leaderboard</h2>
+      <div class="leaderboard-list" id="leaderboard-list"></div>
+      <p class="leaderboard-next">Next question coming up...</p>
+    </div>
+  </div>
+
+  <!-- PLAYER: Final Results -->
+  <div id="screen-final" class="screen">
+    <div class="final-container">
+      <div class="trophy-icon">
+        <svg viewBox="0 0 80 80" width="96" height="96" fill="none">
+          <path d="M20 16h40v24c0 11-9 20-20 20s-20-9-20-20V16z" fill="var(--accent-yellow)" opacity="0.9"/>
+          <path d="M20 24H8c0 10 5 16 12 18" stroke="var(--accent-yellow)" stroke-width="3" fill="none"/>
+          <path d="M60 24h12c0 10-5 16-12 18" stroke="var(--accent-yellow)" stroke-width="3" fill="none"/>
+          <rect x="30" y="60" width="20" height="6" rx="2" fill="var(--accent-yellow)" opacity="0.7"/>
+          <rect x="24" y="66" width="32" height="6" rx="2" fill="var(--accent-yellow)" opacity="0.5"/>
+        </svg>
+      </div>
+      <h2 class="final-title" id="final-title">Game Over</h2>
+      <div class="final-podium" id="final-podium"></div>
+      <div class="final-full-list" id="final-full-list"></div>
+    </div>
+  </div>
+
+
+  <!-- ==================== HOST SCREENS ==================== -->
+
+  <!-- HOST: Subject Selection -->
+  <div id="screen-host-subject" class="screen">
+    <div class="subject-container">
+      <div class="logo-area">
+        <h1 class="game-title">Lecturer Panel</h1>
+        <p class="game-subtitle">Select a subject to host</p>
+      </div>
+      <div class="subject-list" id="host-subject-list">
+        <!-- Populated by JS -->
+      </div>
+      <button id="btn-back-player" class="back-link">&larr; Back to student view</button>
+    </div>
+  </div>
+
+  <!-- HOST: Lobby -->
+  <div id="screen-host-lobby" class="screen">
+    <div class="host-lobby-container">
+      <div class="host-header">
+        <h1 class="host-title" id="host-lobby-title">Engineering Quiz</h1>
+        <p class="host-subtitle" id="host-lobby-subtitle">Lecturer Control Panel</p>
+      </div>
+      <div class="host-columns">
+        <div class="host-qr-panel">
+          <p class="qr-label">Students scan to join</p>
+          <div id="qr-code"></div>
+          <p class="qr-url" id="qr-url-text"></p>
+        </div>
+        <div class="host-players-panel">
+          <h3 class="host-panel-title">Players <span class="player-count-badge" id="host-player-count">0</span></h3>
+          <div class="host-player-list" id="host-player-list">
+            <p class="empty-msg">Waiting for students to join...</p>
+          </div>
+        </div>
+      </div>
+      <div class="host-lobby-actions">
+        <button id="btn-start-game" class="btn btn-primary btn-large" disabled>Start Game</button>
+        <button id="btn-download-stats" class="btn btn-secondary btn-stats" hidden>Download Previous Stats</button>
+        <button id="btn-change-subject" class="btn btn-secondary">Change Subject</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- HOST: Question view -->
+  <div id="screen-host-question" class="screen">
+    <div class="host-question-container">
+      <div class="host-q-header">
+        <span class="host-q-num" id="host-q-num">Q1 / 15</span>
+        <span class="host-timer" id="host-timer">30</span>
+      </div>
+      <div class="host-q-timer-bar">
+        <div class="timer-bar" id="host-timer-bar"></div>
+      </div>
+      <h2 class="host-q-text" id="host-q-text"></h2>
+      <div class="host-answers" id="host-answers"></div>
+      <div class="host-answer-progress">
+        <span id="host-answered-count">0</span> / <span id="host-total-players">0</span> answered
+      </div>
+    </div>
+  </div>
+
+  <!-- HOST: Reveal + Leaderboard -->
+  <div id="screen-host-reveal" class="screen">
+    <div class="host-reveal-container">
+      <div class="host-reveal-top">
+        <div class="host-reveal-answer-panel">
+          <h3 class="host-reveal-section-title">Correct Answer</h3>
+          <div id="host-reveal-answer"></div>
+          <p class="host-reveal-explanation" id="host-reveal-explanation"></p>
+        </div>
+        <div class="host-reveal-leaderboard-panel">
+          <h3 class="host-reveal-section-title">Leaderboard</h3>
+          <div class="host-reveal-leaderboard" id="host-reveal-leaderboard"></div>
+        </div>
+      </div>
+      <button id="btn-next-question" class="btn btn-primary btn-large" style="display:none;">Next Question</button>
+      <p id="host-auto-countdown" class="auto-countdown" style="display:none;"></p>
+    </div>
+  </div>
+
+  <!-- HOST: Final -->
+  <div id="screen-host-final" class="screen">
+    <div class="final-container">
+      <div class="trophy-icon">
+        <svg viewBox="0 0 80 80" width="96" height="96" fill="none">
+          <path d="M20 16h40v24c0 11-9 20-20 20s-20-9-20-20V16z" fill="var(--accent-yellow)" opacity="0.9"/>
+          <path d="M20 24H8c0 10 5 16 12 18" stroke="var(--accent-yellow)" stroke-width="3" fill="none"/>
+          <path d="M60 24h12c0 10-5 16-12 18" stroke="var(--accent-yellow)" stroke-width="3" fill="none"/>
+          <rect x="30" y="60" width="20" height="6" rx="2" fill="var(--accent-yellow)" opacity="0.7"/>
+          <rect x="24" y="66" width="32" height="6" rx="2" fill="var(--accent-yellow)" opacity="0.5"/>
+        </svg>
+      </div>
+      <h2 class="final-title">Final Results</h2>
+      <div class="final-podium" id="host-final-podium"></div>
+      <div class="final-full-list" id="host-final-list"></div>
+      <div class="host-final-actions">
+        <button id="btn-download-stats-final" class="btn btn-secondary btn-stats">Download Stats (Excel)</button>
+        <button id="btn-play-again" class="btn btn-primary btn-large">New Game</button>
+        <button id="btn-change-subject-final" class="btn btn-secondary">Change Subject</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Passcode Modal -->
+<div id="passcode-modal" class="modal-overlay" hidden>
+  <div class="modal-box">
+    <h3 class="modal-title">Lecturer Access</h3>
+    <p class="modal-desc">Enter the passcode to host a game</p>
+    <input type="password" id="passcode-input" class="nickname-input" placeholder="Passcode" maxlength="30" autocomplete="off">
+    <p id="passcode-error" class="modal-error" hidden>Incorrect passcode</p>
+    <div class="modal-actions">
+      <button id="btn-passcode-cancel" class="btn modal-btn-cancel">Cancel</button>
+      <button id="btn-passcode-submit" class="btn btn-primary modal-btn-submit">Enter</button>
+    </div>
+  </div>
+</div>
+
+<footer class="site-footer">
+  <a href="https://www.perplexity.ai/computer" target="_blank" rel="noopener noreferrer">Created with Perplexity Computer</a>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>
