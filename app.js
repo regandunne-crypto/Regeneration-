@@ -1,7 +1,6 @@
 /* ============================================================
    Engineering Quiz — Multi-subject real-time multiplayer quiz
-   Host (lecturer): /#host → subject selection → lobby
-   Player (student): / → subject selection → name+student# → lobby
+   Extended host flow: subject → saved test → lobby/game.
    ============================================================ */
 
 const SHAPES = ['◆', '●', '▲', '■'];
@@ -10,7 +9,6 @@ const TIME_PER_Q = 30;
 const HOST_PASSCODE = 'Regan@1990';
 const HOST_AUTH_KEY = 'engineering_quiz_host_auth';
 
-// WebSocket/API URLs — same-origin for both local runs and Render deployments
 const WS_PROTOCOL = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const WS_URL = `${WS_PROTOCOL}//${location.host}/ws`;
 const API_BASE = location.origin;
@@ -18,39 +16,43 @@ const API_BASE = location.origin;
 const $ = (sel) => document.querySelector(sel);
 let ws = null;
 let wsAllowReconnect = true;
+let wsOnOpen = null;
+let wsReconnectTimer = null;
 let isHost = false;
 let myPlayerId = null;
+let myPlayerName = '';
+let myStudentNumber = '';
 let timerInterval = null;
+let hostTimerInterval = null;
 let timeLeft = TIME_PER_Q;
-let selectedSubject = null; // {code, name, questionCount}
+let selectedSubject = null;
+let selectedTest = null;
+let storageInfo = null;
+let hostSubjectCode = null;
+let hostCorrectAnswer = -1;
+let hostCurrentOptions = [];
+let hostCurrentQuestion = '';
+let playerAnswered = false;
 
-// Subject colors for the cards
 const SUBJECT_COLORS = {
-  'MEC105B': { bg: 'var(--accent-blue)', icon: '⚙️' },
+  MEC105B: { bg: 'var(--accent-blue)', icon: '⚙️' },
   '1EM105B': { bg: 'var(--accent-purple)', icon: '🔧' },
-  'DYN317B': { bg: 'var(--accent-orange)', icon: '🚀' }
+  DYN317B: { bg: 'var(--accent-orange)', icon: '🚀' }
 };
-
-// Default fallback for unknown subjects
 const DEFAULT_SUBJECT_COLOR = { bg: 'var(--accent-green)', icon: '📚' };
 
-
-// ─── Screen management ───
 function showScreen(id) {
-  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.screen').forEach((s) => s.classList.remove('active'));
   const el = $(`#${id}`);
   if (el) el.classList.add('active');
 }
 
-
-// ─── WebSocket connection ───
-let wsOnOpen = null;
-let wsReconnectTimer = null;
-
 function connectWS(onOpen) {
   if (onOpen) wsOnOpen = onOpen;
-  if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
-
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
   wsAllowReconnect = true;
 
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
@@ -59,26 +61,19 @@ function connectWS(onOpen) {
   }
 
   ws = new WebSocket(WS_URL);
-
   ws.onopen = () => {
-    console.log('WS connected');
     if (wsOnOpen) wsOnOpen();
   };
-
   ws.onmessage = (evt) => {
     const msg = JSON.parse(evt.data);
     handleMessage(msg);
   };
-
   ws.onclose = () => {
-    console.log('WS disconnected');
     ws = null;
     if (wsAllowReconnect) {
-      console.log('Reconnecting in 3s...');
       wsReconnectTimer = setTimeout(() => connectWS(), 3000);
     }
   };
-
   ws.onerror = () => {};
 }
 
@@ -104,10 +99,10 @@ function closeWS({ reconnect = false } = {}) {
   wsOnOpen = null;
 }
 
-
-// ─── Route messages ───
 function handleMessage(msg) {
   if (msg.type === 'error') {
+    showInlineStatus('#host-library-status', msg.message, true);
+    showInlineStatus('#host-create-status', msg.message, true);
     console.error('Server error:', msg.message);
     return;
   }
@@ -118,31 +113,62 @@ function handleMessage(msg) {
   }
 }
 
+function showInlineStatus(selector, text, isError = false) {
+  const el = $(selector);
+  if (!el) return;
+  el.textContent = text || '';
+  el.hidden = !text;
+  el.classList.toggle('error-text', !!isError);
+  el.classList.toggle('success-text', !isError && !!text);
+}
 
-// ════════════════════════════════════════════════════════════
-//  SUBJECT SELECTION (shared logic)
-// ════════════════════════════════════════════════════════════
+async function apiGet(path) {
+  const resp = await fetch(`${API_BASE}${path}`);
+  const data = await resp.json();
+  if (!resp.ok) {
+    throw new Error(data.detail || data.error || 'Request failed');
+  }
+  return data;
+}
+
+async function apiPost(path, payload) {
+  const resp = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    const detail = Array.isArray(data.detail)
+      ? data.detail.map((item) => item.msg || JSON.stringify(item)).join(' ')
+      : (data.detail || data.error || 'Request failed');
+    throw new Error(detail);
+  }
+  return data;
+}
 
 function renderSubjectCards(containerId, subjects, onSelect) {
   const container = $(`#${containerId}`);
   container.innerHTML = '';
-
-  subjects.forEach(sub => {
+  subjects.forEach((sub) => {
     const colors = SUBJECT_COLORS[sub.code] || DEFAULT_SUBJECT_COLOR;
     const card = document.createElement('button');
     card.className = 'subject-card';
     card.style.setProperty('--card-accent', colors.bg);
 
-    const qCountText = sub.questionCount > 0
-      ? `${sub.questionCount} questions`
-      : 'No questions yet';
+    let metaText = '';
+    if (typeof sub.testCount === 'number') {
+      metaText = sub.testCount === 1 ? '1 saved test' : `${sub.testCount} saved tests`;
+    } else {
+      metaText = sub.questionCount > 0 ? `${sub.questionCount} questions` : 'No questions yet';
+    }
 
     card.innerHTML = `
       <span class="subject-icon">${colors.icon}</span>
       <div class="subject-info">
         <span class="subject-name">${escapeHtml(sub.name)}</span>
         <span class="subject-code-label">${escapeHtml(sub.code)}</span>
-        <span class="subject-q-count">${qCountText}</span>
+        <span class="subject-q-count">${escapeHtml(metaText)}</span>
       </div>
       <span class="subject-arrow">→</span>
     `;
@@ -153,53 +179,86 @@ function renderSubjectCards(containerId, subjects, onSelect) {
 
 async function loadSubjects() {
   try {
-    const resp = await fetch(`${API_BASE}/api/subjects`);
-    if (resp.ok) return await resp.json();
+    return await apiGet('/api/subjects');
   } catch (e) {
-    console.error('Failed to load subjects:', e);
+    console.error(e);
+    return [
+      { code: 'MEC105B', name: 'Mechanics', questionCount: 15, testCount: 1 },
+      { code: '1EM105B', name: 'Mechanics', questionCount: 0, testCount: 0 },
+      { code: 'DYN317B', name: 'Dynamics', questionCount: 0, testCount: 0 }
+    ];
   }
-  // Fallback: hardcoded subjects (in case API isn't up yet)
-  return [
-    { code: 'MEC105B', name: 'Mechanics', questionCount: 15 },
-    { code: '1EM105B', name: 'Mechanics', questionCount: 0 },
-    { code: 'DYN317B', name: 'Dynamics', questionCount: 0 }
-  ];
 }
 
+async function loadTests(subjectCode) {
+  return await apiGet(`/api/tests/${encodeURIComponent(subjectCode)}`);
+}
+
+async function loadStorageStatus() {
+  try {
+    storageInfo = await apiGet('/api/storage-status');
+  } catch (e) {
+    storageInfo = { mode: 'unknown', supabaseConfigured: false, note: 'Could not load storage status.' };
+  }
+  return storageInfo;
+}
+
+function getPrefilledSubjectFromURL(subjects) {
+  const params = new URLSearchParams(location.search);
+  const code = params.get('subject');
+  if (!code) return null;
+  return subjects.find((sub) => sub.code === code) || null;
+}
+
+function formatActiveTestLabel(subject, activeTest) {
+  if (!subject) return '';
+  if (!activeTest || !activeTest.title) return `${subject.name} (${subject.code})`;
+  const chapter = activeTest.chapter ? ` — ${activeTest.chapter}` : '';
+  return `${subject.name} (${subject.code}) • ${activeTest.title}${chapter}`;
+}
 
 // ════════════════════════════════════════════════════════════
-//  PLAYER LOGIC
+// PLAYER
 // ════════════════════════════════════════════════════════════
 
 async function initPlayer() {
   isHost = false;
   showScreen('screen-subject');
-
   const subjects = await loadSubjects();
   renderSubjectCards('subject-list', subjects, (sub) => {
     selectedSubject = sub;
     showPlayerJoinScreen();
   });
 
-  // Lecturer link → passcode modal
+  const preselected = getPrefilledSubjectFromURL(subjects);
+  if (preselected) {
+    selectedSubject = preselected;
+    showPlayerJoinScreen();
+  }
 }
 
 function showPlayerJoinScreen() {
   showScreen('screen-join');
   $('#join-subject-title').textContent = selectedSubject.name;
   $('#join-subject-code').textContent = selectedSubject.code;
+  const hint = $('#join-test-hint');
+  if (hint) {
+    hint.textContent = 'Your lecturer will choose the active test for this subject.';
+  }
 
   const nameInput = $('#nickname-input');
   const numInput = $('#student-number-input');
   const btn = $('#btn-join');
   const errEl = $('#name-error');
 
-  // Clear old state
   nameInput.value = '';
   numInput.value = '';
   btn.disabled = true;
   btn.textContent = 'Join Game';
-  if (errEl) errEl.hidden = true;
+  if (errEl) {
+    errEl.hidden = true;
+    errEl.textContent = '';
+  }
 
   function checkReady() {
     const ready = !!(nameInput.value.trim() && numInput.value.trim());
@@ -208,7 +267,7 @@ function showPlayerJoinScreen() {
   }
 
   const bindCheck = (el) => {
-    ['input', 'change', 'keyup', 'blur'].forEach(evt => {
+    ['input', 'change', 'keyup', 'blur'].forEach((evt) => {
       el.addEventListener(evt, checkReady);
     });
   };
@@ -226,24 +285,17 @@ function showPlayerJoinScreen() {
   };
   btn.onclick = joinAsPlayer;
 
-  // Back button
   $('#btn-back-subject').onclick = () => {
     selectedSubject = null;
     showScreen('screen-subject');
   };
 
-  // Some browsers restore/autofill values after the screen appears,
-  // so run a few delayed checks as well.
   checkReady();
   setTimeout(checkReady, 0);
   setTimeout(checkReady, 150);
   setTimeout(checkReady, 600);
-
   nameInput.focus();
 }
-
-var myPlayerName = '';
-var myStudentNumber = '';
 
 function joinAsPlayer() {
   const name = $('#nickname-input').value.trim();
@@ -251,7 +303,6 @@ function joinAsPlayer() {
   if (!name || !studentNum) return;
   myPlayerName = name;
   myStudentNumber = studentNum;
-
   const errEl = $('#name-error');
   if (errEl) errEl.hidden = true;
   $('#btn-join').disabled = true;
@@ -277,15 +328,13 @@ function leaveLobby() {
     myPlayerId = null;
     myPlayerName = '';
     myStudentNumber = '';
-    selectedSubject = null;
-    showScreen('screen-subject');
-    initPlayer();
+    showPlayerJoinScreen();
   }, 150);
 }
 
 function handlePlayerMessage(msg) {
   switch (msg.type) {
-    case 'name_taken':
+    case 'name_taken': {
       showScreen('screen-join');
       const errEl = $('#name-error');
       if (errEl) {
@@ -297,57 +346,48 @@ function handlePlayerMessage(msg) {
       $('#nickname-input').focus();
       $('#nickname-input').select();
       break;
-
-    case 'joined':
+    }
+    case 'joined': {
       myPlayerId = msg.playerId;
       $('#lobby-player-name').textContent = myPlayerName;
       $('#lobby-p-count').textContent = msg.playerCount;
-      $('#lobby-subject-badge').textContent = `${selectedSubject.name} (${selectedSubject.code})`;
+      $('#lobby-subject-badge').textContent = formatActiveTestLabel(selectedSubject, msg.activeTest);
       const leaveBtn = $('#btn-leave-lobby');
-      if (leaveBtn) {
-        leaveBtn.onclick = leaveLobby;
-      }
-      if (msg.phase === 'lobby') {
-        showScreen('screen-lobby-player');
-      }
+      if (leaveBtn) leaveBtn.onclick = leaveLobby;
+      if (msg.phase === 'lobby') showScreen('screen-lobby-player');
       $('#btn-join').disabled = false;
       $('#btn-join').textContent = 'Join Game';
       break;
-
+    }
     case 'player_update':
-      if (msg.players) {
-        $('#lobby-p-count').textContent = msg.players.length;
+      if (msg.players) $('#lobby-p-count').textContent = msg.players.length;
+      if (selectedSubject) {
+        $('#lobby-subject-badge').textContent = formatActiveTestLabel(selectedSubject, msg.activeTest);
       }
       break;
-
     case 'get_ready':
       playerGetReady(msg.qNum, msg.totalQ);
       break;
-
     case 'question':
       playerShowQuestion(msg);
       break;
-
     case 'answer_result':
       playerShowResult(msg);
       break;
-
     case 'leaderboard':
       playerShowLeaderboard(msg.leaderboard);
       break;
-
     case 'final':
       playerShowFinal(msg.leaderboard);
       break;
-
     case 'reset':
-      if (typeof msg.playerCount === 'number') {
-        $('#lobby-p-count').textContent = msg.playerCount;
-      }
-      if (selectedSubject) {
-        $('#lobby-subject-badge').textContent = `${selectedSubject.name} (${selectedSubject.code})`;
-      }
+      if (typeof msg.playerCount === 'number') $('#lobby-p-count').textContent = msg.playerCount;
+      if (selectedSubject) $('#lobby-subject-badge').textContent = formatActiveTestLabel(selectedSubject, msg.activeTest);
       showScreen('screen-lobby-player');
+      break;
+    case 'left':
+      closeWS({ reconnect: false });
+      showPlayerJoinScreen();
       break;
   }
 }
@@ -358,7 +398,7 @@ function playerGetReady(qNum, totalQ) {
   let count = 3;
   $('#ready-count').textContent = count;
   const iv = setInterval(() => {
-    count--;
+    count -= 1;
     if (count <= 0) {
       clearInterval(iv);
     } else {
@@ -370,7 +410,6 @@ function playerGetReady(qNum, totalQ) {
 function playerShowQuestion(msg) {
   clearTimer();
   showScreen('screen-question');
-
   $('#q-number').textContent = msg.qNum;
   $('#q-total').textContent = msg.totalQ;
   $('#question-text').textContent = msg.question;
@@ -389,15 +428,12 @@ function playerShowQuestion(msg) {
   startPlayerTimer();
 }
 
-let playerAnswered = false;
-
 function playerAnswer(choice, btnEl) {
   if (playerAnswered) return;
   playerAnswered = true;
   clearTimer();
   send({ action: 'answer', choice });
-
-  document.querySelectorAll('.answer-btn').forEach(b => b.classList.add('disabled'));
+  document.querySelectorAll('.answer-btn').forEach((b) => b.classList.add('disabled'));
   btnEl.classList.add('selected');
 }
 
@@ -418,7 +454,7 @@ function updatePlayerTimerDisplay() {
   const pct = (timeLeft / TIME_PER_Q) * 100;
   const bar = $('#timer-bar');
   const text = $('#timer-text');
-  bar.style.width = pct + '%';
+  bar.style.width = `${pct}%`;
   text.textContent = Math.ceil(timeLeft);
   if (timeLeft <= 10) {
     bar.classList.add('urgent');
@@ -430,7 +466,10 @@ function updatePlayerTimerDisplay() {
 }
 
 function clearTimer() {
-  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
+  if (timerInterval) {
+    clearInterval(timerInterval);
+    timerInterval = null;
+  }
 }
 
 function playerShowResult(msg) {
@@ -456,13 +495,6 @@ function playerShowResult(msg) {
 
   detail.textContent = msg.explanation;
   scoreVal.textContent = msg.totalScore.toLocaleString();
-
-  if (msg.correctAnswer !== undefined) {
-    const btns = document.querySelectorAll('.answer-btn');
-    btns.forEach((b, i) => {
-      if (i === msg.correctAnswer) b.classList.add('correct-reveal');
-    });
-  }
 }
 
 function playerShowLeaderboard(lb) {
@@ -472,37 +504,29 @@ function playerShowLeaderboard(lb) {
 
 function playerShowFinal(lb) {
   showScreen('screen-final');
-  const myRank = lb.findIndex(p => p.id === myPlayerId) + 1;
+  const myRank = lb.findIndex((p) => p.id === myPlayerId) + 1;
   $('#final-title').textContent = myRank === 1 ? 'You Win! 🏆' : `Game Over — You placed #${myRank}`;
   renderPodium($('#final-podium'), lb);
   renderFullList($('#final-full-list'), lb.slice(3), myPlayerId, 4);
 }
 
-
 // ════════════════════════════════════════════════════════════
-//  HOST (LECTURER) LOGIC
+// HOST
 // ════════════════════════════════════════════════════════════
-
-var hostSubjectCode = null;
 
 async function initHost() {
   isHost = true;
-
-  // Close any existing WS when re-entering host subject selection
-  if (ws) {
-    closeWS({ reconnect: false });
-  }
-
+  selectedTest = null;
+  if (ws) closeWS({ reconnect: false });
   showScreen('screen-host-subject');
 
   const subjects = await loadSubjects();
   renderSubjectCards('host-subject-list', subjects, (sub) => {
     selectedSubject = sub;
     hostSubjectCode = sub.code;
-    startHostForSubject();
+    showHostTestLibrary();
   });
 
-  // Back to player view (clone to avoid duplicate listeners)
   const backBtn = $('#btn-back-player');
   const newBack = backBtn.cloneNode(true);
   backBtn.replaceWith(newBack);
@@ -513,32 +537,246 @@ async function initHost() {
   });
 }
 
-function startHostForSubject() {
-  showScreen('screen-host-lobby');
+async function showHostTestLibrary() {
+  if (ws) closeWS({ reconnect: false });
+  showScreen('screen-host-tests');
+  $('#host-tests-title').textContent = `${selectedSubject.name} (${selectedSubject.code})`;
+  $('#host-tests-subtitle').textContent = 'Choose a saved test or create a new one.';
+  showInlineStatus('#host-library-status', 'Loading tests...', false);
+
+  const storage = await loadStorageStatus();
+  const badge = $('#host-storage-badge');
+  badge.textContent = storage.mode === 'supabase' ? 'Supabase storage active' : 'Temporary in-memory storage';
+  badge.className = `storage-badge ${storage.mode === 'supabase' ? 'storage-badge-live' : 'storage-badge-warning'}`;
+  $('#host-storage-note').textContent = storage.note || '';
+
+  try {
+    const tests = await loadTests(selectedSubject.code);
+    renderHostTestCards(tests);
+    showInlineStatus('#host-library-status', tests.length ? '' : 'No tests saved yet. Create your first one below.', false);
+  } catch (e) {
+    renderHostTestCards([]);
+    showInlineStatus('#host-library-status', e.message, true);
+  }
+
+  const createBtn = $('#btn-create-test');
+  const createClone = createBtn.cloneNode(true);
+  createBtn.replaceWith(createClone);
+  createClone.addEventListener('click', () => showCreateTestScreen());
+
+  const backBtn = $('#btn-back-host-subjects');
+  const backClone = backBtn.cloneNode(true);
+  backBtn.replaceWith(backClone);
+  backClone.addEventListener('click', () => initHost());
+}
+
+function renderHostTestCards(tests) {
+  const container = $('#host-test-list');
+  container.innerHTML = '';
+  if (!tests || tests.length === 0) {
+    container.innerHTML = '<p class="empty-msg">No saved tests for this subject yet.</p>';
+    return;
+  }
+
+  tests.forEach((test) => {
+    const card = document.createElement('div');
+    card.className = 'test-card';
+    const sourceText = test.source === 'supabase'
+      ? 'Stored in Supabase'
+      : (test.source === 'built-in' ? 'Built-in starter quiz' : 'Temporary local test');
+    const chapter = test.chapter ? `<p class="test-card-chapter">${escapeHtml(test.chapter)}</p>` : '';
+    const desc = test.description ? `<p class="test-card-desc">${escapeHtml(test.description)}</p>` : '';
+    card.innerHTML = `
+      <div class="test-card-main">
+        <div>
+          <h3 class="test-card-title">${escapeHtml(test.title)}</h3>
+          ${chapter}
+          ${desc}
+        </div>
+        <div class="test-card-meta">
+          <span class="test-pill">${test.questionCount} question${test.questionCount === 1 ? '' : 's'}</span>
+          <span class="test-card-source">${escapeHtml(sourceText)}</span>
+        </div>
+      </div>
+      <div class="test-card-actions">
+        <button class="btn btn-primary test-use-btn">Use This Test</button>
+      </div>
+    `;
+    card.querySelector('.test-use-btn').addEventListener('click', () => {
+      selectedTest = test;
+      startHostForTest(test);
+    });
+    container.appendChild(card);
+  });
+}
+
+function showCreateTestScreen() {
+  showScreen('screen-host-create-test');
+  $('#create-test-subject').textContent = `${selectedSubject.name} (${selectedSubject.code})`;
+  showInlineStatus('#host-create-status', '', false);
+  $('#test-title-input').value = '';
+  $('#test-chapter-input').value = '';
+  $('#test-description-input').value = '';
+  renderQuestionEditors([
+    { q: '', options: ['', '', '', ''], correct: 0, explanation: '' }
+  ]);
+
+  const addBtn = $('#btn-add-question');
+  const addClone = addBtn.cloneNode(true);
+  addBtn.replaceWith(addClone);
+  addClone.addEventListener('click', () => addQuestionEditor());
+
+  const cancelBtn = $('#btn-cancel-create-test');
+  const cancelClone = cancelBtn.cloneNode(true);
+  cancelBtn.replaceWith(cancelClone);
+  cancelClone.addEventListener('click', () => showHostTestLibrary());
+
+  const saveBtn = $('#btn-save-test');
+  const saveClone = saveBtn.cloneNode(true);
+  saveBtn.replaceWith(saveClone);
+  saveClone.addEventListener('click', async () => {
+    showInlineStatus('#host-create-status', '', false);
+    saveClone.disabled = true;
+    saveClone.textContent = 'Saving...';
+    try {
+      const payload = collectTestFormPayload();
+      const resp = await apiPost(`/api/tests/${encodeURIComponent(selectedSubject.code)}`, payload);
+      selectedTest = resp.test;
+      startHostForTest(resp.test);
+    } catch (e) {
+      showInlineStatus('#host-create-status', e.message, true);
+      saveClone.disabled = false;
+      saveClone.textContent = 'Save Test & Use It';
+    }
+  });
+}
+
+function renderQuestionEditors(questions) {
+  const container = $('#question-editor-list');
+  container.innerHTML = '';
+  questions.forEach((q) => addQuestionEditor(q));
+}
+
+function addQuestionEditor(data = { q: '', options: ['', '', '', ''], correct: 0, explanation: '' }) {
+  const container = $('#question-editor-list');
+  const card = document.createElement('div');
+  card.className = 'question-editor-card';
+  card.innerHTML = `
+    <div class="question-editor-header">
+      <h3 class="question-editor-title">Question</h3>
+      <button type="button" class="question-remove-btn">Remove</button>
+    </div>
+    <label class="input-label">Question text</label>
+    <textarea class="editor-textarea editor-question" rows="3" placeholder="Type the question here..."></textarea>
+    <div class="editor-options-grid">
+      <div>
+        <label class="input-label">Option A</label>
+        <input class="editor-input editor-option" data-opt="0" type="text" placeholder="Option A">
+      </div>
+      <div>
+        <label class="input-label">Option B</label>
+        <input class="editor-input editor-option" data-opt="1" type="text" placeholder="Option B">
+      </div>
+      <div>
+        <label class="input-label">Option C</label>
+        <input class="editor-input editor-option" data-opt="2" type="text" placeholder="Option C">
+      </div>
+      <div>
+        <label class="input-label">Option D</label>
+        <input class="editor-input editor-option" data-opt="3" type="text" placeholder="Option D">
+      </div>
+    </div>
+    <div class="editor-row-two">
+      <div>
+        <label class="input-label">Correct answer</label>
+        <select class="editor-select editor-correct">
+          <option value="0">Option A</option>
+          <option value="1">Option B</option>
+          <option value="2">Option C</option>
+          <option value="3">Option D</option>
+        </select>
+      </div>
+      <div class="editor-grow">
+        <label class="input-label">Explanation</label>
+        <textarea class="editor-textarea editor-explanation" rows="2" placeholder="Short explanation shown after answering..."></textarea>
+      </div>
+    </div>
+  `;
+  card.querySelector('.editor-question').value = data.q || '';
+  card.querySelector('.editor-correct').value = String(data.correct || 0);
+  const optionInputs = card.querySelectorAll('.editor-option');
+  optionInputs.forEach((input, idx) => {
+    input.value = (data.options && data.options[idx]) || '';
+  });
+  card.querySelector('.editor-explanation').value = data.explanation || '';
+  card.querySelector('.question-remove-btn').addEventListener('click', () => {
+    const total = container.querySelectorAll('.question-editor-card').length;
+    if (total <= 1) {
+      showInlineStatus('#host-create-status', 'A test needs at least one question.', true);
+      return;
+    }
+    card.remove();
+  });
+  container.appendChild(card);
+  refreshQuestionEditorLabels();
+}
+
+function refreshQuestionEditorLabels() {
+  document.querySelectorAll('.question-editor-card').forEach((card, index) => {
+    const title = card.querySelector('.question-editor-title');
+    if (title) title.textContent = `Question ${index + 1}`;
+  });
+}
+
+function collectTestFormPayload() {
+  const title = $('#test-title-input').value.trim();
+  const chapter = $('#test-chapter-input').value.trim();
+  const description = $('#test-description-input').value.trim();
+  const questionCards = Array.from(document.querySelectorAll('.question-editor-card'));
+  const questions = questionCards.map((card) => {
+    const q = card.querySelector('.editor-question').value.trim();
+    const options = Array.from(card.querySelectorAll('.editor-option')).map((input) => input.value.trim());
+    const correct = Number(card.querySelector('.editor-correct').value);
+    const explanation = card.querySelector('.editor-explanation').value.trim();
+    return { q, options, correct, explanation };
+  });
+  return { title, chapter, description, questions };
+}
+
+function updateHostLobbyHeading() {
   $('#host-lobby-title').textContent = `${selectedSubject.name} (${selectedSubject.code})`;
-  $('#host-lobby-subtitle').textContent = 'Lecturer Control Panel';
+  const chapter = selectedTest && selectedTest.chapter ? ` — ${selectedTest.chapter}` : '';
+  $('#host-lobby-subtitle').textContent = selectedTest ? `${selectedTest.title}${chapter}` : 'Lecturer Control Panel';
+  $('#host-active-test-pill').textContent = selectedTest
+    ? `${selectedTest.title}${chapter} • ${selectedTest.questionCount || 0} questions`
+    : 'No test selected';
+}
+
+function startHostForTest(testSummary) {
+  selectedTest = testSummary;
+  showScreen('screen-host-lobby');
+  updateHostLobbyHeading();
 
   connectWS(() => {
-    send({ action: 'host_join', subject: hostSubjectCode });
+    send({ action: 'host_join', subject: hostSubjectCode, testId: selectedTest.id });
   });
 
-  // Generate QR code pointing to the deployed player URL
-  const playerURL = location.origin + location.pathname.replace(/\/#.*$/, '/').replace(/\/+$/, '/');
+  const playerURL = new URL(location.origin + location.pathname);
+  playerURL.searchParams.set('subject', hostSubjectCode);
   const qrContainer = $('#qr-code');
   qrContainer.innerHTML = '';
   try {
     new QRCode(qrContainer, {
-      text: playerURL,
+      text: playerURL.toString(),
       width: 160,
       height: 160,
       colorDark: '#1a1027',
       colorLight: '#ffffff',
       correctLevel: QRCode.CorrectLevel.M
     });
-  } catch(e) {}
-  $('#qr-url-text').textContent = playerURL;
+  } catch (e) {}
+  $('#qr-url-text').textContent = playerURL.toString();
 
-  // Clone buttons to remove old listeners
   const startBtn = $('#btn-start-game');
   const newStart = startBtn.cloneNode(true);
   startBtn.replaceWith(newStart);
@@ -551,155 +789,128 @@ function startHostForSubject() {
   const nextBtn = $('#btn-next-question');
   const newNext = nextBtn.cloneNode(true);
   nextBtn.replaceWith(newNext);
-  newNext.addEventListener('click', () => {
-    send({ action: 'next_question' });
-  });
+  newNext.addEventListener('click', () => send({ action: 'next_question' }));
 
-  const bindEndGame = (selector) => {
-    const btn = $(selector);
-    if (!btn) return;
-    const newBtn = btn.cloneNode(true);
-    btn.replaceWith(newBtn);
-    newBtn.addEventListener('click', () => {
-      if (confirm('End the game now and show the final leaderboard?')) {
-        send({ action: 'end_game' });
-      }
-    });
-  };
-
-  const bindCancelGame = (selector) => {
-    const btn = $(selector);
-    if (!btn) return;
-    const newBtn = btn.cloneNode(true);
-    btn.replaceWith(newBtn);
-    newBtn.addEventListener('click', () => {
-      if (confirm('Cancel this game and return everyone to the lobby?')) {
-        send({ action: 'cancel_game' });
-      }
-    });
-  };
-
-  bindCancelGame('#btn-cancel-game');
-  bindCancelGame('#btn-cancel-game-reveal');
-  bindEndGame('#btn-end-game');
-  bindEndGame('#btn-end-game-reveal');
+  bindConfirmAction('#btn-end-game', 'End the game now and show the final leaderboard?', 'end_game');
+  bindConfirmAction('#btn-end-game-reveal', 'End the game now and show the final leaderboard?', 'end_game');
+  bindConfirmAction('#btn-cancel-game', 'Cancel this game and return everyone to the lobby?', 'cancel_game');
+  bindConfirmAction('#btn-cancel-game-reveal', 'Cancel this game and return everyone to the lobby?', 'cancel_game');
 
   const playAgainBtn = $('#btn-play-again');
   const newPlayAgain = playAgainBtn.cloneNode(true);
   playAgainBtn.replaceWith(newPlayAgain);
-  newPlayAgain.addEventListener('click', () => {
-    send({ action: 'reset_game' });
-  });
+  newPlayAgain.addEventListener('click', () => send({ action: 'reset_game' }));
 
-  // Stats download buttons
   setupStatsDownload('#btn-download-stats');
   setupStatsDownload('#btn-download-stats-final');
 
-  // Change Subject buttons — return to subject picker without re-entering passcode
-  const changeBtn = $('#btn-change-subject');
+  const changeBtn = $('#btn-change-test');
   const newChange = changeBtn.cloneNode(true);
   changeBtn.replaceWith(newChange);
-  newChange.addEventListener('click', () => {
-    initHost(); // re-shows subject picker, closes old WS
-  });
+  newChange.addEventListener('click', () => showHostTestLibrary());
 
-  const changeBtnFinal = $('#btn-change-subject-final');
+  const changeBtnFinal = $('#btn-change-test-final');
   const newChangeFinal = changeBtnFinal.cloneNode(true);
   changeBtnFinal.replaceWith(newChangeFinal);
-  newChangeFinal.addEventListener('click', () => {
-    initHost();
+  newChangeFinal.addEventListener('click', () => showHostTestLibrary());
+}
+
+function bindConfirmAction(selector, prompt, action) {
+  const btn = $(selector);
+  if (!btn) return;
+  const clone = btn.cloneNode(true);
+  btn.replaceWith(clone);
+  clone.addEventListener('click', () => {
+    if (confirm(prompt)) send({ action });
   });
 }
 
 function setupStatsDownload(selector) {
   const btn = $(selector);
   if (!btn) return;
-  const newBtn = btn.cloneNode(true);
-  btn.replaceWith(newBtn);
-  newBtn.addEventListener('click', () => {
-    if (hostSubjectCode) {
-      const url = `${API_BASE}/api/stats/${hostSubjectCode}`;
-      // Use fetch to get the file, then trigger download
-      fetch(url).then(resp => {
-        if (!resp.ok) return resp.json().then(d => { throw new Error(d.error || 'Download failed'); });
+  const clone = btn.cloneNode(true);
+  btn.replaceWith(clone);
+  clone.addEventListener('click', () => {
+    if (!hostSubjectCode) return;
+    const url = `${API_BASE}/api/stats/${hostSubjectCode}`;
+    fetch(url)
+      .then(async (resp) => {
+        if (!resp.ok) {
+          const detail = await resp.json().catch(() => ({}));
+          throw new Error(detail.detail || detail.error || 'Download failed');
+        }
         return resp.blob();
-      }).then(blob => {
+      })
+      .then((blob) => {
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = `Stats_${hostSubjectCode}.xlsx`;
         a.click();
         URL.revokeObjectURL(a.href);
-      }).catch(err => {
-        // Show error inline since alert() is blocked in sandbox
-        newBtn.textContent = err.message || 'Download failed';
-        setTimeout(() => { newBtn.textContent = 'Download Stats (Excel)'; }, 3000);
+      })
+      .catch((err) => {
+        clone.textContent = err.message || 'Download failed';
+        setTimeout(() => {
+          clone.textContent = 'Download Stats (Excel)';
+        }, 3000);
       });
-    }
   });
 }
 
 function handleHostMessage(msg) {
   switch (msg.type) {
     case 'host_joined':
-      updateHostLobby(msg.players);
-      if (msg.phase === 'lobby') {
-        showScreen('screen-host-lobby');
+      if (msg.selectedTest) {
+        selectedTest = { ...selectedTest, ...msg.selectedTest };
+        updateHostLobbyHeading();
       }
-      // Show/hide stats download button
-      const statsBtn = $('#btn-download-stats');
-      if (statsBtn) {
-        statsBtn.hidden = !msg.hasStats;
-      }
-      // Warn if no questions
+      updateHostLobby(msg.players, msg.selectedTest || selectedTest);
+      if (msg.phase === 'lobby') showScreen('screen-host-lobby');
+      $('#btn-download-stats').hidden = !msg.hasStats;
       if (!msg.hasQuestions) {
         const startBtn = $('#btn-start-game');
-        if (startBtn) {
-          startBtn.disabled = true;
-          startBtn.textContent = 'No questions loaded';
-        }
+        startBtn.disabled = true;
+        startBtn.textContent = 'This test has no questions';
       }
       break;
-
     case 'player_update':
-      updateHostLobby(msg.players);
+      if (msg.activeTest) {
+        selectedTest = { ...selectedTest, ...msg.activeTest };
+        updateHostLobbyHeading();
+      }
+      updateHostLobby(msg.players, msg.activeTest || selectedTest);
       break;
-
     case 'get_ready':
       hostGetReady(msg.qNum, msg.totalQ);
       break;
-
     case 'question':
       hostShowQuestion(msg);
       break;
-
     case 'answer_count':
       $('#host-answered-count').textContent = msg.answered;
       $('#host-total-players').textContent = msg.total;
       break;
-
     case 'reveal':
       hostShowReveal(msg);
       break;
-
     case 'final':
       hostShowFinal(msg.leaderboard);
-      const finalStatsBtn = $('#btn-download-stats-final');
-      if (finalStatsBtn && msg.hasStats !== undefined) {
-        finalStatsBtn.hidden = !msg.hasStats;
-      }
+      $('#btn-download-stats-final').hidden = !msg.hasStats;
       break;
   }
 }
 
-function updateHostLobby(players) {
+function updateHostLobby(players, activeTest = selectedTest) {
   const count = players ? players.length : 0;
   $('#host-player-count').textContent = count;
-
   const startBtn = $('#btn-start-game');
-  // Only enable if there are players AND there are questions
-  if (selectedSubject && selectedSubject.questionCount > 0) {
+  const qCount = activeTest && activeTest.questionCount ? activeTest.questionCount : 0;
+  if (qCount > 0) {
     startBtn.disabled = count === 0;
-    startBtn.textContent = `Start Game (${count} players)`;
+    startBtn.textContent = count === 0 ? 'Waiting for players…' : `Start Game (${count} players)`;
+  } else {
+    startBtn.disabled = true;
+    startBtn.textContent = 'This test has no questions';
   }
 
   const list = $('#host-player-list');
@@ -708,7 +919,7 @@ function updateHostLobby(players) {
     return;
   }
   list.innerHTML = '';
-  players.forEach(p => {
+  players.forEach((p) => {
     const el = document.createElement('div');
     el.className = 'host-player-item';
     el.innerHTML = `
@@ -721,8 +932,6 @@ function updateHostLobby(players) {
 
 function hostGetReady(qNum, totalQ) {
   showScreen('screen-host-question');
-  const controls = $('#host-live-controls');
-  if (controls) controls.style.display = 'flex';
   $('#host-q-num').textContent = `Q${qNum} / ${totalQ}`;
   $('#host-timer').textContent = '...';
   $('#host-q-text').textContent = 'Get Ready...';
@@ -732,19 +941,11 @@ function hostGetReady(qNum, totalQ) {
   $('#host-timer-bar').style.width = '100%';
 }
 
-let hostTimerInterval = null;
-var hostCorrectAnswer = -1;
-var hostCurrentOptions = [];
-var hostCurrentQuestion = '';
-
 function hostShowQuestion(msg) {
   showScreen('screen-host-question');
-  const controls = $('#host-live-controls');
-  if (controls) controls.style.display = 'flex';
   $('#host-q-num').textContent = `Q${msg.qNum} / ${msg.totalQ}`;
   $('#host-q-text').textContent = msg.question;
   $('#host-answered-count').textContent = '0';
-
   hostCorrectAnswer = msg.correctAnswer;
   hostCurrentOptions = msg.options;
   hostCurrentQuestion = msg.question;
@@ -767,89 +968,77 @@ function hostShowQuestion(msg) {
       clearInterval(hostTimerInterval);
     }
     const pct = (hostTimeLeft / TIME_PER_Q) * 100;
-    $('#host-timer-bar').style.width = pct + '%';
+    $('#host-timer-bar').style.width = `${pct}%`;
     $('#host-timer').textContent = Math.ceil(hostTimeLeft);
   }, 100);
 }
 
 function hostShowReveal(msg) {
-  if (hostTimerInterval) { clearInterval(hostTimerInterval); hostTimerInterval = null; }
-  showScreen('screen-host-reveal');
-  const controls = $('#host-reveal-controls');
-  if (controls) controls.style.display = 'flex';
-
-  const answerEl = $('#host-reveal-answer');
-  if (answerEl && hostCurrentOptions.length > 0) {
-    const correctIdx = msg.correctAnswer !== undefined ? msg.correctAnswer : hostCorrectAnswer;
-    const correctText = hostCurrentOptions[correctIdx] || '';
-    const shape = SHAPES[correctIdx] || '';
-    const color = COLORS[correctIdx] || '';
-    answerEl.innerHTML = `
-      <p class="reveal-question-text">${escapeHtml(hostCurrentQuestion)}</p>
-      <div class="reveal-correct-answer ${color}">
-        <span class="shape">${shape}</span>
-        <span>${escapeHtml(correctText)} ✓</span>
-      </div>
-    `;
+  if (hostTimerInterval) {
+    clearInterval(hostTimerInterval);
+    hostTimerInterval = null;
   }
-
+  showScreen('screen-host-reveal');
+  const answerEl = $('#host-reveal-answer');
+  const correctIdx = msg.correctAnswer !== undefined ? msg.correctAnswer : hostCorrectAnswer;
+  const correctText = hostCurrentOptions[correctIdx] || '';
+  const shape = SHAPES[correctIdx] || '';
+  const color = COLORS[correctIdx] || '';
+  answerEl.innerHTML = `
+    <p class="reveal-question-text">${escapeHtml(hostCurrentQuestion)}</p>
+    <div class="reveal-correct-answer ${color}">
+      <span class="shape">${shape}</span>
+      <span>${escapeHtml(correctText)} ✓</span>
+    </div>
+  `;
   $('#host-reveal-explanation').textContent = msg.explanation;
   renderLeaderboardList($('#host-reveal-leaderboard'), msg.leaderboard, null);
 
-  const btn = $('#btn-next-question');
-  if (btn) btn.style.display = 'none';
-
   let autoCountdown = 5;
   const countdownEl = $('#host-auto-countdown');
-  if (countdownEl) {
-    countdownEl.textContent = `Next question in ${autoCountdown}s...`;
-    countdownEl.style.display = 'block';
-    const iv = setInterval(() => {
-      autoCountdown--;
-      if (autoCountdown <= 0) {
-        clearInterval(iv);
-        countdownEl.textContent = 'Loading next question...';
-      } else {
-        countdownEl.textContent = `Next question in ${autoCountdown}s...`;
-      }
-    }, 1000);
-  }
+  countdownEl.textContent = `Next question in ${autoCountdown}s...`;
+  countdownEl.style.display = 'block';
+  const iv = setInterval(() => {
+    autoCountdown -= 1;
+    if (autoCountdown <= 0) {
+      clearInterval(iv);
+      countdownEl.textContent = 'Loading next question...';
+    } else {
+      countdownEl.textContent = `Next question in ${autoCountdown}s...`;
+    }
+  }, 1000);
 }
 
 function hostShowFinal(lb) {
-  if (hostTimerInterval) { clearInterval(hostTimerInterval); hostTimerInterval = null; }
+  if (hostTimerInterval) {
+    clearInterval(hostTimerInterval);
+    hostTimerInterval = null;
+  }
   showScreen('screen-host-final');
   renderPodium($('#host-final-podium'), lb);
   renderFullList($('#host-final-list'), lb.slice(3), null, 4);
 }
 
-
 // ════════════════════════════════════════════════════════════
-//  PASSCODE MODAL
+// PASSCODE MODAL
 // ════════════════════════════════════════════════════════════
 
 function hasHostSession() {
   return sessionStorage.getItem(HOST_AUTH_KEY) === '1';
 }
-
 function setHostSession() {
   sessionStorage.setItem(HOST_AUTH_KEY, '1');
 }
-
 function clearHostSession() {
   sessionStorage.removeItem(HOST_AUTH_KEY);
 }
-
-function openPasscodeModal(afterSuccess) {
+function openPasscodeModal() {
   const modal = $('#passcode-modal');
   const passInput = $('#passcode-input');
   const passError = $('#passcode-error');
-  if (!modal || !passInput || !passError) return;
-
   passInput.value = '';
   passError.hidden = true;
   modal.hidden = false;
-  modal.dataset.afterSuccess = afterSuccess || 'host';
   setTimeout(() => passInput.focus(), 0);
 }
 
@@ -866,7 +1055,7 @@ function setupPasscodeModal() {
       initHost();
       return;
     }
-    openPasscodeModal('host');
+    openPasscodeModal();
   });
 
   passCancel.addEventListener('click', () => { modal.hidden = true; });
@@ -889,9 +1078,8 @@ function setupPasscodeModal() {
   passInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitPasscode(); });
 }
 
-
 // ════════════════════════════════════════════════════════════
-//  SHARED RENDERING
+// SHARED RENDERING
 // ════════════════════════════════════════════════════════════
 
 function renderLeaderboardList(container, lb, myId) {
@@ -913,8 +1101,7 @@ function renderPodium(container, lb) {
   const medals = ['🥇', '🥈', '🥉'];
   const classes = ['gold', 'silver', 'bronze'];
   const order = [1, 0, 2];
-
-  order.forEach(pos => {
+  order.forEach((pos) => {
     if (lb[pos]) {
       const item = document.createElement('div');
       item.className = `podium-item ${classes[pos]}`;
@@ -948,20 +1135,14 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-
-// ═══════════════════════════════════════════════
-//  INIT
-// ═══════════════════════════════════════════════
-
 window.addEventListener('DOMContentLoaded', () => {
   setupPasscodeModal();
-
   if (location.hash === '#host') {
     if (hasHostSession()) {
       initHost();
     } else {
       initPlayer();
-      openPasscodeModal('host');
+      openPasscodeModal();
     }
   } else {
     initPlayer();

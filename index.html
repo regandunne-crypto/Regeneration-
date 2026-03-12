@@ -55,6 +55,7 @@
       <div class="logo-area">
         <h2 class="join-subject-title" id="join-subject-title"></h2>
         <p class="join-subject-code" id="join-subject-code"></p>
+        <p class="join-test-hint" id="join-test-hint"></p>
       </div>
       <div class="join-form">
         <label for="nickname-input" class="input-label">Your Name</label>
@@ -165,12 +166,64 @@
     </div>
   </div>
 
+  <!-- HOST: Test Library -->
+  <div id="screen-host-tests" class="screen">
+    <div class="host-tests-container">
+      <div class="host-tests-header">
+        <h1 class="host-title" id="host-tests-title">Subject Tests</h1>
+        <p class="host-subtitle" id="host-tests-subtitle">Choose a saved test or create a new one.</p>
+        <div class="storage-badge-row">
+          <span id="host-storage-badge" class="storage-badge">Storage</span>
+          <span id="host-storage-note" class="storage-note"></span>
+        </div>
+      </div>
+      <p id="host-library-status" class="inline-status" hidden></p>
+      <div class="host-test-list" id="host-test-list"></div>
+      <div class="host-test-library-actions">
+        <button id="btn-create-test" class="btn btn-primary">Create New Test</button>
+        <button id="btn-back-host-subjects" class="btn btn-secondary">Change Subject</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- HOST: Create Test -->
+  <div id="screen-host-create-test" class="screen">
+    <div class="create-test-container">
+      <div class="host-tests-header">
+        <h1 class="host-title">Create Test</h1>
+        <p class="host-subtitle" id="create-test-subject"></p>
+      </div>
+      <p id="host-create-status" class="inline-status" hidden></p>
+      <div class="create-test-form">
+        <label for="test-title-input" class="input-label">Test name</label>
+        <input type="text" id="test-title-input" class="editor-input" placeholder="e.g. Chapter 3 Forces Quiz" maxlength="140">
+
+        <label for="test-chapter-input" class="input-label">Chapter / topic</label>
+        <input type="text" id="test-chapter-input" class="editor-input" placeholder="e.g. Chapter 3: Equilibrium" maxlength="140">
+
+        <label for="test-description-input" class="input-label">Short description</label>
+        <textarea id="test-description-input" class="editor-textarea" rows="3" placeholder="Optional note for lecturers" maxlength="600"></textarea>
+
+        <div class="question-editor-toolbar">
+          <h2 class="question-editor-heading">Questions</h2>
+          <button id="btn-add-question" class="btn btn-secondary">Add Question</button>
+        </div>
+        <div id="question-editor-list" class="question-editor-list"></div>
+      </div>
+      <div class="create-test-actions">
+        <button id="btn-save-test" class="btn btn-primary btn-large">Save Test &amp; Use It</button>
+        <button id="btn-cancel-create-test" class="btn btn-secondary">Back to Test Library</button>
+      </div>
+    </div>
+  </div>
+
   <!-- HOST: Lobby -->
   <div id="screen-host-lobby" class="screen">
     <div class="host-lobby-container">
       <div class="host-header">
         <h1 class="host-title" id="host-lobby-title">Engineering Quiz</h1>
         <p class="host-subtitle" id="host-lobby-subtitle">Lecturer Control Panel</p>
+        <p class="host-active-test-pill" id="host-active-test-pill">No test selected</p>
       </div>
       <div class="host-columns">
         <div class="host-qr-panel">
@@ -188,7 +241,7 @@
       <div class="host-lobby-actions">
         <button id="btn-start-game" class="btn btn-primary btn-large" disabled>Start Game</button>
         <button id="btn-download-stats" class="btn btn-secondary btn-stats" hidden>Download Previous Stats</button>
-        <button id="btn-change-subject" class="btn btn-secondary">Change Subject</button>
+        <button id="btn-change-test" class="btn btn-secondary">Change Test</button>
       </div>
     </div>
   </div>
@@ -256,7 +309,7 @@
       <div class="host-final-actions">
         <button id="btn-download-stats-final" class="btn btn-secondary btn-stats">Download Stats (Excel)</button>
         <button id="btn-play-again" class="btn btn-primary btn-large">New Game</button>
-        <button id="btn-change-subject-final" class="btn btn-secondary">Change Subject</button>
+        <button id="btn-change-test-final" class="btn btn-secondary">Change Test</button>
       </div>
     </div>
   </div>
