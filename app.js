@@ -6,11 +6,23 @@
 const SHAPES = ['◆', '●', '▲', '■'];
 const COLORS = ['color-0', 'color-1', 'color-2', 'color-3'];
 const TIME_PER_Q = 30;
-const HOST_PASSCODE = 'Regan@1990';
-const HOST_AUTH_KEY = 'engineering_quiz_host_auth';
+
+function getOrCreateVisitorId() {
+  try {
+    const key = 'quiz_visitor_id';
+    const existing = localStorage.getItem(key);
+    if (existing) return existing;
+    const created = (crypto && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+    localStorage.setItem(key, created);
+    return created;
+  } catch (e) {
+    return `${Date.now()}-${Math.random()}`;
+  }
+}
 
 const WS_PROTOCOL = location.protocol === 'https:' ? 'wss:' : 'ws:';
-const WS_URL = `${WS_PROTOCOL}//${location.host}/ws`;
+const VISITOR_ID = getOrCreateVisitorId();
+const WS_URL = `${WS_PROTOCOL}//${location.host}/ws?visitorId=${encodeURIComponent(VISITOR_ID)}`;
 const API_BASE = location.origin;
 
 const $ = (sel) => document.querySelector(sel);
@@ -18,6 +30,7 @@ let ws = null;
 let wsAllowReconnect = true;
 let wsOnOpen = null;
 let wsReconnectTimer = null;
+let wsPingTimer = null;
 let isHost = false;
 let myPlayerId = null;
 let myPlayerName = '';
@@ -28,11 +41,21 @@ let timeLeft = TIME_PER_Q;
 let selectedSubject = null;
 let selectedTest = null;
 let storageInfo = null;
+let lecturerSession = null;
 let hostSubjectCode = null;
+let editorMode = 'create';
+let editingTestId = null;
+let draftDirty = false;
+let draftSaveTimer = null;
+let currentDraftLoaded = null;
+let originalEditingTest = null;
+let authUiBound = false;
+let editorInputBound = false;
 let hostCorrectAnswer = -1;
 let hostCurrentOptions = [];
 let hostCurrentQuestion = '';
 let playerAnswered = false;
+let statsAutoDownloaded = false;
 
 const SUBJECT_COLORS = {
   MEC105B: { bg: 'var(--accent-blue)', icon: '⚙️' },
@@ -62,6 +85,7 @@ function connectWS(onOpen) {
 
   ws = new WebSocket(WS_URL);
   ws.onopen = () => {
+    startWsPing();
     if (wsOnOpen) wsOnOpen();
   };
   ws.onmessage = (evt) => {
@@ -70,11 +94,26 @@ function connectWS(onOpen) {
   };
   ws.onclose = () => {
     ws = null;
+    stopWsPing();
     if (wsAllowReconnect) {
       wsReconnectTimer = setTimeout(() => connectWS(), 3000);
     }
   };
   ws.onerror = () => {};
+}
+
+function startWsPing() {
+  stopWsPing();
+  wsPingTimer = setInterval(() => {
+    send({ action: 'ping' });
+  }, 25000);
+}
+
+function stopWsPing() {
+  if (wsPingTimer) {
+    clearInterval(wsPingTimer);
+    wsPingTimer = null;
+  }
 }
 
 function send(msg) {
@@ -96,10 +135,18 @@ function closeWS({ reconnect = false } = {}) {
     } catch (e) {}
     ws = null;
   }
+  stopWsPing();
   wsOnOpen = null;
 }
 
 function handleMessage(msg) {
+  if (msg.type === 'pong') return;
+  if (msg.type === 'auth_required') {
+    lecturerSession = null;
+    updateHostAccountBar();
+    showHostAuthScreen('login', msg.message || 'Please sign in as a lecturer.');
+    return;
+  }
   if (msg.type === 'error') {
     showInlineStatus('#host-library-status', msg.message, true);
     showInlineStatus('#host-create-status', msg.message, true);
@@ -122,29 +169,46 @@ function showInlineStatus(selector, text, isError = false) {
   el.classList.toggle('success-text', !isError && !!text);
 }
 
-async function apiGet(path) {
-  const resp = await fetch(`${API_BASE}${path}`);
-  const data = await resp.json();
+async function parseApiResponse(resp) {
+  const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
-    throw new Error(data.detail || data.error || 'Request failed');
+    const detail = Array.isArray(data.detail)
+      ? data.detail.map((item) => item.msg || JSON.stringify(item)).join(' ')
+      : (data.detail || data.error || 'Request failed');
+    const err = new Error(detail);
+    err.status = resp.status;
+    err.payload = data;
+    throw err;
   }
   return data;
 }
 
-async function apiPost(path, payload) {
+async function apiGet(path) {
+  const resp = await fetch(`${API_BASE}${path}`);
+  return await parseApiResponse(resp);
+}
+
+async function apiPost(path, payload = {}) {
   const resp = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
-  const data = await resp.json();
-  if (!resp.ok) {
-    const detail = Array.isArray(data.detail)
-      ? data.detail.map((item) => item.msg || JSON.stringify(item)).join(' ')
-      : (data.detail || data.error || 'Request failed');
-    throw new Error(detail);
-  }
-  return data;
+  return await parseApiResponse(resp);
+}
+
+async function apiPut(path, payload = {}) {
+  const resp = await fetch(`${API_BASE}${path}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  return await parseApiResponse(resp);
+}
+
+async function apiDelete(path) {
+  const resp = await fetch(`${API_BASE}${path}`, { method: 'DELETE' });
+  return await parseApiResponse(resp);
 }
 
 function renderSubjectCards(containerId, subjects, onSelect) {
@@ -514,10 +578,178 @@ function playerShowFinal(lb) {
 // HOST
 // ════════════════════════════════════════════════════════════
 
+async function fetchLecturerSession() {
+  try {
+    const data = await apiGet('/api/lecturer/session');
+    lecturerSession = data.authenticated ? data.lecturer : null;
+  } catch (e) {
+    lecturerSession = null;
+  }
+  updateHostAccountBar();
+  return lecturerSession;
+}
+
+function updateHostAccountBar() {
+  const bar = $('#host-account-bar');
+  if (!bar) return;
+  const visible = !!(isHost && lecturerSession);
+  bar.hidden = !visible;
+  if (visible) {
+    $('#host-account-name').textContent = lecturerSession.name || lecturerSession.email || 'Lecturer';
+  }
+}
+
+function setAuthMode(mode) {
+  const loginTab = $('#btn-auth-tab-login');
+  const signupTab = $('#btn-auth-tab-signup');
+  const loginForm = $('#host-login-form');
+  const signupForm = $('#host-signup-form');
+  const isLogin = mode !== 'signup';
+  loginTab.classList.toggle('active', isLogin);
+  signupTab.classList.toggle('active', !isLogin);
+  loginForm.hidden = !isLogin;
+  signupForm.hidden = isLogin;
+  $('#host-auth-title').textContent = isLogin ? 'Lecturer Sign In' : 'Create Lecturer Account';
+}
+
+function showHostAuthScreen(mode = 'login', statusMessage = '', isError = false) {
+  isHost = true;
+  if (ws) closeWS({ reconnect: false });
+  setAuthMode(mode);
+  updateHostAccountBar();
+  showScreen('screen-host-auth');
+  showInlineStatus('#host-auth-status', statusMessage, isError);
+  const focusSelector = mode === 'signup' ? '#signup-name-input' : '#login-email-input';
+  setTimeout(() => {
+    const target = $(focusSelector);
+    if (target) target.focus();
+  }, 0);
+}
+
+async function enterHostArea() {
+  isHost = true;
+  location.hash = '#host';
+  const session = await fetchLecturerSession();
+  if (session) {
+    await initHost();
+  } else {
+    showHostAuthScreen('login');
+  }
+}
+
+function resetToStudentView() {
+  if (ws) closeWS({ reconnect: false });
+  isHost = false;
+  selectedTest = null;
+  selectedSubject = null;
+  hostSubjectCode = null;
+  editingTestId = null;
+  originalEditingTest = null;
+  currentDraftLoaded = null;
+  location.hash = '';
+  updateHostAccountBar();
+  initPlayer();
+}
+
+function bindHostAuthUI() {
+  if (authUiBound) return;
+  authUiBound = true;
+
+  $('#btn-host-link').addEventListener('click', () => {
+    enterHostArea();
+  });
+
+  $('#btn-auth-tab-login').addEventListener('click', () => {
+    setAuthMode('login');
+    showInlineStatus('#host-auth-status', '', false);
+  });
+
+  $('#btn-auth-tab-signup').addEventListener('click', () => {
+    setAuthMode('signup');
+    showInlineStatus('#host-auth-status', '', false);
+  });
+
+  $('#btn-auth-back').addEventListener('click', () => {
+    resetToStudentView();
+  });
+
+  $('#host-login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    showInlineStatus('#host-auth-status', '', false);
+    const btn = $('#btn-login-submit');
+    btn.disabled = true;
+    btn.textContent = 'Signing In...';
+    try {
+      await apiPost('/api/lecturer/login', {
+        email: $('#login-email-input').value.trim(),
+        password: $('#login-password-input').value
+      });
+      await fetchLecturerSession();
+      $('#login-password-input').value = '';
+      await initHost();
+    } catch (e) {
+      showInlineStatus('#host-auth-status', e.message, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Sign In';
+    }
+  });
+
+  $('#host-signup-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    showInlineStatus('#host-auth-status', '', false);
+    const password = $('#signup-password-input').value;
+    const confirm = $('#signup-password-confirm-input').value;
+    if (password !== confirm) {
+      showInlineStatus('#host-auth-status', 'Passwords do not match.', true);
+      return;
+    }
+    const btn = $('#btn-signup-submit');
+    btn.disabled = true;
+    btn.textContent = 'Creating Account...';
+    try {
+      await apiPost('/api/lecturer/signup', {
+        name: $('#signup-name-input').value.trim(),
+        email: $('#signup-email-input').value.trim(),
+        password
+      });
+      await fetchLecturerSession();
+      $('#signup-password-input').value = '';
+      $('#signup-password-confirm-input').value = '';
+      await initHost();
+    } catch (e) {
+      showInlineStatus('#host-auth-status', e.message, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Create Account';
+    }
+  });
+
+  $('#btn-host-logout').addEventListener('click', async () => {
+    try {
+      await apiPost('/api/lecturer/logout', {});
+    } catch (e) {
+      console.error(e);
+    }
+    lecturerSession = null;
+    updateHostAccountBar();
+    showHostAuthScreen('login', 'Signed out.');
+  });
+}
+
 async function initHost() {
+  const session = lecturerSession || await fetchLecturerSession();
+  if (!session) {
+    showHostAuthScreen('login');
+    return;
+  }
   isHost = true;
   selectedTest = null;
+  editingTestId = null;
+  currentDraftLoaded = null;
+  originalEditingTest = null;
   if (ws) closeWS({ reconnect: false });
+  updateHostAccountBar();
   showScreen('screen-host-subject');
 
   const subjects = await loadSubjects();
@@ -531,17 +763,19 @@ async function initHost() {
   const newBack = backBtn.cloneNode(true);
   backBtn.replaceWith(newBack);
   newBack.addEventListener('click', () => {
-    isHost = false;
-    location.hash = '';
-    location.reload();
+    resetToStudentView();
   });
 }
 
 async function showHostTestLibrary() {
+  if (!lecturerSession) {
+    showHostAuthScreen('login', 'Please sign in as a lecturer.');
+    return;
+  }
   if (ws) closeWS({ reconnect: false });
   showScreen('screen-host-tests');
   $('#host-tests-title').textContent = `${selectedSubject.name} (${selectedSubject.code})`;
-  $('#host-tests-subtitle').textContent = 'Choose a saved test or create a new one.';
+  $('#host-tests-subtitle').textContent = 'Choose a saved test, edit one you own, or create a new one.';
   showInlineStatus('#host-library-status', 'Loading tests...', false);
 
   const storage = await loadStorageStatus();
@@ -555,6 +789,12 @@ async function showHostTestLibrary() {
     renderHostTestCards(tests);
     showInlineStatus('#host-library-status', tests.length ? '' : 'No tests saved yet. Create your first one below.', false);
   } catch (e) {
+    if (e.status === 401) {
+      lecturerSession = null;
+      updateHostAccountBar();
+      showHostAuthScreen('login', 'Your lecturer session expired. Please sign in again.', true);
+      return;
+    }
     renderHostTestCards([]);
     showInlineStatus('#host-library-status', e.message, true);
   }
@@ -562,12 +802,19 @@ async function showHostTestLibrary() {
   const createBtn = $('#btn-create-test');
   const createClone = createBtn.cloneNode(true);
   createBtn.replaceWith(createClone);
-  createClone.addEventListener('click', () => showCreateTestScreen());
+  createClone.addEventListener('click', () => showCreateTestScreen({ mode: 'create' }));
 
   const backBtn = $('#btn-back-host-subjects');
   const backClone = backBtn.cloneNode(true);
   backBtn.replaceWith(backClone);
   backClone.addEventListener('click', () => initHost());
+}
+
+function formatDateTime(value) {
+  if (!value) return 'Just now';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return 'Just now';
+  return d.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
 }
 
 function renderHostTestCards(tests) {
@@ -586,12 +833,16 @@ function renderHostTestCards(tests) {
       : (test.source === 'built-in' ? 'Built-in starter quiz' : 'Temporary local test');
     const chapter = test.chapter ? `<p class="test-card-chapter">${escapeHtml(test.chapter)}</p>` : '';
     const desc = test.description ? `<p class="test-card-desc">${escapeHtml(test.description)}</p>` : '';
+    const owner = test.ownerName ? `<p class="test-card-owner">Owner: ${escapeHtml(test.ownerName)}</p>` : '';
+    const updated = `<p class="test-card-updated">Updated ${escapeHtml(formatDateTime(test.updated_at || test.created_at))}</p>`;
     card.innerHTML = `
       <div class="test-card-main">
         <div>
           <h3 class="test-card-title">${escapeHtml(test.title)}</h3>
           ${chapter}
           ${desc}
+          ${owner}
+          ${updated}
         </div>
         <div class="test-card-meta">
           <span class="test-pill">${test.questionCount} question${test.questionCount === 1 ? '' : 's'}</span>
@@ -600,36 +851,228 @@ function renderHostTestCards(tests) {
       </div>
       <div class="test-card-actions">
         <button class="btn btn-primary test-use-btn">Use This Test</button>
+        ${test.canEdit ? '<button class="btn btn-secondary test-edit-btn">Edit Test</button>' : ''}
       </div>
     `;
     card.querySelector('.test-use-btn').addEventListener('click', () => {
       selectedTest = test;
       startHostForTest(test);
     });
+    const editBtn = card.querySelector('.test-edit-btn');
+    if (editBtn) {
+      editBtn.addEventListener('click', () => showCreateTestScreen({ mode: 'edit', testId: test.id }));
+    }
     container.appendChild(card);
   });
 }
 
-function showCreateTestScreen() {
+function getDraftEditingId(draft) {
+  return draft?.editing_test_id || draft?.editingTestId || null;
+}
+
+function applyEditorData(data = {}) {
+  $('#test-title-input').value = data.title || '';
+  $('#test-chapter-input').value = data.chapter || '';
+  $('#test-description-input').value = data.description || '';
+  const questions = Array.isArray(data.questions) && data.questions.length
+    ? data.questions
+    : [{ q: '', options: ['', '', '', ''], correct: 0, explanation: '' }];
+  renderQuestionEditors(questions);
+}
+
+function resetDraftStatus(text = 'No draft changes yet.', isError = false) {
+  const el = $('#draft-status');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('error-text', !!isError);
+  el.classList.toggle('success-text', !isError && !!text && !text.toLowerCase().includes('unsaved'));
+  el.classList.toggle('muted-text', !isError && (!text || text.toLowerCase().includes('unsaved') || text.toLowerCase().includes('no draft')));
+}
+
+function markDraftDirty() {
+  draftDirty = true;
+  resetDraftStatus('Unsaved changes…', false);
+  if (draftSaveTimer) clearTimeout(draftSaveTimer);
+  draftSaveTimer = setTimeout(() => {
+    saveDraft({ silent: true });
+  }, 1500);
+}
+
+function bindEditorInputAutosave() {
+  if (editorInputBound) return;
+  editorInputBound = true;
+  const screen = $('#screen-host-create-test');
+  ['input', 'change'].forEach((evt) => {
+    screen.addEventListener(evt, (e) => {
+      if (!(e.target instanceof HTMLElement)) return;
+      if (!e.target.closest('.create-test-form')) return;
+      markDraftDirty();
+    });
+  });
+}
+
+function collectDraftFormPayload() {
+  const title = $('#test-title-input').value.trim();
+  const chapter = $('#test-chapter-input').value.trim();
+  const description = $('#test-description-input').value.trim();
+  const questionCards = Array.from(document.querySelectorAll('.question-editor-card'));
+  const questions = questionCards.map((card) => {
+    const q = card.querySelector('.editor-question').value.trim();
+    const options = Array.from(card.querySelectorAll('.editor-option')).map((input) => input.value.trim());
+    const correct = Number(card.querySelector('.editor-correct').value || 0);
+    const explanation = card.querySelector('.editor-explanation').value.trim();
+    return { q, options, correct, explanation };
+  });
+  return {
+    title,
+    chapter,
+    description,
+    questions,
+    editingTestId: editingTestId || null
+  };
+}
+
+async function saveDraft({ silent = false } = {}) {
+  if (!selectedSubject || !lecturerSession) return null;
+  if (draftSaveTimer) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+  const payload = collectDraftFormPayload();
+  try {
+    const resp = await apiPost(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`, payload);
+    draftDirty = false;
+    currentDraftLoaded = resp.draft || payload;
+    const updatedAt = resp.draft?.updated_at || new Date().toISOString();
+    resetDraftStatus(`Draft saved ${formatDateTime(updatedAt)}.`, false);
+    return resp.draft;
+  } catch (e) {
+    if (!silent) {
+      resetDraftStatus(e.message || 'Draft save failed.', true);
+    } else {
+      resetDraftStatus('Autosave failed. Use Save Draft before leaving.', true);
+    }
+    return null;
+  }
+}
+
+async function discardDraft() {
+  if (!selectedSubject) return;
+  if (!confirm('Discard the saved draft for this subject?')) return;
+  try {
+    await apiDelete(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`);
+    currentDraftLoaded = null;
+    draftDirty = false;
+    if (editorMode === 'edit' && originalEditingTest) {
+      applyEditorData(originalEditingTest);
+      resetDraftStatus('Draft discarded. Restored the saved test.', false);
+    } else {
+      applyEditorData({ title: '', chapter: '', description: '', questions: [] });
+      resetDraftStatus('Draft discarded.', false);
+    }
+  } catch (e) {
+    resetDraftStatus(e.message || 'Could not discard the draft.', true);
+  }
+}
+
+async function showCreateTestScreen(options = {}) {
+  if (!lecturerSession) {
+    showHostAuthScreen('login', 'Please sign in as a lecturer.');
+    return;
+  }
+  editorMode = options.mode || 'create';
+  editingTestId = options.testId || null;
+  draftDirty = false;
+  currentDraftLoaded = null;
+  originalEditingTest = null;
+
   showScreen('screen-host-create-test');
+  $('#create-test-title').textContent = editorMode === 'edit' ? 'Edit Test' : 'Create Test';
   $('#create-test-subject').textContent = `${selectedSubject.name} (${selectedSubject.code})`;
+  $('#btn-save-test').textContent = editorMode === 'edit' ? 'Update Test & Use It' : 'Save Test & Use It';
   showInlineStatus('#host-create-status', '', false);
-  $('#test-title-input').value = '';
-  $('#test-chapter-input').value = '';
-  $('#test-description-input').value = '';
-  renderQuestionEditors([
-    { q: '', options: ['', '', '', ''], correct: 0, explanation: '' }
-  ]);
+  resetDraftStatus('Loading editor...', false);
+
+  let draft = null;
+  try {
+    const draftResp = await apiGet(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`);
+    draft = draftResp.draft;
+  } catch (e) {
+    draft = null;
+  }
+
+  try {
+    if (editorMode === 'edit' && editingTestId) {
+      originalEditingTest = await apiGet(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(editingTestId)}`);
+      if (draft && getDraftEditingId(draft) === editingTestId) {
+        currentDraftLoaded = draft;
+        applyEditorData({
+          title: draft.title || '',
+          chapter: draft.chapter || '',
+          description: draft.description || '',
+          questions: draft.questions || []
+        });
+        resetDraftStatus(`Recovered your draft from ${formatDateTime(draft.updated_at)}.`, false);
+      } else {
+        applyEditorData(originalEditingTest);
+        resetDraftStatus('Editing the saved test.', false);
+      }
+    } else {
+      editingTestId = null;
+      originalEditingTest = null;
+      if (draft && !getDraftEditingId(draft)) {
+        currentDraftLoaded = draft;
+        applyEditorData({
+          title: draft.title || '',
+          chapter: draft.chapter || '',
+          description: draft.description || '',
+          questions: draft.questions || []
+        });
+        resetDraftStatus(`Recovered your draft from ${formatDateTime(draft.updated_at)}.`, false);
+      } else {
+        applyEditorData({ title: '', chapter: '', description: '', questions: [] });
+        resetDraftStatus('Start building your test. Drafts save automatically.', false);
+      }
+    }
+  } catch (e) {
+    showInlineStatus('#host-create-status', e.message, true);
+    applyEditorData({ title: '', chapter: '', description: '', questions: [] });
+    resetDraftStatus('Could not load the editor data.', true);
+  }
+
+  bindEditorInputAutosave();
 
   const addBtn = $('#btn-add-question');
   const addClone = addBtn.cloneNode(true);
   addBtn.replaceWith(addClone);
-  addClone.addEventListener('click', () => addQuestionEditor());
+  addClone.addEventListener('click', () => {
+    addQuestionEditor();
+    markDraftDirty();
+  });
 
   const cancelBtn = $('#btn-cancel-create-test');
   const cancelClone = cancelBtn.cloneNode(true);
   cancelBtn.replaceWith(cancelClone);
-  cancelClone.addEventListener('click', () => showHostTestLibrary());
+  cancelClone.addEventListener('click', async () => {
+    if (draftDirty) await saveDraft({ silent: false });
+    showHostTestLibrary();
+  });
+
+  const draftBtn = $('#btn-save-draft');
+  const draftClone = draftBtn.cloneNode(true);
+  draftBtn.replaceWith(draftClone);
+  draftClone.addEventListener('click', async () => {
+    draftClone.disabled = true;
+    draftClone.textContent = 'Saving Draft...';
+    await saveDraft({ silent: false });
+    draftClone.disabled = false;
+    draftClone.textContent = 'Save Draft';
+  });
+
+  const discardBtn = $('#btn-discard-draft');
+  const discardClone = discardBtn.cloneNode(true);
+  discardBtn.replaceWith(discardClone);
+  discardClone.addEventListener('click', discardDraft);
 
   const saveBtn = $('#btn-save-test');
   const saveClone = saveBtn.cloneNode(true);
@@ -637,16 +1080,22 @@ function showCreateTestScreen() {
   saveClone.addEventListener('click', async () => {
     showInlineStatus('#host-create-status', '', false);
     saveClone.disabled = true;
-    saveClone.textContent = 'Saving...';
+    saveClone.textContent = editorMode === 'edit' ? 'Updating...' : 'Saving...';
     try {
       const payload = collectTestFormPayload();
-      const resp = await apiPost(`/api/tests/${encodeURIComponent(selectedSubject.code)}`, payload);
+      const resp = editingTestId
+        ? await apiPut(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(editingTestId)}`, payload)
+        : await apiPost(`/api/tests/${encodeURIComponent(selectedSubject.code)}`, payload);
       selectedTest = resp.test;
+      currentDraftLoaded = null;
+      draftDirty = false;
+      editingTestId = null;
+      originalEditingTest = null;
       startHostForTest(resp.test);
     } catch (e) {
       showInlineStatus('#host-create-status', e.message, true);
       saveClone.disabled = false;
-      saveClone.textContent = 'Save Test & Use It';
+      saveClone.textContent = editorMode === 'edit' ? 'Update Test & Use It' : 'Save Test & Use It';
     }
   });
 }
@@ -654,7 +1103,10 @@ function showCreateTestScreen() {
 function renderQuestionEditors(questions) {
   const container = $('#question-editor-list');
   container.innerHTML = '';
-  questions.forEach((q) => addQuestionEditor(q));
+  const normalized = Array.isArray(questions) && questions.length
+    ? questions
+    : [{ q: '', options: ['', '', '', ''], correct: 0, explanation: '' }];
+  normalized.forEach((q) => addQuestionEditor(q));
 }
 
 function addQuestionEditor(data = { q: '', options: ['', '', '', ''], correct: 0, explanation: '' }) {
@@ -716,6 +1168,8 @@ function addQuestionEditor(data = { q: '', options: ['', '', '', ''], correct: 0
       return;
     }
     card.remove();
+    refreshQuestionEditorLabels();
+    markDraftDirty();
   });
   container.appendChild(card);
   refreshQuestionEditorLabels();
@@ -754,8 +1208,10 @@ function updateHostLobbyHeading() {
 
 function startHostForTest(testSummary) {
   selectedTest = testSummary;
+  statsAutoDownloaded = false;
   showScreen('screen-host-lobby');
   updateHostLobbyHeading();
+  updateHostAccountBar();
 
   connectWS(() => {
     send({ action: 'host_join', subject: hostSubjectCode, testId: selectedTest.id });
@@ -832,29 +1288,37 @@ function setupStatsDownload(selector) {
   btn.replaceWith(clone);
   clone.addEventListener('click', () => {
     if (!hostSubjectCode) return;
-    const url = `${API_BASE}/api/stats/${hostSubjectCode}`;
-    fetch(url)
-      .then(async (resp) => {
-        if (!resp.ok) {
-          const detail = await resp.json().catch(() => ({}));
-          throw new Error(detail.detail || detail.error || 'Download failed');
-        }
-        return resp.blob();
-      })
-      .then((blob) => {
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = `Stats_${hostSubjectCode}.xlsx`;
-        a.click();
-        URL.revokeObjectURL(a.href);
-      })
-      .catch((err) => {
-        clone.textContent = err.message || 'Download failed';
-        setTimeout(() => {
-          clone.textContent = 'Download Stats (Excel)';
-        }, 3000);
-      });
+    downloadStatsNow(hostSubjectCode, clone);
   });
+}
+
+function downloadStatsNow(subjectCode, buttonEl) {
+  const url = `${API_BASE}/api/stats/${subjectCode}`;
+  if (buttonEl) buttonEl.textContent = 'Downloading...';
+  fetch(url)
+    .then(async (resp) => {
+      if (!resp.ok) {
+        const detail = await resp.json().catch(() => ({}));
+        throw new Error(detail.detail || detail.error || 'Download failed');
+      }
+      return resp.blob();
+    })
+    .then((blob) => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `Stats_${subjectCode}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      if (buttonEl) buttonEl.textContent = 'Download Stats (Excel)';
+    })
+    .catch((err) => {
+      if (buttonEl) {
+        buttonEl.textContent = err.message || 'Download failed';
+        setTimeout(() => {
+          buttonEl.textContent = 'Download Stats (Excel)';
+        }, 3000);
+      }
+    });
 }
 
 function handleHostMessage(msg) {
@@ -896,6 +1360,11 @@ function handleHostMessage(msg) {
     case 'final':
       hostShowFinal(msg.leaderboard);
       $('#btn-download-stats-final').hidden = !msg.hasStats;
+      if (!statsAutoDownloaded && msg.hasStats && hostSubjectCode) {
+        statsAutoDownloaded = true;
+        const btn = $('#btn-download-stats-final');
+        downloadStatsNow(hostSubjectCode, btn);
+      }
       break;
   }
 }
@@ -1020,65 +1489,6 @@ function hostShowFinal(lb) {
 }
 
 // ════════════════════════════════════════════════════════════
-// PASSCODE MODAL
-// ════════════════════════════════════════════════════════════
-
-function hasHostSession() {
-  return sessionStorage.getItem(HOST_AUTH_KEY) === '1';
-}
-function setHostSession() {
-  sessionStorage.setItem(HOST_AUTH_KEY, '1');
-}
-function clearHostSession() {
-  sessionStorage.removeItem(HOST_AUTH_KEY);
-}
-function openPasscodeModal() {
-  const modal = $('#passcode-modal');
-  const passInput = $('#passcode-input');
-  const passError = $('#passcode-error');
-  passInput.value = '';
-  passError.hidden = true;
-  modal.hidden = false;
-  setTimeout(() => passInput.focus(), 0);
-}
-
-function setupPasscodeModal() {
-  const modal = $('#passcode-modal');
-  const passInput = $('#passcode-input');
-  const passError = $('#passcode-error');
-  const passSubmit = $('#btn-passcode-submit');
-  const passCancel = $('#btn-passcode-cancel');
-
-  $('#btn-host-link').addEventListener('click', () => {
-    if (hasHostSession()) {
-      location.hash = '#host';
-      initHost();
-      return;
-    }
-    openPasscodeModal();
-  });
-
-  passCancel.addEventListener('click', () => { modal.hidden = true; });
-  modal.addEventListener('click', (e) => { if (e.target === modal) modal.hidden = true; });
-
-  function submitPasscode() {
-    if (passInput.value.trim() === HOST_PASSCODE) {
-      setHostSession();
-      modal.hidden = true;
-      location.hash = '#host';
-      initHost();
-    } else {
-      passError.hidden = false;
-      passInput.value = '';
-      passInput.focus();
-    }
-  }
-
-  passSubmit.addEventListener('click', submitPasscode);
-  passInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitPasscode(); });
-}
-
-// ════════════════════════════════════════════════════════════
 // SHARED RENDERING
 // ════════════════════════════════════════════════════════════
 
@@ -1135,15 +1545,10 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-window.addEventListener('DOMContentLoaded', () => {
-  setupPasscodeModal();
+window.addEventListener('DOMContentLoaded', async () => {
+  bindHostAuthUI();
   if (location.hash === '#host') {
-    if (hasHostSession()) {
-      initHost();
-    } else {
-      initPlayer();
-      openPasscodeModal();
-    }
+    await enterHostArea();
   } else {
     initPlayer();
   }

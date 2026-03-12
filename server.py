@@ -9,9 +9,13 @@ Key ideas:
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import io
 import json
 import os
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -20,9 +24,9 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
@@ -185,6 +189,61 @@ REQUEST_TIMEOUT = 20
 # ──────────────────────────────────────────────────────────────────────────────
 # Test bank models + storage
 # ──────────────────────────────────────────────────────────────────────────────
+SESSION_COOKIE_NAME = "lecturer_session"
+SESSION_MAX_AGE = 60 * 60 * 24 * 14  # 14 days
+
+
+def _session_secret() -> str:
+    return (
+        os.environ.get("APP_SESSION_SECRET", "").strip()
+        or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+        or "engineering-quiz-dev-secret"
+    )
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    rounds = 260_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), rounds)
+    return f"pbkdf2_sha256${rounds}${salt}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algorithm, rounds_str, salt, digest = stored.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        rounds = int(rounds_str)
+    except Exception:
+        return False
+    candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), rounds).hex()
+    return hmac.compare_digest(candidate, digest)
+
+
+def create_session_token(lecturer_id: str) -> str:
+    expires = int(time.time()) + SESSION_MAX_AGE
+    payload = f"{lecturer_id}.{expires}"
+    signature = hmac.new(_session_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(f"{payload}.{signature.hex()}".encode("utf-8")).decode("utf-8")
+
+
+def parse_session_token(token: str | None) -> str | None:
+    if not token:
+        return None
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode("utf-8")).decode("utf-8")
+        lecturer_id, expires_str, signature = decoded.split(".", 2)
+        payload = f"{lecturer_id}.{expires_str}"
+        expected = hmac.new(_session_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        if int(expires_str) < int(time.time()):
+            return None
+        return lecturer_id
+    except Exception:
+        return None
+
+
 class QuestionPayload(BaseModel):
     q: str = Field(min_length=1, max_length=600)
     options: list[str]
@@ -250,17 +309,99 @@ class TestPayload(BaseModel):
         return value
 
 
-class SupabaseTestStore:
+class LecturerSignupPayload(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    email: str = Field(min_length=5, max_length=240)
+    password: str = Field(min_length=8, max_length=200)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        value = (value or "").strip()
+        if len(value) < 2:
+            raise ValueError("Name must be at least 2 characters.")
+        return value
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        value = (value or "").strip().lower()
+        if "@" not in value or "." not in value.split("@")[-1]:
+            raise ValueError("Please enter a valid email address.")
+        return value
+
+
+class LecturerLoginPayload(BaseModel):
+    email: str = Field(min_length=5, max_length=240)
+    password: str = Field(min_length=8, max_length=200)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        return (value or "").strip().lower()
+
+
+class DraftQuestionPayload(BaseModel):
+    q: str = Field(default="", max_length=600)
+    options: list[str] = Field(default_factory=lambda: ["", "", "", ""])
+    correct: int = Field(default=0, ge=0, le=3)
+    explanation: str = Field(default="", max_length=2000)
+
+    @field_validator("options")
+    @classmethod
+    def validate_options(cls, value: list[str]) -> list[str]:
+        value = list(value or [])[:4]
+        while len(value) < 4:
+            value.append("")
+        return [(item or "").strip()[:240] for item in value]
+
+    @field_validator("q")
+    @classmethod
+    def normalize_question_text(cls, value: str) -> str:
+        return (value or "").strip()
+
+    @field_validator("explanation")
+    @classmethod
+    def normalize_explanation(cls, value: str) -> str:
+        return (value or "").strip()
+
+
+class DraftPayload(BaseModel):
+    title: str = Field(default="", max_length=140)
+    chapter: str = Field(default="", max_length=140)
+    description: str = Field(default="", max_length=600)
+    questions: list[DraftQuestionPayload] = Field(default_factory=list)
+    editingTestId: str | None = None
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        return (value or "").strip()
+
+    @field_validator("chapter")
+    @classmethod
+    def normalize_chapter(cls, value: str) -> str:
+        return (value or "").strip()
+
+    @field_validator("description")
+    @classmethod
+    def normalize_description(cls, value: str) -> str:
+        return (value or "").strip()
+
+
+class SupabaseStore:
     def __init__(self, base_url: str, service_role_key: str):
         self.base_url = base_url.rstrip("/")
         self.service_role_key = service_role_key
-        self.rest_base = f"{self.base_url}/rest/v1/quiz_tests"
         self.session = requests.Session()
         self.session.headers.update({
             "apikey": self.service_role_key,
             "Authorization": f"Bearer {self.service_role_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         })
+        self.quiz_tests_base = f"{self.base_url}/rest/v1/quiz_tests"
+        self.lecturers_base = f"{self.base_url}/rest/v1/quiz_lecturers"
+        self.drafts_base = f"{self.base_url}/rest/v1/quiz_test_drafts"
 
     def _check_response(self, resp: requests.Response) -> None:
         if not resp.ok:
@@ -270,54 +411,154 @@ class SupabaseTestStore:
                 detail = resp.text
             raise RuntimeError(f"Supabase request failed: {detail}")
 
-    def list_tests(self, subject_code: str) -> list[dict[str, Any]]:
-        params = {
-            "select": "id,subject_code,title,chapter,description,question_count,created_at,updated_at",
-            "subject_code": f"eq.{subject_code}",
-            "order": "updated_at.desc"
-        }
-        resp = self.session.get(self.rest_base, params=params, timeout=REQUEST_TIMEOUT)
+    def _request(self, method: str, url: str, *, params=None, body=None, prefer: str | None = None) -> list[dict[str, Any]]:
+        headers = dict(self.session.headers)
+        if prefer:
+            headers["Prefer"] = prefer
+        resp = self.session.request(method, url, params=params, headers=headers, data=json.dumps(body) if body is not None else None, timeout=REQUEST_TIMEOUT)
         self._check_response(resp)
-        rows = resp.json()
+        if not resp.text:
+            return []
+        try:
+            return resp.json()
+        except Exception:
+            return []
+
+    def get_lecturer_by_email(self, email: str) -> dict[str, Any] | None:
+        rows = self._request("GET", self.lecturers_base, params={
+            "select": "id,name,email,password_hash,created_at,updated_at",
+            "email": f"eq.{email.lower()}",
+            "limit": "1",
+        })
+        return rows[0] if rows else None
+
+    def get_lecturer_by_id(self, lecturer_id: str) -> dict[str, Any] | None:
+        rows = self._request("GET", self.lecturers_base, params={
+            "select": "id,name,email,created_at,updated_at",
+            "id": f"eq.{lecturer_id}",
+            "limit": "1",
+        })
+        return rows[0] if rows else None
+
+    def create_lecturer(self, name: str, email: str, password_hash: str) -> dict[str, Any]:
+        rows = self._request("POST", self.lecturers_base, body={
+            "name": name,
+            "email": email.lower(),
+            "password_hash": password_hash,
+        }, prefer="return=representation")
+        if not rows:
+            raise RuntimeError("Supabase did not return the created lecturer.")
+        return rows[0]
+
+    def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
+        rows = self._request("GET", self.quiz_tests_base, params={
+            "select": "id,subject_code,title,chapter,description,question_count,created_at,updated_at,created_by,owner_name",
+            "subject_code": f"eq.{subject_code}",
+            "order": "updated_at.desc",
+        })
         for row in rows:
             row["source"] = "supabase"
+            row["can_edit"] = bool(lecturer_id and row.get("created_by") == lecturer_id)
         return rows
 
-    def get_test(self, subject_code: str, test_id: str) -> dict[str, Any] | None:
-        params = {
-            "select": "id,subject_code,title,chapter,description,questions,question_count,created_at,updated_at",
+    def get_test(self, subject_code: str, test_id: str, lecturer_id: str | None = None) -> dict[str, Any] | None:
+        rows = self._request("GET", self.quiz_tests_base, params={
+            "select": "id,subject_code,title,chapter,description,questions,question_count,created_at,updated_at,created_by,owner_name",
             "subject_code": f"eq.{subject_code}",
             "id": f"eq.{test_id}",
-            "limit": "1"
-        }
-        resp = self.session.get(self.rest_base, params=params, timeout=REQUEST_TIMEOUT)
-        self._check_response(resp)
-        rows = resp.json()
+            "limit": "1",
+        })
         if not rows:
             return None
         row = rows[0]
         row["source"] = "supabase"
+        row["can_edit"] = bool(lecturer_id and row.get("created_by") == lecturer_id)
         return row
 
-    def create_test(self, subject_code: str, payload: TestPayload) -> dict[str, Any]:
-        body = {
+    def create_test(self, subject_code: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
+        rows = self._request("POST", self.quiz_tests_base, body={
             "subject_code": subject_code,
             "title": payload.title,
             "chapter": payload.chapter or None,
             "description": payload.description or None,
             "question_count": len(payload.questions),
             "questions": [q.model_dump() for q in payload.questions],
-        }
-        headers = dict(self.session.headers)
-        headers["Prefer"] = "return=representation"
-        resp = self.session.post(self.rest_base, headers=headers, data=json.dumps(body), timeout=REQUEST_TIMEOUT)
-        self._check_response(resp)
-        rows = resp.json()
+            "created_by": lecturer["id"],
+            "updated_by": lecturer["id"],
+            "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
+        }, prefer="return=representation")
         if not rows:
             raise RuntimeError("Supabase did not return the created test.")
         row = rows[0]
         row["source"] = "supabase"
+        row["can_edit"] = True
         return row
+
+    def update_test(self, subject_code: str, test_id: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
+        existing = self.get_test(subject_code, test_id, lecturer["id"])
+        if not existing:
+            raise KeyError("Test not found")
+        if existing.get("created_by") and existing.get("created_by") != lecturer["id"]:
+            raise PermissionError("Only the lecturer who created this test can edit it.")
+        rows = self._request("PATCH", self.quiz_tests_base, params={
+            "subject_code": f"eq.{subject_code}",
+            "id": f"eq.{test_id}",
+        }, body={
+            "title": payload.title,
+            "chapter": payload.chapter or None,
+            "description": payload.description or None,
+            "question_count": len(payload.questions),
+            "questions": [q.model_dump() for q in payload.questions],
+            "updated_by": lecturer["id"],
+            "owner_name": existing.get("owner_name") or lecturer.get("name") or lecturer.get("email") or "Lecturer",
+            "updated_at": datetime.utcnow().isoformat(),
+        }, prefer="return=representation")
+        if not rows:
+            raise RuntimeError("Supabase did not return the updated test.")
+        row = rows[0]
+        row["source"] = "supabase"
+        row["can_edit"] = True
+        return row
+
+    def get_draft(self, subject_code: str, lecturer_id: str) -> dict[str, Any] | None:
+        rows = self._request("GET", self.drafts_base, params={
+            "select": "id,lecturer_id,subject_code,title,chapter,description,questions,question_count,editing_test_id,updated_at",
+            "lecturer_id": f"eq.{lecturer_id}",
+            "subject_code": f"eq.{subject_code}",
+            "limit": "1",
+        })
+        return rows[0] if rows else None
+
+    def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> dict[str, Any]:
+        existing = self.get_draft(subject_code, lecturer["id"])
+        body = {
+            "lecturer_id": lecturer["id"],
+            "subject_code": subject_code,
+            "title": payload.title,
+            "chapter": payload.chapter or None,
+            "description": payload.description or None,
+            "question_count": len(payload.questions),
+            "questions": [q.model_dump() for q in payload.questions],
+            "editing_test_id": payload.editingTestId,
+            "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        if existing:
+            rows = self._request("PATCH", self.drafts_base, params={
+                "id": f"eq.{existing['id']}",
+                "lecturer_id": f"eq.{lecturer['id']}",
+            }, body=body, prefer="return=representation")
+        else:
+            rows = self._request("POST", self.drafts_base, body=body, prefer="return=representation")
+        if not rows:
+            raise RuntimeError("Supabase did not return the saved draft.")
+        return rows[0]
+
+    def clear_draft(self, subject_code: str, lecturer_id: str) -> None:
+        self._request("DELETE", self.drafts_base, params={
+            "lecturer_id": f"eq.{lecturer_id}",
+            "subject_code": f"eq.{subject_code}",
+        })
 
 
 class HybridTestRepository:
@@ -325,11 +566,13 @@ class HybridTestRepository:
         self.subjects = subjects
         self.builtin_tests: dict[str, dict[str, dict[str, Any]]] = {}
         self.local_custom_tests: dict[str, dict[str, dict[str, Any]]] = {}
+        self.local_drafts: dict[tuple[str, str], dict[str, Any]] = {}
+        self.local_lecturers: dict[str, dict[str, Any]] = {}
         self._seed_builtin_tests()
 
         url = os.environ.get("SUPABASE_URL", "").strip()
         key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-        self.remote = SupabaseTestStore(url, key) if url and key else None
+        self.remote = SupabaseStore(url, key) if url and key else None
         self.storage_mode = "supabase" if self.remote else "in-memory"
 
     def _seed_builtin_tests(self) -> None:
@@ -350,16 +593,23 @@ class HybridTestRepository:
                     "created_at": None,
                     "updated_at": None,
                     "source": "built-in",
+                    "created_by": None,
+                    "owner_name": "System",
                 }
 
     def get_storage_status(self) -> dict[str, Any]:
         return {
             "mode": self.storage_mode,
             "supabaseConfigured": self.remote is not None,
-            "note": "Supabase storage is durable. In-memory storage resets on redeploy/restart." if self.remote is None else "Supabase storage is active."
+            "note": "Supabase storage is durable. In-memory storage resets on redeploy/restart." if self.remote is None else "Supabase storage is active.",
         }
 
-    def _summary(self, row: dict[str, Any]) -> dict[str, Any]:
+    def _summary(self, row: dict[str, Any], lecturer_id: str | None = None) -> dict[str, Any]:
+        created_by = row.get("created_by")
+        source = row.get("source", "supabase")
+        can_edit = False
+        if source not in {"built-in"}:
+            can_edit = bool(lecturer_id and created_by and created_by == lecturer_id)
         return {
             "id": row["id"],
             "subject_code": row["subject_code"],
@@ -367,49 +617,85 @@ class HybridTestRepository:
             "chapter": row.get("chapter") or "",
             "description": row.get("description") or "",
             "questionCount": row.get("question_count") or len(row.get("questions") or []),
-            "source": row.get("source", "supabase"),
+            "source": source,
             "created_at": row.get("created_at"),
             "updated_at": row.get("updated_at"),
+            "ownerName": row.get("owner_name") or "System",
+            "createdBy": created_by,
+            "canEdit": can_edit,
         }
 
-    def list_tests(self, subject_code: str) -> list[dict[str, Any]]:
+    def get_lecturer_by_email(self, email: str) -> dict[str, Any] | None:
+        email = email.strip().lower()
+        if self.remote is not None:
+            return self.remote.get_lecturer_by_email(email)
+        return self.local_lecturers.get(email)
+
+    def get_lecturer_by_id(self, lecturer_id: str) -> dict[str, Any] | None:
+        if self.remote is not None:
+            return self.remote.get_lecturer_by_id(lecturer_id)
+        for row in self.local_lecturers.values():
+            if row["id"] == lecturer_id:
+                return {k: v for k, v in row.items() if k != "password_hash"}
+        return None
+
+    def create_lecturer(self, payload: LecturerSignupPayload) -> dict[str, Any]:
+        if self.get_lecturer_by_email(payload.email):
+            raise ValueError("An account with that email already exists.")
+        password_hash = hash_password(payload.password)
+        if self.remote is not None:
+            return self.remote.create_lecturer(payload.name, payload.email, password_hash)
+        row = {
+            "id": str(uuid.uuid4()),
+            "name": payload.name,
+            "email": payload.email,
+            "password_hash": password_hash,
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        self.local_lecturers[payload.email] = row
+        return {k: v for k, v in row.items() if k != "password_hash"}
+
+    def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
         if subject_code not in self.subjects:
             raise KeyError(subject_code)
 
         tests: list[dict[str, Any]] = []
-
-        # Built-in first so the existing default mechanics quiz remains available.
         builtin_rows = list(self.builtin_tests.get(subject_code, {}).values())
-        tests.extend(self._summary(row) for row in builtin_rows)
+        tests.extend(self._summary(row, lecturer_id) for row in builtin_rows)
 
         remote_rows: list[dict[str, Any]] = []
         if self.remote is not None:
-            remote_rows = self.remote.list_tests(subject_code)
+            remote_rows = self.remote.list_tests(subject_code, lecturer_id)
         local_rows = list(self.local_custom_tests.get(subject_code, {}).values())
 
-        tests.extend(self._summary(row) for row in remote_rows)
-        tests.extend(self._summary(row) for row in local_rows)
+        tests.extend(self._summary(row, lecturer_id) for row in remote_rows)
+        tests.extend(self._summary(row, lecturer_id) for row in local_rows)
         return tests
 
-    def get_test(self, subject_code: str, test_id: str) -> dict[str, Any] | None:
+    def get_test(self, subject_code: str, test_id: str, lecturer_id: str | None = None) -> dict[str, Any] | None:
         if test_id in self.builtin_tests.get(subject_code, {}):
-            return self.builtin_tests[subject_code][test_id]
+            row = self.builtin_tests[subject_code][test_id]
+            row["can_edit"] = False
+            return row
         if test_id in self.local_custom_tests.get(subject_code, {}):
-            return self.local_custom_tests[subject_code][test_id]
+            row = self.local_custom_tests[subject_code][test_id]
+            row["can_edit"] = bool(lecturer_id and row.get("created_by") == lecturer_id)
+            return row
         if self.remote is not None:
-            return self.remote.get_test(subject_code, test_id)
+            return self.remote.get_test(subject_code, test_id, lecturer_id)
         return None
 
-    def create_test(self, subject_code: str, payload: TestPayload) -> dict[str, Any]:
+    def create_test(self, subject_code: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
         if subject_code not in self.subjects:
             raise KeyError(subject_code)
-
         if self.remote is not None:
-            row = self.remote.create_test(subject_code, payload)
+            row = self.remote.create_test(subject_code, payload, lecturer)
             row.setdefault("question_count", len(payload.questions))
             row.setdefault("questions", [q.model_dump() for q in payload.questions])
+            row.setdefault("owner_name", lecturer.get("name") or lecturer.get("email") or "Lecturer")
+            row.setdefault("created_by", lecturer["id"])
             return row
-
         test_id = f"local:{uuid.uuid4()}"
         row = {
             "id": test_id,
@@ -422,9 +708,66 @@ class HybridTestRepository:
             "created_at": datetime.utcnow().isoformat(),
             "updated_at": datetime.utcnow().isoformat(),
             "source": "in-memory",
+            "created_by": lecturer["id"],
+            "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
         }
         self.local_custom_tests.setdefault(subject_code, {})[test_id] = row
         return row
+
+    def update_test(self, subject_code: str, test_id: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
+        if test_id in self.builtin_tests.get(subject_code, {}):
+            raise PermissionError("Built-in tests cannot be edited.")
+        if self.remote is not None:
+            row = self.remote.update_test(subject_code, test_id, payload, lecturer)
+            row.setdefault("question_count", len(payload.questions))
+            row.setdefault("questions", [q.model_dump() for q in payload.questions])
+            row.setdefault("owner_name", lecturer.get("name") or lecturer.get("email") or "Lecturer")
+            row.setdefault("created_by", lecturer["id"])
+            return row
+        row = self.local_custom_tests.get(subject_code, {}).get(test_id)
+        if not row:
+            raise KeyError("Test not found")
+        if row.get("created_by") and row.get("created_by") != lecturer["id"]:
+            raise PermissionError("Only the lecturer who created this test can edit it.")
+        row.update({
+            "title": payload.title,
+            "chapter": payload.chapter,
+            "description": payload.description,
+            "question_count": len(payload.questions),
+            "questions": [q.model_dump() for q in payload.questions],
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+        return row
+
+    def get_draft(self, subject_code: str, lecturer: dict[str, Any]) -> dict[str, Any] | None:
+        if self.remote is not None:
+            return self.remote.get_draft(subject_code, lecturer["id"])
+        return self.local_drafts.get((lecturer["id"], subject_code))
+
+    def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> dict[str, Any]:
+        if self.remote is not None:
+            return self.remote.save_draft(subject_code, lecturer, payload)
+        row = {
+            "id": self.local_drafts.get((lecturer["id"], subject_code), {}).get("id", f"draft:{uuid.uuid4()}"),
+            "lecturer_id": lecturer["id"],
+            "subject_code": subject_code,
+            "title": payload.title,
+            "chapter": payload.chapter,
+            "description": payload.description,
+            "question_count": len(payload.questions),
+            "questions": [q.model_dump() for q in payload.questions],
+            "editing_test_id": payload.editingTestId,
+            "updated_at": datetime.utcnow().isoformat(),
+            "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
+        }
+        self.local_drafts[(lecturer["id"], subject_code)] = row
+        return row
+
+    def clear_draft(self, subject_code: str, lecturer: dict[str, Any]) -> None:
+        if self.remote is not None:
+            self.remote.clear_draft(subject_code, lecturer["id"])
+            return
+        self.local_drafts.pop((lecturer["id"], subject_code), None)
 
 
 repo = HybridTestRepository(SUBJECTS)
@@ -517,6 +860,51 @@ def app_js():
     return FileResponse(BASE_DIR / "app.js", media_type="application/javascript")
 
 
+def public_lecturer_view(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "name": row.get("name") or "Lecturer",
+        "email": row.get("email"),
+    }
+
+
+def set_session_cookie(response: JSONResponse, lecturer_id: str, request: Request) -> None:
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        create_session_token(lecturer_id),
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+        max_age=SESSION_MAX_AGE,
+        path="/",
+    )
+
+
+def clear_session_cookie(response: JSONResponse) -> None:
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+
+
+def current_lecturer_from_request(request: Request) -> dict[str, Any] | None:
+    lecturer_id = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME))
+    if not lecturer_id:
+        return None
+    return repo.get_lecturer_by_id(lecturer_id)
+
+
+def require_lecturer(request: Request) -> dict[str, Any]:
+    lecturer = current_lecturer_from_request(request)
+    if not lecturer:
+        raise HTTPException(status_code=401, detail="Lecturer sign-in required")
+    return lecturer
+
+
+def current_lecturer_from_websocket(websocket: WebSocket) -> dict[str, Any] | None:
+    lecturer_id = parse_session_token(websocket.cookies.get(SESSION_COOKIE_NAME))
+    if not lecturer_id:
+        return None
+    return repo.get_lecturer_by_id(lecturer_id)
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True, "storage": repo.get_storage_status()}
@@ -525,6 +913,53 @@ def health():
 @app.get("/api/storage-status")
 def storage_status():
     return repo.get_storage_status()
+
+
+@app.get("/api/lecturer/session")
+def lecturer_session(request: Request):
+    lecturer = current_lecturer_from_request(request)
+    return {"authenticated": bool(lecturer), "lecturer": public_lecturer_view(lecturer) if lecturer else None}
+
+
+@app.post("/api/lecturer/signup")
+def lecturer_signup(payload: dict[str, Any], request: Request):
+    try:
+        validated = LecturerSignupPayload.model_validate(payload)
+        lecturer = repo.create_lecturer(validated)
+        response = JSONResponse({"ok": True, "lecturer": public_lecturer_view(lecturer)})
+        set_session_cookie(response, lecturer["id"], request)
+        return response
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/lecturer/login")
+def lecturer_login(payload: dict[str, Any], request: Request):
+    try:
+        validated = LecturerLoginPayload.model_validate(payload)
+        lecturer = repo.get_lecturer_by_email(validated.email)
+        if not lecturer or not verify_password(validated.password, lecturer.get("password_hash", "")):
+            raise HTTPException(status_code=401, detail="Incorrect email or password")
+        response = JSONResponse({"ok": True, "lecturer": public_lecturer_view(lecturer)})
+        set_session_cookie(response, lecturer["id"], request)
+        return response
+    except HTTPException:
+        raise
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/lecturer/logout")
+def lecturer_logout():
+    response = JSONResponse({"ok": True})
+    clear_session_cookie(response)
+    return response
 
 
 @app.get("/api/subjects")
@@ -544,25 +979,116 @@ def get_subjects():
 
 
 @app.get("/api/tests/{subject_code}")
-def get_tests(subject_code: str):
+def get_tests(subject_code: str, request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
+    lecturer = require_lecturer(request)
     try:
-        return repo.list_tests(subject_code)
+        return repo.list_tests(subject_code, lecturer.get("id"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/tests/{subject_code}/{test_id}")
+def get_test_detail(subject_code: str, test_id: str, request: Request):
+    if subject_code not in SUBJECTS:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    lecturer = require_lecturer(request)
+    try:
+        row = repo.get_test(subject_code, test_id, lecturer.get("id"))
+        if not row:
+            raise HTTPException(status_code=404, detail="Test not found")
+        return {
+            "id": row["id"],
+            "subject_code": row["subject_code"],
+            "title": row.get("title") or "",
+            "chapter": row.get("chapter") or "",
+            "description": row.get("description") or "",
+            "questions": row.get("questions") or [],
+            "questionCount": row.get("question_count") or len(row.get("questions") or []),
+            "source": row.get("source", "supabase"),
+            "ownerName": row.get("owner_name") or "System",
+            "canEdit": bool(row.get("can_edit") or (row.get("created_by") == lecturer.get("id"))),
+        }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/api/tests/{subject_code}")
-def create_test(subject_code: str, payload: dict[str, Any]):
+def create_test(subject_code: str, payload: dict[str, Any], request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
+    lecturer = require_lecturer(request)
     try:
         validated = TestPayload.model_validate(payload)
-        created = repo.create_test(subject_code, validated)
-        return {"ok": True, "test": repo._summary(created)}
+        created = repo.create_test(subject_code, validated, lecturer)
+        repo.clear_draft(subject_code, lecturer)
+        return {"ok": True, "test": repo._summary(created, lecturer.get("id"))}
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors())
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.put("/api/tests/{subject_code}/{test_id}")
+def update_test(subject_code: str, test_id: str, payload: dict[str, Any], request: Request):
+    if subject_code not in SUBJECTS:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    lecturer = require_lecturer(request)
+    try:
+        validated = TestPayload.model_validate(payload)
+        updated = repo.update_test(subject_code, test_id, validated, lecturer)
+        repo.clear_draft(subject_code, lecturer)
+        return {"ok": True, "test": repo._summary(updated, lecturer.get("id"))}
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors())
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Test not found")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/drafts/{subject_code}")
+def get_test_draft(subject_code: str, request: Request):
+    if subject_code not in SUBJECTS:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    lecturer = require_lecturer(request)
+    try:
+        draft = repo.get_draft(subject_code, lecturer)
+        return {"draft": draft}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/drafts/{subject_code}")
+def save_test_draft(subject_code: str, payload: dict[str, Any], request: Request):
+    if subject_code not in SUBJECTS:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    lecturer = require_lecturer(request)
+    try:
+        validated = DraftPayload.model_validate(payload)
+        draft = repo.save_draft(subject_code, lecturer, validated)
+        return {"ok": True, "draft": draft}
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors())
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/api/drafts/{subject_code}")
+def clear_test_draft(subject_code: str, request: Request):
+    if subject_code not in SUBJECTS:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    lecturer = require_lecturer(request)
+    try:
+        repo.clear_draft(subject_code, lecturer)
+        return {"ok": True}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -883,7 +1409,11 @@ async def force_end_game(room: GameRoom) -> None:
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    visitor_id = websocket.headers.get("x-visitor-id", str(uuid.uuid4()))
+    visitor_id = (
+        websocket.headers.get("x-visitor-id")
+        or websocket.query_params.get("visitorId")
+        or str(uuid.uuid4())
+    )
     role = None
     room = None
 
@@ -894,6 +1424,10 @@ async def websocket_endpoint(websocket: WebSocket):
             action = msg.get("action")
 
             if action == "host_join":
+                lecturer = current_lecturer_from_websocket(websocket)
+                if not lecturer:
+                    await websocket.send_text(json.dumps({"type": "auth_required", "message": "Lecturer sign-in required"}))
+                    continue
                 subject_code = msg.get("subject")
                 test_id = msg.get("testId")
                 if subject_code not in rooms:
@@ -958,6 +1492,9 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == "end_game":
                 if role == "host" and room is not None:
                     await force_end_game(room)
+
+            elif action == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
 
             elif action == "player_join":
                 subject_code = msg.get("subject")

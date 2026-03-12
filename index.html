@@ -27,6 +27,14 @@
 <body>
 <div id="app">
 
+<div id="host-account-bar" class="host-account-bar" hidden>
+  <div class="host-account-meta">
+    <span class="host-account-label">Lecturer</span>
+    <span id="host-account-name" class="host-account-name">Not signed in</span>
+  </div>
+  <button id="btn-host-logout" class="btn btn-secondary host-logout-btn">Log out</button>
+</div>
+
   <!-- ==================== SUBJECT SELECTION ==================== -->
   <div id="screen-subject" class="screen active">
     <div class="subject-container">
@@ -152,6 +160,51 @@
 
   <!-- ==================== HOST SCREENS ==================== -->
 
+  <!-- HOST: Lecturer Auth -->
+  <div id="screen-host-auth" class="screen">
+    <div class="auth-container">
+      <div class="auth-card">
+        <div class="host-tests-header">
+          <h1 class="host-title" id="host-auth-title">Lecturer Sign In</h1>
+          <p class="host-subtitle">Create your lecturer account or sign in to manage saved tests.</p>
+        </div>
+        <div class="auth-toggle" role="tablist" aria-label="Lecturer authentication mode">
+          <button id="btn-auth-tab-login" class="auth-tab active" type="button">Sign In</button>
+          <button id="btn-auth-tab-signup" class="auth-tab" type="button">Create Account</button>
+        </div>
+        <p id="host-auth-status" class="inline-status" hidden></p>
+
+        <form id="host-login-form" class="auth-form">
+          <label for="login-email-input" class="input-label">Email address</label>
+          <input type="email" id="login-email-input" class="editor-input" placeholder="lecturer@example.com" autocomplete="username email">
+
+          <label for="login-password-input" class="input-label">Password</label>
+          <input type="password" id="login-password-input" class="editor-input" placeholder="Password" autocomplete="current-password">
+
+          <button id="btn-login-submit" class="btn btn-primary btn-large" type="submit">Sign In</button>
+        </form>
+
+        <form id="host-signup-form" class="auth-form" hidden>
+          <label for="signup-name-input" class="input-label">Full name</label>
+          <input type="text" id="signup-name-input" class="editor-input" placeholder="Dr Jane Smith" autocomplete="name">
+
+          <label for="signup-email-input" class="input-label">Email address</label>
+          <input type="email" id="signup-email-input" class="editor-input" placeholder="lecturer@example.com" autocomplete="username email">
+
+          <label for="signup-password-input" class="input-label">Password</label>
+          <input type="password" id="signup-password-input" class="editor-input" placeholder="At least 8 characters" autocomplete="new-password">
+
+          <label for="signup-password-confirm-input" class="input-label">Confirm password</label>
+          <input type="password" id="signup-password-confirm-input" class="editor-input" placeholder="Repeat your password" autocomplete="new-password">
+
+          <button id="btn-signup-submit" class="btn btn-primary btn-large" type="submit">Create Account</button>
+        </form>
+
+        <button id="btn-auth-back" class="back-link">&larr; Back to student view</button>
+      </div>
+    </div>
+  </div>
+
   <!-- HOST: Subject Selection -->
   <div id="screen-host-subject" class="screen">
     <div class="subject-container">
@@ -190,7 +243,7 @@
   <div id="screen-host-create-test" class="screen">
     <div class="create-test-container">
       <div class="host-tests-header">
-        <h1 class="host-title">Create Test</h1>
+        <h1 class="host-title" id="create-test-title">Create Test</h1>
         <p class="host-subtitle" id="create-test-subject"></p>
       </div>
       <p id="host-create-status" class="inline-status" hidden></p>
@@ -210,7 +263,12 @@
         </div>
         <div id="question-editor-list" class="question-editor-list"></div>
       </div>
+      <div class="draft-status-row">
+        <p id="draft-status" class="draft-status-text">No draft changes yet.</p>
+      </div>
       <div class="create-test-actions">
+        <button id="btn-save-draft" class="btn btn-secondary">Save Draft</button>
+        <button id="btn-discard-draft" class="btn btn-danger">Discard Draft</button>
         <button id="btn-save-test" class="btn btn-primary btn-large">Save Test &amp; Use It</button>
         <button id="btn-cancel-create-test" class="btn btn-secondary">Back to Test Library</button>
       </div>
@@ -316,19 +374,6 @@
 
 </div>
 
-<!-- Passcode Modal -->
-<div id="passcode-modal" class="modal-overlay" hidden>
-  <div class="modal-box">
-    <h3 class="modal-title">Lecturer Access</h3>
-    <p class="modal-desc">Enter the passcode to host a game</p>
-    <input type="password" id="passcode-input" class="nickname-input" placeholder="Passcode" maxlength="30" autocomplete="off">
-    <p id="passcode-error" class="modal-error" hidden>Incorrect passcode</p>
-    <div class="modal-actions">
-      <button id="btn-passcode-cancel" class="btn modal-btn-cancel">Cancel</button>
-      <button id="btn-passcode-submit" class="btn btn-primary modal-btn-submit">Enter</button>
-    </div>
-  </div>
-</div>
 
 <footer class="site-footer">
   <a href="https://www.perplexity.ai/computer" target="_blank" rel="noopener noreferrer">Created with Perplexity Computer</a>
