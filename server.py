@@ -571,7 +571,7 @@ class HybridTestRepository:
         self.local_drafts: dict[tuple[str, str], dict[str, Any]] = {}
         self.local_lecturers: dict[str, dict[str, Any]] = {}
         self.local_store_path = LOCAL_STORE_PATH
-        self.local_store_enabled = False
+        self.local_store_enabled = True
         self.local_store_error: str | None = None
         self.supabase_configured = False
         self.supabase_error: str | None = None
@@ -582,7 +582,6 @@ class HybridTestRepository:
         key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
         self.supabase_configured = bool(url and key)
         self.remote = SupabaseStore(url, key) if self.supabase_configured else None
-        self.local_store_enabled = self.remote is None
         self._set_storage_mode()
 
     def _set_storage_mode(self) -> None:
@@ -664,7 +663,13 @@ class HybridTestRepository:
 
     def _handle_supabase_error(self, exc: RuntimeError) -> bool:
         message = str(exc)
-        if "PGRST205" in message or "schema cache" in message:
+        message_lower = message.lower()
+        if (
+            "pgrst205" in message_lower
+            or "schema cache" in message_lower
+            or ("could not find the table" in message_lower)
+            or ("relation" in message_lower and "does not exist" in message_lower)
+        ):
             self.supabase_error = message
             self.remote = None
             self.local_store_enabled = True
@@ -681,6 +686,12 @@ class HybridTestRepository:
             if self._handle_supabase_error(exc):
                 return fallback()
             raise
+        except requests.RequestException as exc:
+            self.supabase_error = str(exc)
+            self.remote = None
+            self.local_store_enabled = True
+            self._set_storage_mode()
+            return fallback()
 
     def _seed_builtin_tests(self) -> None:
         for code, info in self.subjects.items():
@@ -748,10 +759,23 @@ class HybridTestRepository:
 
     def get_lecturer_by_email(self, email: str) -> dict[str, Any] | None:
         email = email.strip().lower()
-        return self._call_remote(
-            lambda: self.remote.get_lecturer_by_email(email),
-            lambda: self.local_lecturers.get(email)
-        )
+        def _local_lookup():
+            return self.local_lecturers.get(email)
+        if self.remote is None:
+            return _local_lookup()
+        try:
+            row = self.remote.get_lecturer_by_email(email)
+        except RuntimeError as exc:
+            if self._handle_supabase_error(exc):
+                return _local_lookup()
+            raise
+        except requests.RequestException as exc:
+            self.supabase_error = str(exc)
+            self.remote = None
+            self.local_store_enabled = True
+            self._set_storage_mode()
+            return _local_lookup()
+        return row or _local_lookup()
 
     def get_lecturer_by_id(self, lecturer_id: str) -> dict[str, Any] | None:
         def _local_lookup():
@@ -759,10 +783,21 @@ class HybridTestRepository:
                 if row["id"] == lecturer_id:
                     return {k: v for k, v in row.items() if k != "password_hash"}
             return None
-        return self._call_remote(
-            lambda: self.remote.get_lecturer_by_id(lecturer_id),
-            _local_lookup
-        )
+        if self.remote is None:
+            return _local_lookup()
+        try:
+            row = self.remote.get_lecturer_by_id(lecturer_id)
+        except RuntimeError as exc:
+            if self._handle_supabase_error(exc):
+                return _local_lookup()
+            raise
+        except requests.RequestException as exc:
+            self.supabase_error = str(exc)
+            self.remote = None
+            self.local_store_enabled = True
+            self._set_storage_mode()
+            return _local_lookup()
+        return row or _local_lookup()
 
     def create_lecturer(self, payload: LecturerSignupPayload) -> dict[str, Any]:
         if self.get_lecturer_by_email(payload.email):
@@ -797,9 +832,7 @@ class HybridTestRepository:
             lambda: self.remote.list_tests(subject_code, lecturer_id),
             lambda: []
         )
-        local_rows = []
-        if self.remote is None:
-            local_rows = list(self.local_custom_tests.get(subject_code, {}).values())
+        local_rows = list(self.local_custom_tests.get(subject_code, {}).values())
 
         tests.extend(self._summary(row, lecturer_id) for row in remote_rows)
         tests.extend(self._summary(row, lecturer_id) for row in local_rows)
@@ -810,7 +843,7 @@ class HybridTestRepository:
             row = self.builtin_tests[subject_code][test_id]
             row["can_edit"] = False
             return row
-        if self.remote is None and test_id in self.local_custom_tests.get(subject_code, {}):
+        if test_id in self.local_custom_tests.get(subject_code, {}):
             row = self.local_custom_tests[subject_code][test_id]
             row["can_edit"] = bool(lecturer_id and row.get("created_by") == lecturer_id)
             return row
