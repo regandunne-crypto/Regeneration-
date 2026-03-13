@@ -184,8 +184,14 @@ TIME_PER_Q = 30
 MAX_POINTS = 1000
 MIN_POINTS = 200
 REQUEST_TIMEOUT = 20
-LOCAL_STORE_PATH = Path(__file__).resolve().parent / "local_store.json"
+REQUIRE_SUPABASE = os.environ.get("REQUIRE_SUPABASE", "").strip().lower() in {"1", "true", "yes", "on"}
+_local_store_env = os.environ.get("LOCAL_STORE_PATH", "").strip()
+LOCAL_STORE_PATH = Path(_local_store_env).expanduser() if _local_store_env else (Path(__file__).resolve().parent / "local_store.json")
 LOCAL_STORE_VERSION = 1
+
+
+class SupabaseUnavailable(RuntimeError):
+    pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -573,6 +579,7 @@ class HybridTestRepository:
         self.local_store_path = LOCAL_STORE_PATH
         self.local_store_enabled = True
         self.local_store_error: str | None = None
+        self.require_supabase = REQUIRE_SUPABASE
         self.supabase_configured = False
         self.supabase_error: str | None = None
         self._seed_builtin_tests()
@@ -591,6 +598,13 @@ class HybridTestRepository:
             self.storage_mode = "local-file"
         else:
             self.storage_mode = "in-memory"
+
+    def supabase_unavailable(self) -> bool:
+        return self.supabase_configured and self.remote is None and bool(self.supabase_error)
+
+    def _ensure_supabase_for_write(self) -> None:
+        if self.require_supabase and self.supabase_configured and self.remote is None:
+            raise SupabaseUnavailable("Supabase is unavailable. Writes are disabled while REQUIRE_SUPABASE is enabled.")
 
     def _draft_key(self, lecturer_id: str, subject_code: str) -> str:
         return f"{lecturer_id}::{subject_code}"
@@ -733,7 +747,7 @@ class HybridTestRepository:
                 if self.supabase_configured and self.supabase_error:
                     note = "Supabase configured but schema is missing. Using local file storage."
                 else:
-                    note = "Local file storage is active on this server."
+                    note = "Local file storage is active on this server. Data resets on redeploy unless a persistent disk is used."
             else:
                 if self.supabase_configured and self.supabase_error:
                     note = "Supabase configured but schema is missing. Running in-memory until the schema is applied."
@@ -815,6 +829,7 @@ class HybridTestRepository:
         return row or _local_lookup()
 
     def create_lecturer(self, payload: LecturerSignupPayload) -> dict[str, Any]:
+        self._ensure_supabase_for_write()
         if self.get_lecturer_by_email(payload.email):
             raise ValueError("An account with that email already exists.")
         password_hash = hash_password(payload.password)
@@ -870,6 +885,7 @@ class HybridTestRepository:
         )
 
     def create_test(self, subject_code: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_supabase_for_write()
         if subject_code not in self.subjects:
             raise KeyError(subject_code)
         def _local_create():
@@ -901,6 +917,7 @@ class HybridTestRepository:
         return self._call_remote(_remote_create, _local_create)
 
     def update_test(self, subject_code: str, test_id: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_supabase_for_write()
         if test_id in self.builtin_tests.get(subject_code, {}):
             raise PermissionError("Built-in tests cannot be edited.")
         def _local_update():
@@ -935,6 +952,7 @@ class HybridTestRepository:
         )
 
     def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> dict[str, Any]:
+        self._ensure_supabase_for_write()
         def _local_save():
             row = {
                 "id": self.local_drafts.get((lecturer["id"], subject_code), {}).get("id", f"draft:{uuid.uuid4()}"),
@@ -958,6 +976,7 @@ class HybridTestRepository:
         )
 
     def clear_draft(self, subject_code: str, lecturer: dict[str, Any]) -> None:
+        self._ensure_supabase_for_write()
         def _local_clear():
             self.local_drafts.pop((lecturer["id"], subject_code), None)
             self._persist_local_store()
@@ -1130,6 +1149,8 @@ def lecturer_signup(payload: dict[str, Any], request: Request):
         raise HTTPException(status_code=422, detail=exc.errors())
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except SupabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -1139,7 +1160,11 @@ def lecturer_login(payload: dict[str, Any], request: Request):
     try:
         validated = LecturerLoginPayload.model_validate(payload)
         lecturer = repo.get_lecturer_by_email(validated.email)
-        if not lecturer or not verify_password(validated.password, lecturer.get("password_hash", "")):
+        if not lecturer:
+            if repo.supabase_unavailable():
+                raise HTTPException(status_code=503, detail="Supabase is unavailable. Please try again once it is restored.")
+            raise HTTPException(status_code=401, detail="Incorrect email or password")
+        if not verify_password(validated.password, lecturer.get("password_hash", "")):
             raise HTTPException(status_code=401, detail="Incorrect email or password")
         response = JSONResponse({"ok": True, "lecturer": public_lecturer_view(lecturer)})
         set_session_cookie(response, lecturer["id"], request)
@@ -1223,6 +1248,8 @@ def create_test(subject_code: str, payload: dict[str, Any], request: Request):
         created = repo.create_test(subject_code, validated, lecturer)
         repo.clear_draft(subject_code, lecturer)
         return {"ok": True, "test": repo._summary(created, lecturer.get("id"))}
+    except SupabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors())
     except PermissionError as exc:
@@ -1241,6 +1268,8 @@ def update_test(subject_code: str, test_id: str, payload: dict[str, Any], reques
         updated = repo.update_test(subject_code, test_id, validated, lecturer)
         repo.clear_draft(subject_code, lecturer)
         return {"ok": True, "test": repo._summary(updated, lecturer.get("id"))}
+    except SupabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors())
     except KeyError:
@@ -1272,6 +1301,8 @@ def save_test_draft(subject_code: str, payload: dict[str, Any], request: Request
         validated = DraftPayload.model_validate(payload)
         draft = repo.save_draft(subject_code, lecturer, validated)
         return {"ok": True, "draft": draft}
+    except SupabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors())
     except Exception as exc:
@@ -1286,6 +1317,8 @@ def clear_test_draft(subject_code: str, request: Request):
     try:
         repo.clear_draft(subject_code, lecturer)
         return {"ok": True}
+    except SupabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
