@@ -661,6 +661,18 @@ class HybridTestRepository:
             self.local_store_enabled = False
             self._set_storage_mode()
 
+    def _cache_lecturer_row(self, row: dict[str, Any] | None) -> None:
+        if not row or "password_hash" not in row:
+            return
+        email = (row.get("email") or "").strip().lower()
+        if not email:
+            return
+        existing = self.local_lecturers.get(email, {})
+        merged = dict(existing)
+        merged.update(row)
+        self.local_lecturers[email] = merged
+        self._persist_local_store()
+
     def _handle_supabase_error(self, exc: RuntimeError) -> bool:
         message = str(exc)
         message_lower = message.lower()
@@ -775,7 +787,10 @@ class HybridTestRepository:
             self.local_store_enabled = True
             self._set_storage_mode()
             return _local_lookup()
-        return row or _local_lookup()
+        if row:
+            self._cache_lecturer_row(row)
+            return row
+        return _local_lookup()
 
     def get_lecturer_by_id(self, lecturer_id: str) -> dict[str, Any] | None:
         def _local_lookup():
@@ -815,10 +830,12 @@ class HybridTestRepository:
             self.local_lecturers[payload.email] = row
             self._persist_local_store()
             return {k: v for k, v in row.items() if k != "password_hash"}
-        return self._call_remote(
+        result = self._call_remote(
             lambda: self.remote.create_lecturer(payload.name, payload.email, password_hash),
             _local_create
         )
+        self._cache_lecturer_row(result)
+        return result
 
     def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
         if subject_code not in self.subjects:

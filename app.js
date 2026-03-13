@@ -866,7 +866,7 @@ function renderHostTestCards(tests) {
       </div>
       <div class="test-card-actions">
         <button class="btn btn-primary test-use-btn">Use This Test</button>
-        ${test.canEdit ? '<button class="btn btn-secondary test-edit-btn">Edit Test</button>' : ''}
+        ${test.canEdit ? '<button class="btn btn-secondary test-edit-btn">Edit Test</button>' : '<button class="btn btn-secondary test-duplicate-btn">Duplicate Test</button>'}
       </div>
     `;
     card.querySelector('.test-use-btn').addEventListener('click', () => {
@@ -877,8 +877,33 @@ function renderHostTestCards(tests) {
     if (editBtn) {
       editBtn.addEventListener('click', () => showCreateTestScreen({ mode: 'edit', testId: test.id }));
     }
+    const duplicateBtn = card.querySelector('.test-duplicate-btn');
+    if (duplicateBtn) {
+      duplicateBtn.addEventListener('click', () => duplicateTestFrom(test));
+    }
     container.appendChild(card);
   });
+}
+
+async function duplicateTestFrom(testSummary) {
+  if (!selectedSubject) return;
+  showInlineStatus('#host-library-status', 'Preparing a copy...', false);
+  try {
+    const detail = await apiGet(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(testSummary.id)}`);
+    await showCreateTestScreen({ mode: 'create' });
+    const copyTitle = detail.title ? `${detail.title} (Copy)` : 'Untitled Test (Copy)';
+    applyEditorData({
+      title: copyTitle,
+      chapter: detail.chapter || '',
+      description: detail.description || '',
+      questions: detail.questions || []
+    });
+    showInlineStatus('#host-create-status', 'Copied test. Update it, then save.', false);
+    resetDraftStatus('Copied from a saved test. Drafts will auto-save.', false);
+    markDraftDirty();
+  } catch (e) {
+    showInlineStatus('#host-library-status', e.message || 'Could not duplicate the test.', true);
+  }
 }
 
 function getDraftEditingId(draft) {
