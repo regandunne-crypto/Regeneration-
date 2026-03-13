@@ -184,6 +184,8 @@ TIME_PER_Q = 30
 MAX_POINTS = 1000
 MIN_POINTS = 200
 REQUEST_TIMEOUT = 20
+LOCAL_STORE_PATH = Path(__file__).resolve().parent / "local_store.json"
+LOCAL_STORE_VERSION = 1
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -568,22 +570,105 @@ class HybridTestRepository:
         self.local_custom_tests: dict[str, dict[str, dict[str, Any]]] = {}
         self.local_drafts: dict[tuple[str, str], dict[str, Any]] = {}
         self.local_lecturers: dict[str, dict[str, Any]] = {}
+        self.local_store_path = LOCAL_STORE_PATH
+        self.local_store_enabled = False
+        self.local_store_error: str | None = None
         self.supabase_configured = False
         self.supabase_error: str | None = None
         self._seed_builtin_tests()
+        self._load_local_store()
 
         url = os.environ.get("SUPABASE_URL", "").strip()
         key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
         self.supabase_configured = bool(url and key)
         self.remote = SupabaseStore(url, key) if self.supabase_configured else None
-        self.storage_mode = "supabase" if self.remote else "in-memory"
+        self.local_store_enabled = self.remote is None
+        self._set_storage_mode()
+
+    def _set_storage_mode(self) -> None:
+        if self.remote is not None:
+            self.storage_mode = "supabase"
+        elif self.local_store_enabled:
+            self.storage_mode = "local-file"
+        else:
+            self.storage_mode = "in-memory"
+
+    def _draft_key(self, lecturer_id: str, subject_code: str) -> str:
+        return f"{lecturer_id}::{subject_code}"
+
+    def _parse_draft_key(self, key: str) -> tuple[str, str] | None:
+        if not isinstance(key, str) or "::" not in key:
+            return None
+        parts = key.split("::", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return None
+        return parts[0], parts[1]
+
+    def _load_local_store(self) -> None:
+        if not self.local_store_path.exists():
+            return
+        try:
+            with self.local_store_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            self.local_store_error = f"Failed to load local store: {exc}"
+            return
+        if not isinstance(data, dict):
+            return
+        tests = data.get("local_custom_tests", {})
+        if isinstance(tests, dict):
+            for code, items in tests.items():
+                if code not in self.subjects or not isinstance(items, dict):
+                    continue
+                cleaned: dict[str, dict[str, Any]] = {}
+                for test_id, row in items.items():
+                    if not isinstance(row, dict):
+                        continue
+                    row.setdefault("subject_code", code)
+                    row["source"] = row.get("source") or "local-file"
+                    cleaned[test_id] = row
+                if cleaned:
+                    self.local_custom_tests[code] = cleaned
+        drafts = data.get("local_drafts", {})
+        if isinstance(drafts, dict):
+            for key, row in drafts.items():
+                parsed = self._parse_draft_key(key)
+                if not parsed or not isinstance(row, dict):
+                    continue
+                self.local_drafts[parsed] = row
+        lecturers = data.get("local_lecturers", {})
+        if isinstance(lecturers, dict):
+            self.local_lecturers = lecturers
+
+    def _persist_local_store(self) -> None:
+        if not self.local_store_enabled:
+            return
+        payload = {
+            "version": LOCAL_STORE_VERSION,
+            "local_custom_tests": self.local_custom_tests,
+            "local_drafts": {
+                self._draft_key(lecturer_id, subject_code): row
+                for (lecturer_id, subject_code), row in self.local_drafts.items()
+            },
+            "local_lecturers": self.local_lecturers,
+        }
+        tmp_path = self.local_store_path.with_suffix(".tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=True, indent=2, sort_keys=True)
+            tmp_path.replace(self.local_store_path)
+        except Exception as exc:
+            self.local_store_error = f"Failed to save local store: {exc}"
+            self.local_store_enabled = False
+            self._set_storage_mode()
 
     def _handle_supabase_error(self, exc: RuntimeError) -> bool:
         message = str(exc)
         if "PGRST205" in message or "schema cache" in message:
             self.supabase_error = message
             self.remote = None
-            self.storage_mode = "in-memory"
+            self.local_store_enabled = True
+            self._set_storage_mode()
             return True
         return False
 
@@ -621,10 +706,16 @@ class HybridTestRepository:
 
     def get_storage_status(self) -> dict[str, Any]:
         if self.remote is None:
-            if self.supabase_configured and self.supabase_error:
-                note = "Supabase configured but schema is missing. Running in-memory until the schema is applied."
+            if self.local_store_enabled:
+                if self.supabase_configured and self.supabase_error:
+                    note = "Supabase configured but schema is missing. Using local file storage."
+                else:
+                    note = "Local file storage is active on this server."
             else:
-                note = "In-memory storage resets on redeploy/restart."
+                if self.supabase_configured and self.supabase_error:
+                    note = "Supabase configured but schema is missing. Running in-memory until the schema is applied."
+                else:
+                    note = "In-memory storage resets on redeploy/restart."
         else:
             note = "Supabase storage is active."
         return {
@@ -687,6 +778,7 @@ class HybridTestRepository:
                 "updated_at": datetime.utcnow().isoformat(),
             }
             self.local_lecturers[payload.email] = row
+            self._persist_local_store()
             return {k: v for k, v in row.items() if k != "password_hash"}
         return self._call_remote(
             lambda: self.remote.create_lecturer(payload.name, payload.email, password_hash),
@@ -705,7 +797,9 @@ class HybridTestRepository:
             lambda: self.remote.list_tests(subject_code, lecturer_id),
             lambda: []
         )
-        local_rows = list(self.local_custom_tests.get(subject_code, {}).values())
+        local_rows = []
+        if self.remote is None:
+            local_rows = list(self.local_custom_tests.get(subject_code, {}).values())
 
         tests.extend(self._summary(row, lecturer_id) for row in remote_rows)
         tests.extend(self._summary(row, lecturer_id) for row in local_rows)
@@ -716,7 +810,7 @@ class HybridTestRepository:
             row = self.builtin_tests[subject_code][test_id]
             row["can_edit"] = False
             return row
-        if test_id in self.local_custom_tests.get(subject_code, {}):
+        if self.remote is None and test_id in self.local_custom_tests.get(subject_code, {}):
             row = self.local_custom_tests[subject_code][test_id]
             row["can_edit"] = bool(lecturer_id and row.get("created_by") == lecturer_id)
             return row
@@ -740,11 +834,12 @@ class HybridTestRepository:
                 "questions": [q.model_dump() for q in payload.questions],
                 "created_at": datetime.utcnow().isoformat(),
                 "updated_at": datetime.utcnow().isoformat(),
-                "source": "in-memory",
+                "source": "local-file" if self.local_store_enabled else "in-memory",
                 "created_by": lecturer["id"],
                 "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
             }
             self.local_custom_tests.setdefault(subject_code, {})[test_id] = row
+            self._persist_local_store()
             return row
         def _remote_create():
             row = self.remote.create_test(subject_code, payload, lecturer)
@@ -772,6 +867,7 @@ class HybridTestRepository:
                 "questions": [q.model_dump() for q in payload.questions],
                 "updated_at": datetime.utcnow().isoformat(),
             })
+            self._persist_local_store()
             return row
         def _remote_update():
             row = self.remote.update_test(subject_code, test_id, payload, lecturer)
@@ -804,6 +900,7 @@ class HybridTestRepository:
                 "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
             }
             self.local_drafts[(lecturer["id"], subject_code)] = row
+            self._persist_local_store()
             return row
         return self._call_remote(
             lambda: self.remote.save_draft(subject_code, lecturer, payload),
@@ -813,6 +910,7 @@ class HybridTestRepository:
     def clear_draft(self, subject_code: str, lecturer: dict[str, Any]) -> None:
         def _local_clear():
             self.local_drafts.pop((lecturer["id"], subject_code), None)
+            self._persist_local_store()
         return self._call_remote(
             lambda: self.remote.clear_draft(subject_code, lecturer["id"]),
             _local_clear
@@ -947,15 +1045,6 @@ def require_lecturer(request: Request) -> dict[str, Any]:
     return lecturer
 
 
-def require_durable_storage_for_management() -> None:
-    status = repo.get_storage_status()
-    if status.get("supabaseConfigured") and status.get("mode") != "supabase":
-        raise HTTPException(
-            status_code=503,
-            detail="Supabase storage is temporarily unavailable, so test changes are disabled to prevent data loss. Apply the Supabase schema and confirm the Render environment variables before creating or editing tests.",
-        )
-
-
 def current_lecturer_from_websocket(websocket: WebSocket) -> dict[str, Any] | None:
     lecturer_id = parse_session_token(websocket.cookies.get(SESSION_COOKIE_NAME))
     if not lecturer_id:
@@ -1076,7 +1165,6 @@ def get_test_detail(subject_code: str, test_id: str, request: Request):
 
 @app.post("/api/tests/{subject_code}")
 def create_test(subject_code: str, payload: dict[str, Any], request: Request):
-    require_durable_storage_for_management()
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
     lecturer = require_lecturer(request)
@@ -1095,7 +1183,6 @@ def create_test(subject_code: str, payload: dict[str, Any], request: Request):
 
 @app.put("/api/tests/{subject_code}/{test_id}")
 def update_test(subject_code: str, test_id: str, payload: dict[str, Any], request: Request):
-    require_durable_storage_for_management()
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
     lecturer = require_lecturer(request)
@@ -1128,7 +1215,6 @@ def get_test_draft(subject_code: str, request: Request):
 
 @app.post("/api/drafts/{subject_code}")
 def save_test_draft(subject_code: str, payload: dict[str, Any], request: Request):
-    require_durable_storage_for_management()
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
     lecturer = require_lecturer(request)
@@ -1144,7 +1230,6 @@ def save_test_draft(subject_code: str, payload: dict[str, Any], request: Request
 
 @app.delete("/api/drafts/{subject_code}")
 def clear_test_draft(subject_code: str, request: Request):
-    require_durable_storage_for_management()
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
     lecturer = require_lecturer(request)
@@ -1545,7 +1630,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == "reset_game":
                 if role == "host" and room is not None:
                     room.archive_stats()
-                    await return_room_to_lobby(room, keep_players=False)
+                    await return_room_to_lobby(room, keep_players=True)
 
             elif action == "cancel_game":
                 if role == "host" and room is not None:
@@ -1568,10 +1653,30 @@ async def websocket_endpoint(websocket: WebSocket):
                 name = msg.get("name", "Anonymous").strip()[:20]
                 student_number = msg.get("studentNumber", "").strip()[:20]
                 name_lower = name.lower()
-                if any(vid != visitor_id and p["name"].lower() == name_lower for vid, p in room.players.items()):
-                    await websocket.send_text(json.dumps({"type": "name_taken", "name": name}))
-                    continue
-                if visitor_id in room.players:
+                existing_vid = None
+                existing_player = None
+                for vid, player in room.players.items():
+                    if vid == visitor_id:
+                        continue
+                    if student_number and player.get("student_number") == student_number:
+                        existing_vid = vid
+                        existing_player = player
+                        break
+                    if player.get("name", "").lower() == name_lower:
+                        existing_vid = vid
+                        existing_player = player
+                        break
+                if existing_player:
+                    if existing_player.get("ws") is None:
+                        room.players.pop(existing_vid, None)
+                        existing_player["name"] = name
+                        existing_player["student_number"] = student_number
+                        existing_player["ws"] = websocket
+                        room.players[visitor_id] = existing_player
+                    else:
+                        await websocket.send_text(json.dumps({"type": "name_taken", "name": name}))
+                        continue
+                elif visitor_id in room.players:
                     room.players[visitor_id]["ws"] = websocket
                     room.players[visitor_id]["name"] = name
                     room.players[visitor_id]["student_number"] = student_number

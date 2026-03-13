@@ -1,16 +1,6 @@
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
-<!--
-   ______                            __
-  / ____/___  ____ ___  ____  __  __/ /____  _____
- / /   / __ \/ __ `__ \/ __ \/ / / / __/ _ \/ ___/
-/ /___/ /_/ / / / / / / /_/ / /_/ / /_/  __/ /
-\____/\____/_/ /_/ /_/ .___/\__,_/\__/\___/_/
-                    /_/
-        Created with Perplexity Computer
-        https://www.perplexity.ai/computer
--->
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Engineering Quiz</title>
@@ -161,11 +151,7 @@
       <div class="auth-card">
         <div class="host-tests-header">
           <h1 class="host-title" id="host-auth-title">Lecturer Sign In</h1>
-          <p id="host-auth-subtitle" class="host-subtitle">Sign in to manage your saved tests.</p>
-        </div>
-        <div class="auth-toggle" role="tablist" aria-label="Lecturer authentication mode">
-          <button id="btn-auth-tab-login" class="auth-tab active" type="button">Sign In</button>
-          <button id="btn-auth-tab-signup" class="auth-tab" type="button">Create Account</button>
+          <p class="host-subtitle">Sign in to manage saved tests.</p>
         </div>
         <p id="host-auth-status" class="inline-status" hidden></p>
 
@@ -179,7 +165,26 @@
           <button id="btn-login-submit" class="btn btn-primary btn-large" type="submit">Sign In</button>
         </form>
 
-        <form id="host-signup-form" class="auth-form" hidden>
+        <div class="auth-secondary">
+          <p class="muted-text">Need a lecturer account?</p>
+          <button id="btn-open-signup" class="btn btn-secondary btn-large" type="button">Create Account</button>
+        </div>
+
+        <button id="btn-auth-back" class="back-link">&larr; Back to student view</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- HOST: Lecturer Sign Up -->
+  <div id="screen-host-signup" class="screen">
+    <div class="auth-container">
+      <div class="auth-card">
+        <div class="host-tests-header">
+          <h1 class="host-title">Create Lecturer Account</h1>
+          <p class="host-subtitle">Create an account to manage saved tests.</p>
+        </div>
+        <p id="host-signup-status" class="inline-status" hidden></p>
+        <form id="host-signup-form" class="auth-form">
           <label for="signup-name-input" class="input-label">Full name</label>
           <input type="text" id="signup-name-input" class="editor-input" placeholder="Dr Jane Smith" autocomplete="name">
 
@@ -194,8 +199,7 @@
 
           <button id="btn-signup-submit" class="btn btn-primary btn-large" type="submit">Create Account</button>
         </form>
-
-        <button id="btn-auth-back" class="back-link">&larr; Back to student view</button>
+        <button id="btn-signup-back" class="back-link">&larr; Back to sign in</button>
       </div>
     </div>
   </div>
@@ -368,6 +372,7 @@
   </div>
 
 </div>
+
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 <script src="./app.js"></script>
 </body>

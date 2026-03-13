@@ -599,40 +599,26 @@ function updateHostAccountBar() {
   }
 }
 
-
-function setAuthMode(mode) {
-  const loginForm = sel("#host-login-form");
-  const signupForm = sel("#host-signup-form");
-  const loginSwitch = sel("#auth-switch-login");
-  const signupSwitch = sel("#auth-switch-signup");
-  const loginTab = sel("#btn-auth-tab-login");
-  const signupTab = sel("#btn-auth-tab-signup");
-  const authTitle = sel("#host-auth-title");
-  const authSubtitle = sel("#host-auth-subtitle");
-  const isLogin = mode !== "signup";
-
-  if (loginTab) loginTab.classList.toggle("active", isLogin);
-  if (signupTab) signupTab.classList.toggle("active", !isLogin);
-  if (loginForm) loginForm.hidden = !isLogin;
-  if (signupForm) signupForm.hidden = isLogin;
-  if (loginSwitch) loginSwitch.hidden = !isLogin;
-  if (signupSwitch) signupSwitch.hidden = isLogin;
-  if (authTitle) authTitle.textContent = isLogin ? "Lecturer Sign In" : "Create Lecturer Account";
-  if (authSubtitle) {
-    authSubtitle.textContent = isLogin
-      ? "Sign in to manage your saved tests."
-      : "Create a lecturer account to manage your saved tests.";
-  }
-}
-
 function showHostAuthScreen(mode = 'login', statusMessage = '', isError = false) {
   isHost = true;
   if (ws) closeWS({ reconnect: false });
-  setAuthMode(mode);
   updateHostAccountBar();
   showScreen('screen-host-auth');
   showInlineStatus('#host-auth-status', statusMessage, isError);
-  const focusSelector = mode === 'signup' ? '#signup-name-input' : '#login-email-input';
+  const focusSelector = '#login-email-input';
+  setTimeout(() => {
+    const target = $(focusSelector);
+    if (target) target.focus();
+  }, 0);
+}
+
+function showHostSignupScreen(statusMessage = '', isError = false) {
+  isHost = true;
+  if (ws) closeWS({ reconnect: false });
+  updateHostAccountBar();
+  showScreen('screen-host-signup');
+  showInlineStatus('#host-signup-status', statusMessage, isError);
+  const focusSelector = '#signup-name-input';
   setTimeout(() => {
     const target = $(focusSelector);
     if (target) target.focus();
@@ -664,122 +650,96 @@ function resetToStudentView() {
   initPlayer();
 }
 
-
 function bindHostAuthUI() {
   if (authUiBound) return;
   authUiBound = true;
 
-  const hostLink = sel("#btn-host-link");
-  if (hostLink) hostLink.addEventListener("click", enterHostArea);
+  $('#btn-host-link').addEventListener('click', () => {
+    enterHostArea();
+  });
 
-  const clearAuthStatus = () => showInlineStatus("#host-auth-status", "", false);
-
-  const loginTabBtn = sel("#btn-auth-tab-login");
-  if (loginTabBtn) {
-    loginTabBtn.addEventListener("click", () => {
-      setAuthMode("login");
-      clearAuthStatus();
+  const openSignupBtn = $('#btn-open-signup');
+  if (openSignupBtn) {
+    openSignupBtn.addEventListener('click', () => {
+      showInlineStatus('#host-auth-status', '', false);
+      showHostSignupScreen();
     });
   }
 
-  const signupTabBtn = sel("#btn-auth-tab-signup");
-  if (signupTabBtn) {
-    signupTabBtn.addEventListener("click", () => {
-      setAuthMode("signup");
-      clearAuthStatus();
+  $('#btn-auth-back').addEventListener('click', () => {
+    resetToStudentView();
+  });
+
+  const signupBackBtn = $('#btn-signup-back');
+  if (signupBackBtn) {
+    signupBackBtn.addEventListener('click', () => {
+      showInlineStatus('#host-signup-status', '', false);
+      showHostAuthScreen('login');
     });
   }
 
-  const showSignupBtn = sel("#btn-show-signup");
-  if (showSignupBtn) {
-    showSignupBtn.addEventListener("click", () => {
-      setAuthMode("signup");
-      clearAuthStatus();
-    });
-  }
+  $('#host-login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    showInlineStatus('#host-auth-status', '', false);
+    const btn = $('#btn-login-submit');
+    btn.disabled = true;
+    btn.textContent = 'Signing In...';
+    try {
+      await apiPost('/api/lecturer/login', {
+        email: $('#login-email-input').value.trim(),
+        password: $('#login-password-input').value
+      });
+      await fetchLecturerSession();
+      $('#login-password-input').value = '';
+      await initHost();
+    } catch (e) {
+      showInlineStatus('#host-auth-status', e.message, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Sign In';
+    }
+  });
 
-  const showLoginBtn = sel("#btn-show-login");
-  if (showLoginBtn) {
-    showLoginBtn.addEventListener("click", () => {
-      setAuthMode("login");
-      clearAuthStatus();
-    });
-  }
+  $('#host-signup-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    showInlineStatus('#host-signup-status', '', false);
+    const password = $('#signup-password-input').value;
+    const confirm = $('#signup-password-confirm-input').value;
+    if (password !== confirm) {
+      showInlineStatus('#host-signup-status', 'Passwords do not match.', true);
+      return;
+    }
+    const btn = $('#btn-signup-submit');
+    btn.disabled = true;
+    btn.textContent = 'Creating Account...';
+    try {
+      await apiPost('/api/lecturer/signup', {
+        name: $('#signup-name-input').value.trim(),
+        email: $('#signup-email-input').value.trim(),
+        password
+      });
+      await fetchLecturerSession();
+      $('#signup-password-input').value = '';
+      $('#signup-password-confirm-input').value = '';
+      await initHost();
+    } catch (e) {
+      showInlineStatus('#host-signup-status', e.message, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Create Account';
+    }
+  });
 
-  const authBackBtn = sel("#btn-auth-back");
-  if (authBackBtn) authBackBtn.addEventListener("click", resetToStudentView);
-
-  const loginForm = sel("#host-login-form");
-  if (loginForm) {
-    loginForm.addEventListener("submit", async e => {
-      e.preventDefault();
-      clearAuthStatus();
-      const btn = sel("#btn-login-submit");
-      btn.disabled = true;
-      btn.textContent = "Signing In...";
-      try {
-        await apiPost("/api/lecturer/login", {
-          email: sel("#login-email-input").value.trim(),
-          password: sel("#login-password-input").value,
-        });
-        await fetchLecturerSession();
-        sel("#login-password-input").value = "";
-        await initHost();
-      } catch (e) {
-        showInlineStatus("#host-auth-status", e.message, true);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = "Sign In";
-      }
-    });
-  }
-
-  const signupForm = sel("#host-signup-form");
-  if (signupForm) {
-    signupForm.addEventListener("submit", async e => {
-      e.preventDefault();
-      clearAuthStatus();
-      const password = sel("#signup-password-input").value;
-      const confirm = sel("#signup-password-confirm-input").value;
-      if (password !== confirm) {
-        showInlineStatus("#host-auth-status", "Passwords do not match.", true);
-        return;
-      }
-      const btn = sel("#btn-signup-submit");
-      btn.disabled = true;
-      btn.textContent = "Creating Account...";
-      try {
-        await apiPost("/api/lecturer/signup", {
-          name: sel("#signup-name-input").value.trim(),
-          email: sel("#signup-email-input").value.trim(),
-          password,
-        });
-        await fetchLecturerSession();
-        sel("#signup-password-input").value = "";
-        sel("#signup-password-confirm-input").value = "";
-        await initHost();
-      } catch (e) {
-        showInlineStatus("#host-auth-status", e.message, true);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = "Create Account";
-      }
-    });
-  }
-
-  const logoutBtn = sel("#btn-host-logout");
-  if (logoutBtn) {
-    logoutBtn.addEventListener("click", async () => {
-      try {
-        await apiPost("/api/lecturer/logout", {});
-      } catch (e) {
-        console.error(e);
-      }
-      lecturerSession = null;
-      updateHostAccountBar();
-      showHostAuthScreen("login", "Signed out.");
-    });
-  }
+  $('#btn-host-logout').addEventListener('click', async () => {
+    try {
+      await apiPost('/api/lecturer/logout', {});
+    } catch (e) {
+      console.error(e);
+    }
+    lecturerSession = null;
+    updateHostAccountBar();
+    showHostAuthScreen('login', 'Signed out.');
+  });
 }
 
 async function initHost() {
@@ -825,8 +785,16 @@ async function showHostTestLibrary() {
 
   const storage = await loadStorageStatus();
   const badge = $('#host-storage-badge');
-  badge.textContent = storage.mode === 'supabase' ? 'Supabase storage active' : 'Temporary in-memory storage';
-  badge.className = `storage-badge ${storage.mode === 'supabase' ? 'storage-badge-live' : 'storage-badge-warning'}`;
+  if (storage.mode === 'supabase') {
+    badge.textContent = 'Supabase storage active';
+    badge.className = 'storage-badge storage-badge-live';
+  } else if (storage.mode === 'local-file') {
+    badge.textContent = 'Local file storage active';
+    badge.className = 'storage-badge storage-badge-live';
+  } else {
+    badge.textContent = 'Temporary in-memory storage';
+    badge.className = 'storage-badge storage-badge-warning';
+  }
   $('#host-storage-note').textContent = storage.note || '';
 
   try {
@@ -875,7 +843,9 @@ function renderHostTestCards(tests) {
     card.className = 'test-card';
     const sourceText = test.source === 'supabase'
       ? 'Stored in Supabase'
-      : (test.source === 'built-in' ? 'Built-in starter quiz' : 'Temporary local test');
+      : (test.source === 'built-in'
+        ? 'Built-in starter quiz'
+        : (test.source === 'local-file' ? 'Stored locally on server' : 'Temporary local test'));
     const chapter = test.chapter ? `<p class="test-card-chapter">${escapeHtml(test.chapter)}</p>` : '';
     const desc = test.description ? `<p class="test-card-desc">${escapeHtml(test.description)}</p>` : '';
     const owner = test.ownerName ? `<p class="test-card-owner">Owner: ${escapeHtml(test.ownerName)}</p>` : '';
@@ -1414,47 +1384,34 @@ function handleHostMessage(msg) {
   }
 }
 
-
 function updateHostLobby(players, activeTest = selectedTest) {
-  const allPlayers = Array.isArray(players) ? players : [];
-  const connectedPlayers = allPlayers.filter(p => p.connected);
-  const connectedCount = connectedPlayers.length;
-  const hostPlayerCount = sel("#host-player-count");
-  if (hostPlayerCount) hostPlayerCount.textContent = connectedCount;
-
-  const startBtn = sel("#btn-start-game");
+  const count = players ? players.length : 0;
+  $('#host-player-count').textContent = count;
+  const startBtn = $('#btn-start-game');
   const qCount = activeTest && activeTest.questionCount ? activeTest.questionCount : 0;
   if (qCount > 0) {
-    startBtn.disabled = connectedCount === 0;
-    startBtn.textContent = connectedCount === 0 ? "Waiting for players" : `Start Game (${connectedCount} connected)`;
+    startBtn.disabled = count === 0;
+    startBtn.textContent = count === 0 ? 'Waiting for players…' : `Start Game (${count} players)`;
   } else {
     startBtn.disabled = true;
-    startBtn.textContent = "This test has no questions";
+    startBtn.textContent = 'This test has no questions';
   }
 
-  const list = sel("#host-player-list");
-  if (allPlayers.length === 0) {
+  const list = $('#host-player-list');
+  if (!players || players.length === 0) {
     list.innerHTML = '<p class="empty-msg">Waiting for students to join...</p>';
     return;
   }
-
-  list.innerHTML = "";
-  allPlayers.forEach(p => {
-    const el = document.createElement("div");
-    el.className = "host-player-item";
+  list.innerHTML = '';
+  players.forEach((p) => {
+    const el = document.createElement('div');
+    el.className = 'host-player-item';
     el.innerHTML = `
-      <span class="host-player-dot ${p.connected ? "connected" : "disconnected"}"></span>
+      <span class="host-player-dot ${p.connected ? 'connected' : 'disconnected'}"></span>
       <span class="host-player-name-text">${escapeHtml(p.name)}</span>
     `;
     list.appendChild(el);
   });
-
-  if (allPlayers.some(p => !p.connected)) {
-    const note = document.createElement("p");
-    note.className = "empty-msg";
-    note.textContent = "Disconnected students can reconnect using the same device.";
-    list.appendChild(note);
-  }
 }
 
 function hostGetReady(qNum, totalQ) {
