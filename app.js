@@ -599,17 +599,30 @@ function updateHostAccountBar() {
   }
 }
 
+
 function setAuthMode(mode) {
-  const loginTab = $('#btn-auth-tab-login');
-  const signupTab = $('#btn-auth-tab-signup');
-  const loginForm = $('#host-login-form');
-  const signupForm = $('#host-signup-form');
-  const isLogin = mode !== 'signup';
-  loginTab.classList.toggle('active', isLogin);
-  signupTab.classList.toggle('active', !isLogin);
-  loginForm.hidden = !isLogin;
-  signupForm.hidden = isLogin;
-  $('#host-auth-title').textContent = isLogin ? 'Lecturer Sign In' : 'Create Lecturer Account';
+  const loginForm = sel("#host-login-form");
+  const signupForm = sel("#host-signup-form");
+  const loginSwitch = sel("#auth-switch-login");
+  const signupSwitch = sel("#auth-switch-signup");
+  const loginTab = sel("#btn-auth-tab-login");
+  const signupTab = sel("#btn-auth-tab-signup");
+  const authTitle = sel("#host-auth-title");
+  const authSubtitle = sel("#host-auth-subtitle");
+  const isLogin = mode !== "signup";
+
+  if (loginTab) loginTab.classList.toggle("active", isLogin);
+  if (signupTab) signupTab.classList.toggle("active", !isLogin);
+  if (loginForm) loginForm.hidden = !isLogin;
+  if (signupForm) signupForm.hidden = isLogin;
+  if (loginSwitch) loginSwitch.hidden = !isLogin;
+  if (signupSwitch) signupSwitch.hidden = isLogin;
+  if (authTitle) authTitle.textContent = isLogin ? "Lecturer Sign In" : "Create Lecturer Account";
+  if (authSubtitle) {
+    authSubtitle.textContent = isLogin
+      ? "Sign in to manage your saved tests."
+      : "Create a lecturer account to manage your saved tests.";
+  }
 }
 
 function showHostAuthScreen(mode = 'login', statusMessage = '', isError = false) {
@@ -651,90 +664,122 @@ function resetToStudentView() {
   initPlayer();
 }
 
+
 function bindHostAuthUI() {
   if (authUiBound) return;
   authUiBound = true;
 
-  $('#btn-host-link').addEventListener('click', () => {
-    enterHostArea();
-  });
+  const hostLink = sel("#btn-host-link");
+  if (hostLink) hostLink.addEventListener("click", enterHostArea);
 
-  $('#btn-auth-tab-login').addEventListener('click', () => {
-    setAuthMode('login');
-    showInlineStatus('#host-auth-status', '', false);
-  });
+  const clearAuthStatus = () => showInlineStatus("#host-auth-status", "", false);
 
-  $('#btn-auth-tab-signup').addEventListener('click', () => {
-    setAuthMode('signup');
-    showInlineStatus('#host-auth-status', '', false);
-  });
+  const loginTabBtn = sel("#btn-auth-tab-login");
+  if (loginTabBtn) {
+    loginTabBtn.addEventListener("click", () => {
+      setAuthMode("login");
+      clearAuthStatus();
+    });
+  }
 
-  $('#btn-auth-back').addEventListener('click', () => {
-    resetToStudentView();
-  });
+  const signupTabBtn = sel("#btn-auth-tab-signup");
+  if (signupTabBtn) {
+    signupTabBtn.addEventListener("click", () => {
+      setAuthMode("signup");
+      clearAuthStatus();
+    });
+  }
 
-  $('#host-login-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    showInlineStatus('#host-auth-status', '', false);
-    const btn = $('#btn-login-submit');
-    btn.disabled = true;
-    btn.textContent = 'Signing In...';
-    try {
-      await apiPost('/api/lecturer/login', {
-        email: $('#login-email-input').value.trim(),
-        password: $('#login-password-input').value
-      });
-      await fetchLecturerSession();
-      $('#login-password-input').value = '';
-      await initHost();
-    } catch (e) {
-      showInlineStatus('#host-auth-status', e.message, true);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = 'Sign In';
-    }
-  });
+  const showSignupBtn = sel("#btn-show-signup");
+  if (showSignupBtn) {
+    showSignupBtn.addEventListener("click", () => {
+      setAuthMode("signup");
+      clearAuthStatus();
+    });
+  }
 
-  $('#host-signup-form').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    showInlineStatus('#host-auth-status', '', false);
-    const password = $('#signup-password-input').value;
-    const confirm = $('#signup-password-confirm-input').value;
-    if (password !== confirm) {
-      showInlineStatus('#host-auth-status', 'Passwords do not match.', true);
-      return;
-    }
-    const btn = $('#btn-signup-submit');
-    btn.disabled = true;
-    btn.textContent = 'Creating Account...';
-    try {
-      await apiPost('/api/lecturer/signup', {
-        name: $('#signup-name-input').value.trim(),
-        email: $('#signup-email-input').value.trim(),
-        password
-      });
-      await fetchLecturerSession();
-      $('#signup-password-input').value = '';
-      $('#signup-password-confirm-input').value = '';
-      await initHost();
-    } catch (e) {
-      showInlineStatus('#host-auth-status', e.message, true);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = 'Create Account';
-    }
-  });
+  const showLoginBtn = sel("#btn-show-login");
+  if (showLoginBtn) {
+    showLoginBtn.addEventListener("click", () => {
+      setAuthMode("login");
+      clearAuthStatus();
+    });
+  }
 
-  $('#btn-host-logout').addEventListener('click', async () => {
-    try {
-      await apiPost('/api/lecturer/logout', {});
-    } catch (e) {
-      console.error(e);
-    }
-    lecturerSession = null;
-    updateHostAccountBar();
-    showHostAuthScreen('login', 'Signed out.');
-  });
+  const authBackBtn = sel("#btn-auth-back");
+  if (authBackBtn) authBackBtn.addEventListener("click", resetToStudentView);
+
+  const loginForm = sel("#host-login-form");
+  if (loginForm) {
+    loginForm.addEventListener("submit", async e => {
+      e.preventDefault();
+      clearAuthStatus();
+      const btn = sel("#btn-login-submit");
+      btn.disabled = true;
+      btn.textContent = "Signing In...";
+      try {
+        await apiPost("/api/lecturer/login", {
+          email: sel("#login-email-input").value.trim(),
+          password: sel("#login-password-input").value,
+        });
+        await fetchLecturerSession();
+        sel("#login-password-input").value = "";
+        await initHost();
+      } catch (e) {
+        showInlineStatus("#host-auth-status", e.message, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Sign In";
+      }
+    });
+  }
+
+  const signupForm = sel("#host-signup-form");
+  if (signupForm) {
+    signupForm.addEventListener("submit", async e => {
+      e.preventDefault();
+      clearAuthStatus();
+      const password = sel("#signup-password-input").value;
+      const confirm = sel("#signup-password-confirm-input").value;
+      if (password !== confirm) {
+        showInlineStatus("#host-auth-status", "Passwords do not match.", true);
+        return;
+      }
+      const btn = sel("#btn-signup-submit");
+      btn.disabled = true;
+      btn.textContent = "Creating Account...";
+      try {
+        await apiPost("/api/lecturer/signup", {
+          name: sel("#signup-name-input").value.trim(),
+          email: sel("#signup-email-input").value.trim(),
+          password,
+        });
+        await fetchLecturerSession();
+        sel("#signup-password-input").value = "";
+        sel("#signup-password-confirm-input").value = "";
+        await initHost();
+      } catch (e) {
+        showInlineStatus("#host-auth-status", e.message, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Create Account";
+      }
+    });
+  }
+
+  const logoutBtn = sel("#btn-host-logout");
+  if (logoutBtn) {
+    logoutBtn.addEventListener("click", async () => {
+      try {
+        await apiPost("/api/lecturer/logout", {});
+      } catch (e) {
+        console.error(e);
+      }
+      lecturerSession = null;
+      updateHostAccountBar();
+      showHostAuthScreen("login", "Signed out.");
+    });
+  }
 }
 
 async function initHost() {
@@ -1369,34 +1414,47 @@ function handleHostMessage(msg) {
   }
 }
 
+
 function updateHostLobby(players, activeTest = selectedTest) {
-  const count = players ? players.length : 0;
-  $('#host-player-count').textContent = count;
-  const startBtn = $('#btn-start-game');
+  const allPlayers = Array.isArray(players) ? players : [];
+  const connectedPlayers = allPlayers.filter(p => p.connected);
+  const connectedCount = connectedPlayers.length;
+  const hostPlayerCount = sel("#host-player-count");
+  if (hostPlayerCount) hostPlayerCount.textContent = connectedCount;
+
+  const startBtn = sel("#btn-start-game");
   const qCount = activeTest && activeTest.questionCount ? activeTest.questionCount : 0;
   if (qCount > 0) {
-    startBtn.disabled = count === 0;
-    startBtn.textContent = count === 0 ? 'Waiting for players…' : `Start Game (${count} players)`;
+    startBtn.disabled = connectedCount === 0;
+    startBtn.textContent = connectedCount === 0 ? "Waiting for players" : `Start Game (${connectedCount} connected)`;
   } else {
     startBtn.disabled = true;
-    startBtn.textContent = 'This test has no questions';
+    startBtn.textContent = "This test has no questions";
   }
 
-  const list = $('#host-player-list');
-  if (!players || players.length === 0) {
+  const list = sel("#host-player-list");
+  if (allPlayers.length === 0) {
     list.innerHTML = '<p class="empty-msg">Waiting for students to join...</p>';
     return;
   }
-  list.innerHTML = '';
-  players.forEach((p) => {
-    const el = document.createElement('div');
-    el.className = 'host-player-item';
+
+  list.innerHTML = "";
+  allPlayers.forEach(p => {
+    const el = document.createElement("div");
+    el.className = "host-player-item";
     el.innerHTML = `
-      <span class="host-player-dot ${p.connected ? 'connected' : 'disconnected'}"></span>
+      <span class="host-player-dot ${p.connected ? "connected" : "disconnected"}"></span>
       <span class="host-player-name-text">${escapeHtml(p.name)}</span>
     `;
     list.appendChild(el);
   });
+
+  if (allPlayers.some(p => !p.connected)) {
+    const note = document.createElement("p");
+    note.className = "empty-msg";
+    note.textContent = "Disconnected students can reconnect using the same device.";
+    list.appendChild(note);
+  }
 }
 
 function hostGetReady(qNum, totalQ) {

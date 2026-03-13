@@ -947,6 +947,15 @@ def require_lecturer(request: Request) -> dict[str, Any]:
     return lecturer
 
 
+def require_durable_storage_for_management() -> None:
+    status = repo.get_storage_status()
+    if status.get("supabaseConfigured") and status.get("mode") != "supabase":
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase storage is temporarily unavailable, so test changes are disabled to prevent data loss. Apply the Supabase schema and confirm the Render environment variables before creating or editing tests.",
+        )
+
+
 def current_lecturer_from_websocket(websocket: WebSocket) -> dict[str, Any] | None:
     lecturer_id = parse_session_token(websocket.cookies.get(SESSION_COOKIE_NAME))
     if not lecturer_id:
@@ -1067,6 +1076,7 @@ def get_test_detail(subject_code: str, test_id: str, request: Request):
 
 @app.post("/api/tests/{subject_code}")
 def create_test(subject_code: str, payload: dict[str, Any], request: Request):
+    require_durable_storage_for_management()
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
     lecturer = require_lecturer(request)
@@ -1085,6 +1095,7 @@ def create_test(subject_code: str, payload: dict[str, Any], request: Request):
 
 @app.put("/api/tests/{subject_code}/{test_id}")
 def update_test(subject_code: str, test_id: str, payload: dict[str, Any], request: Request):
+    require_durable_storage_for_management()
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
     lecturer = require_lecturer(request)
@@ -1117,6 +1128,7 @@ def get_test_draft(subject_code: str, request: Request):
 
 @app.post("/api/drafts/{subject_code}")
 def save_test_draft(subject_code: str, payload: dict[str, Any], request: Request):
+    require_durable_storage_for_management()
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
     lecturer = require_lecturer(request)
@@ -1132,6 +1144,7 @@ def save_test_draft(subject_code: str, payload: dict[str, Any], request: Request
 
 @app.delete("/api/drafts/{subject_code}")
 def clear_test_draft(subject_code: str, request: Request):
+    require_durable_storage_for_management()
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
     lecturer = require_lecturer(request)
