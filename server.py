@@ -1809,27 +1809,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 name_lower = name.lower()
                 existing_vid = None
                 existing_player = None
+                match_by_student = bool(student_number)
                 for vid, player in room.players.items():
                     if vid == visitor_id:
                         continue
-                    if student_number and player.get("student_number") == student_number:
-                        existing_vid = vid
-                        existing_player = player
-                        break
-                    if player.get("name", "").lower() == name_lower:
-                        existing_vid = vid
-                        existing_player = player
-                        break
-                if existing_player:
-                    if existing_player.get("ws") is None:
-                        room.players.pop(existing_vid, None)
-                        existing_player["name"] = name
-                        existing_player["student_number"] = student_number
-                        existing_player["ws"] = websocket
-                        room.players[visitor_id] = existing_player
+                    if match_by_student:
+                        if player.get("student_number") == student_number:
+                            existing_vid = vid
+                            existing_player = player
+                            break
                     else:
-                        await websocket.send_text(json.dumps({"type": "name_taken", "name": name}))
-                        continue
+                        if player.get("name", "").lower() == name_lower:
+                            existing_vid = vid
+                            existing_player = player
+                            break
+                if existing_player:
+                    old_ws = existing_player.get("ws")
+                    if old_ws is not None:
+                        try:
+                            await old_ws.close(code=4001)
+                        except Exception:
+                            pass
+                    room.players.pop(existing_vid, None)
+                    existing_player["name"] = name
+                    existing_player["student_number"] = student_number
+                    existing_player["ws"] = websocket
+                    room.players[visitor_id] = existing_player
                 elif visitor_id in room.players:
                     room.players[visitor_id]["ws"] = websocket
                     room.players[visitor_id]["name"] = name
