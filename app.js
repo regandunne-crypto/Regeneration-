@@ -850,6 +850,10 @@ function renderHostTestCards(tests) {
     const desc = test.description ? `<p class="test-card-desc">${escapeHtml(test.description)}</p>` : '';
     const owner = test.ownerName ? `<p class="test-card-owner">Owner: ${escapeHtml(test.ownerName)}</p>` : '';
     const updated = `<p class="test-card-updated">Updated ${escapeHtml(formatDateTime(test.updated_at || test.created_at))}</p>`;
+    const secondaryLabel = test.canEdit
+      ? 'Edit Test'
+      : (test.source === 'built-in' ? 'Edit Test' : 'Duplicate Test');
+    const secondaryClass = test.canEdit ? 'test-edit-btn' : 'test-duplicate-btn';
     card.innerHTML = `
       <div class="test-card-main">
         <div>
@@ -866,7 +870,7 @@ function renderHostTestCards(tests) {
       </div>
       <div class="test-card-actions">
         <button class="btn btn-primary test-use-btn">Use This Test</button>
-        ${test.canEdit ? '<button class="btn btn-secondary test-edit-btn">Edit Test</button>' : '<button class="btn btn-secondary test-duplicate-btn">Duplicate Test</button>'}
+        <button class="btn btn-secondary ${secondaryClass}">${secondaryLabel}</button>
       </div>
     `;
     card.querySelector('.test-use-btn').addEventListener('click', () => {
@@ -887,7 +891,12 @@ function renderHostTestCards(tests) {
 
 async function duplicateTestFrom(testSummary) {
   if (!selectedSubject) return;
-  showInlineStatus('#host-library-status', 'Preparing a copy...', false);
+  const copyingBuiltIn = testSummary && testSummary.source === 'built-in';
+  showInlineStatus(
+    '#host-library-status',
+    copyingBuiltIn ? 'Preparing an editable copy of the built-in quiz...' : 'Preparing a copy...',
+    false
+  );
   try {
     const detail = await apiGet(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(testSummary.id)}`);
     await showCreateTestScreen({ mode: 'create' });
