@@ -25,6 +25,19 @@ const VISITOR_ID = getOrCreateVisitorId();
 const WS_URL = `${WS_PROTOCOL}//${location.host}/ws?visitorId=${encodeURIComponent(VISITOR_ID)}`;
 const API_BASE = location.origin;
 
+function normalizeSubjectCode(value) {
+  return (value || '').trim().toUpperCase();
+}
+
+function isValidSubjectCode(code) {
+  return /^[A-Z0-9]{3,10}$/.test(code);
+}
+
+function isValidSubjectName(name) {
+  const cleaned = (name || '').trim();
+  return cleaned.length >= 2 && cleaned.length <= 60;
+}
+
 const $ = (sel) => document.querySelector(sel);
 let ws = null;
 let wsAllowReconnect = true;
@@ -742,6 +755,80 @@ function bindHostAuthUI() {
   });
 }
 
+function bindAddSubjectControls(refreshSubjects) {
+  const addBtn = $('#btn-open-add-subject');
+  const form = $('#host-add-subject-form');
+  if (!addBtn || !form) return;
+
+  const addClone = addBtn.cloneNode(true);
+  addBtn.replaceWith(addClone);
+
+  const formClone = form.cloneNode(true);
+  form.replaceWith(formClone);
+
+  const codeInput = formClone.querySelector('#new-subject-code');
+  const nameInput = formClone.querySelector('#new-subject-name');
+  const cancelBtn = formClone.querySelector('#btn-cancel-add-subject');
+  const submitBtn = formClone.querySelector('#btn-submit-add-subject');
+
+  const resetForm = () => {
+    if (codeInput) codeInput.value = '';
+    if (nameInput) nameInput.value = '';
+    showInlineStatus('#host-add-subject-status', '', false);
+    formClone.hidden = true;
+    addClone.hidden = false;
+  };
+
+  if (codeInput) {
+    codeInput.addEventListener('input', () => {
+      codeInput.value = normalizeSubjectCode(codeInput.value);
+    });
+  }
+
+  addClone.addEventListener('click', () => {
+    formClone.hidden = false;
+    addClone.hidden = true;
+    showInlineStatus('#host-add-subject-status', '', false);
+    if (codeInput) codeInput.focus();
+  });
+
+  if (cancelBtn) {
+    cancelBtn.addEventListener('click', () => resetForm());
+  }
+
+  formClone.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const code = normalizeSubjectCode(codeInput ? codeInput.value : '');
+    const name = (nameInput ? nameInput.value : '').trim();
+    if (!isValidSubjectCode(code)) {
+      showInlineStatus('#host-add-subject-status', 'Subject code must be 3-10 letters or numbers with no spaces.', true);
+      return;
+    }
+    if (!isValidSubjectName(name)) {
+      showInlineStatus('#host-add-subject-status', 'Subject name must be 2-60 characters.', true);
+      return;
+    }
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Adding...';
+    }
+    try {
+      await apiPost('/api/subjects', { code, name });
+      await refreshSubjects();
+      resetForm();
+    } catch (err) {
+      showInlineStatus('#host-add-subject-status', err.message || 'Could not add subject.', true);
+    } finally {
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Add Subject';
+      }
+    }
+  });
+
+  resetForm();
+}
+
 async function initHost() {
   const session = lecturerSession || await fetchLecturerSession();
   if (!session) {
@@ -757,12 +844,16 @@ async function initHost() {
   updateHostAccountBar();
   showScreen('screen-host-subject');
 
-  const subjects = await loadSubjects();
-  renderSubjectCards('host-subject-list', subjects, (sub) => {
-    selectedSubject = sub;
-    hostSubjectCode = sub.code;
-    showHostTestLibrary();
-  });
+  const refreshSubjects = async () => {
+    const subjects = await loadSubjects();
+    renderSubjectCards('host-subject-list', subjects, (sub) => {
+      selectedSubject = sub;
+      hostSubjectCode = sub.code;
+      showHostTestLibrary();
+    });
+  };
+  await refreshSubjects();
+  bindAddSubjectControls(refreshSubjects);
 
   const backBtn = $('#btn-back-player');
   const newBack = backBtn.cloneNode(true);
@@ -821,6 +912,13 @@ async function showHostTestLibrary() {
   const backClone = backBtn.cloneNode(true);
   backBtn.replaceWith(backClone);
   backClone.addEventListener('click', () => initHost());
+
+  const backupBtn = $('#btn-backup-tests');
+  if (backupBtn) {
+    const backupClone = backupBtn.cloneNode(true);
+    backupBtn.replaceWith(backupClone);
+    backupClone.addEventListener('click', () => downloadTestsBackup(backupClone));
+  }
 }
 
 function formatDateTime(value) {
@@ -854,6 +952,9 @@ function renderHostTestCards(tests) {
       ? 'Edit Test'
       : (test.source === 'built-in' ? 'Edit Test' : 'Duplicate Test');
     const secondaryClass = test.canEdit ? 'test-edit-btn' : 'test-duplicate-btn';
+    const deleteButton = test.canEdit
+      ? '<button class="btn btn-danger test-delete-btn">Delete</button>'
+      : '';
     card.innerHTML = `
       <div class="test-card-main">
         <div>
@@ -871,6 +972,7 @@ function renderHostTestCards(tests) {
       <div class="test-card-actions">
         <button class="btn btn-primary test-use-btn">Use This Test</button>
         <button class="btn btn-secondary ${secondaryClass}">${secondaryLabel}</button>
+        ${deleteButton}
       </div>
     `;
     card.querySelector('.test-use-btn').addEventListener('click', () => {
@@ -884,6 +986,10 @@ function renderHostTestCards(tests) {
     const duplicateBtn = card.querySelector('.test-duplicate-btn');
     if (duplicateBtn) {
       duplicateBtn.addEventListener('click', () => duplicateTestFrom(test));
+    }
+    const deleteBtn = card.querySelector('.test-delete-btn');
+    if (deleteBtn) {
+      deleteBtn.addEventListener('click', () => deleteTestFromLibrary(test));
     }
     container.appendChild(card);
   });
@@ -912,6 +1018,19 @@ async function duplicateTestFrom(testSummary) {
     markDraftDirty();
   } catch (e) {
     showInlineStatus('#host-library-status', e.message || 'Could not duplicate the test.', true);
+  }
+}
+
+async function deleteTestFromLibrary(testSummary) {
+  if (!selectedSubject || !testSummary) return;
+  const title = testSummary.title || 'Untitled Test';
+  if (!confirm(`Delete '${title}'? This cannot be undone.`)) return;
+  showInlineStatus('#host-library-status', 'Deleting test...', false);
+  try {
+    await apiDelete(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(testSummary.id)}`);
+    await showHostTestLibrary();
+  } catch (e) {
+    showInlineStatus('#host-library-status', e.message || 'Could not delete the test.', true);
   }
 }
 
@@ -1365,6 +1484,41 @@ function downloadStatsNow(subjectCode, buttonEl) {
         buttonEl.textContent = err.message || 'Download failed';
         setTimeout(() => {
           buttonEl.textContent = 'Download Stats (Excel)';
+        }, 3000);
+      }
+    });
+}
+
+function downloadTestsBackup(buttonEl) {
+  const url = `${API_BASE}/api/export/tests`;
+  const originalLabel = buttonEl ? buttonEl.textContent : '';
+  if (buttonEl) buttonEl.textContent = 'Preparing backup...';
+  fetch(url)
+    .then(async (resp) => {
+      if (!resp.ok) {
+        const detail = await resp.json().catch(() => ({}));
+        throw new Error(detail.detail || detail.error || 'Backup failed');
+      }
+      const disposition = resp.headers.get('content-disposition') || '';
+      const match = /filename="?([^"]+)"?/i.exec(disposition);
+      const filename = match ? match[1] : 'quiz_backup.json';
+      const blob = await resp.blob();
+      return { blob, filename };
+    })
+    .then(({ blob, filename }) => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      if (buttonEl) buttonEl.textContent = originalLabel || 'Backup My Tests';
+    })
+    .catch((err) => {
+      showInlineStatus('#host-library-status', err.message || 'Backup failed.', true);
+      if (buttonEl) {
+        buttonEl.textContent = err.message || 'Backup failed';
+        setTimeout(() => {
+          buttonEl.textContent = originalLabel || 'Backup My Tests';
         }, 3000);
       }
     });

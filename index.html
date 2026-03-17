@@ -214,6 +214,20 @@
       <div class="subject-list" id="host-subject-list">
         <!-- Populated by JS -->
       </div>
+      <button id="btn-open-add-subject" class="btn btn-secondary btn-stats" type="button">+ Add New Subject</button>
+      <form id="host-add-subject-form" class="create-test-form" hidden>
+        <label for="new-subject-code" class="input-label">Subject code</label>
+        <input type="text" id="new-subject-code" class="editor-input" placeholder="e.g. THD201B" maxlength="10" autocomplete="off" spellcheck="false">
+
+        <label for="new-subject-name" class="input-label">Subject name</label>
+        <input type="text" id="new-subject-name" class="editor-input" placeholder="e.g. Thermodynamics" maxlength="60" autocomplete="off" spellcheck="false">
+
+        <p id="host-add-subject-status" class="inline-status" hidden></p>
+        <div class="host-test-library-actions">
+          <button id="btn-submit-add-subject" class="btn btn-primary" type="submit">Add Subject</button>
+          <button id="btn-cancel-add-subject" class="btn btn-secondary" type="button">Cancel</button>
+        </div>
+      </form>
       <button id="btn-back-player" class="back-link">&larr; Back to student view</button>
     </div>
   </div>
@@ -235,6 +249,7 @@
         <button id="btn-create-test" class="btn btn-primary">Create New Test</button>
         <button id="btn-back-host-subjects" class="btn btn-secondary">Change Subject</button>
       </div>
+      <button id="btn-backup-tests" class="btn btn-secondary btn-stats" type="button">&#x2B07; Backup My Tests</button>
     </div>
   </div>
 

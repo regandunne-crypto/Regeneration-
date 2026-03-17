@@ -15,6 +15,7 @@ import hmac
 import io
 import json
 import os
+import re
 import secrets
 import time
 import uuid
@@ -29,6 +30,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Subject catalogue and built-in legacy question sets
@@ -248,8 +252,11 @@ SUBJECTS = {'1EM105B': {'code': '1EM105B',
                                         'Equal in magnitude, opposite in direction, and collinear',
                                         'Unequal but parallel',
                                         'Applied at the same point'],
-                            'q': 'For a two-force member in equilibrium, the two forces must '
+                           'q': 'For a two-force member in equilibrium, the two forces must '
                                  'be:'}]}}
+
+BUILTIN_SUBJECT_CODES = set(SUBJECTS.keys())
+SUBJECT_CODE_PATTERN = re.compile(r"^[A-Z0-9]{3,10}$")
 
 TIME_PER_Q = 30
 MAX_POINTS = 1000
@@ -259,6 +266,8 @@ REQUIRE_SUPABASE = os.environ.get("REQUIRE_SUPABASE", "").strip().lower() in {"1
 _local_store_env = os.environ.get("LOCAL_STORE_PATH", "").strip()
 LOCAL_STORE_PATH = Path(_local_store_env).expanduser() if _local_store_env else (Path(__file__).resolve().parent / "local_store.json")
 LOCAL_STORE_VERSION = 1
+
+limiter = Limiter(key_func=get_remote_address)
 
 
 class SupabaseUnavailable(RuntimeError):
@@ -388,6 +397,27 @@ class TestPayload(BaseModel):
         return value
 
 
+class SubjectPayload(BaseModel):
+    code: str = Field(min_length=3, max_length=10)
+    name: str = Field(min_length=2, max_length=60)
+
+    @field_validator("code")
+    @classmethod
+    def normalize_code(cls, value: str) -> str:
+        cleaned = (value or "").strip().upper()
+        if not SUBJECT_CODE_PATTERN.match(cleaned):
+            raise ValueError("Subject code must be 3-10 letters or numbers (no spaces).")
+        return cleaned
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        cleaned = (value or "").strip()
+        if len(cleaned) < 2 or len(cleaned) > 60:
+            raise ValueError("Subject name must be 2-60 characters.")
+        return cleaned
+
+
 class LecturerSignupPayload(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     email: str = Field(min_length=5, max_length=240)
@@ -481,6 +511,7 @@ class SupabaseStore:
         self.quiz_tests_base = f"{self.base_url}/rest/v1/quiz_tests"
         self.lecturers_base = f"{self.base_url}/rest/v1/quiz_lecturers"
         self.drafts_base = f"{self.base_url}/rest/v1/quiz_test_drafts"
+        self.subjects_base = f"{self.base_url}/rest/v1/quiz_subjects"
 
     def _check_response(self, resp: requests.Response) -> None:
         if not resp.ok:
@@ -529,6 +560,69 @@ class SupabaseStore:
             raise RuntimeError("Supabase did not return the created lecturer.")
         return rows[0]
 
+    def list_subjects(self) -> list[dict[str, Any]]:
+        rows = self._request("GET", self.subjects_base, params={
+            "select": "code,name,created_by,created_at",
+            "order": "name.asc",
+        })
+        for row in rows:
+            if row.get("code"):
+                row["code"] = str(row["code"]).strip().upper()
+            if row.get("name"):
+                row["name"] = str(row["name"]).strip()
+        return rows
+
+    def get_subject(self, code: str) -> dict[str, Any] | None:
+        rows = self._request("GET", self.subjects_base, params={
+            "select": "code,name,created_by,created_at",
+            "code": f"ilike.{code}",
+            "limit": "1",
+        })
+        if not rows:
+            return None
+        row = rows[0]
+        row["code"] = str(row.get("code") or "").strip().upper()
+        row["name"] = str(row.get("name") or "").strip()
+        return row
+
+    def create_subject(self, code: str, name: str, lecturer_id: str) -> dict[str, Any]:
+        rows = self._request("POST", self.subjects_base, body={
+            "code": code,
+            "name": name,
+            "created_by": lecturer_id,
+        }, prefer="return=representation")
+        if not rows:
+            raise RuntimeError("Supabase did not return the created subject.")
+        row = rows[0]
+        row["code"] = str(row.get("code") or "").strip().upper()
+        row["name"] = str(row.get("name") or "").strip()
+        return row
+
+    def delete_subject(self, code: str, lecturer_id: str) -> None:
+        self._request("DELETE", self.subjects_base, params={
+            "code": f"ilike.{code}",
+            "created_by": f"eq.{lecturer_id}",
+        })
+
+    def subject_has_tests(self, subject_code: str) -> bool:
+        rows = self._request("GET", self.quiz_tests_base, params={
+            "select": "id",
+            "subject_code": f"eq.{subject_code}",
+            "limit": "1",
+        })
+        return bool(rows)
+
+    def list_tests_by_creator(self, lecturer_id: str) -> list[dict[str, Any]]:
+        rows = self._request("GET", self.quiz_tests_base, params={
+            "select": "id,subject_code,title,chapter,description,questions,question_count,created_at,updated_at,created_by,owner_name",
+            "created_by": f"eq.{lecturer_id}",
+            "order": "subject_code.asc,updated_at.desc",
+        })
+        for row in rows:
+            row["source"] = "supabase"
+            row.setdefault("question_count", len(row.get("questions") or []))
+        return rows
+
     def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
         rows = self._request("GET", self.quiz_tests_base, params={
             "select": "id,subject_code,title,chapter,description,question_count,created_at,updated_at,created_by,owner_name",
@@ -572,6 +666,12 @@ class SupabaseStore:
         row["source"] = "supabase"
         row["can_edit"] = True
         return row
+
+    def delete_test(self, subject_code: str, test_id: str) -> None:
+        self._request("DELETE", self.quiz_tests_base, params={
+            "subject_code": f"eq.{subject_code}",
+            "id": f"eq.{test_id}",
+        })
 
     def update_test(self, subject_code: str, test_id: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
         existing = self.get_test(subject_code, test_id, lecturer["id"])
@@ -647,6 +747,7 @@ class HybridTestRepository:
         self.local_custom_tests: dict[str, dict[str, dict[str, Any]]] = {}
         self.local_drafts: dict[tuple[str, str], dict[str, Any]] = {}
         self.local_lecturers: dict[str, dict[str, Any]] = {}
+        self.local_subjects: dict[str, dict[str, Any]] = {}
         self.local_store_path = LOCAL_STORE_PATH
         self.local_store_enabled = True
         self.local_store_error: str | None = None
@@ -688,6 +789,18 @@ class HybridTestRepository:
             return None
         return parts[0], parts[1]
 
+    def _register_subject(self, code: str, name: str) -> None:
+        code = (code or "").strip().upper()
+        name = (name or "").strip()
+        if not code or not name or code in BUILTIN_SUBJECT_CODES:
+            return
+        entry = self.subjects.get(code)
+        if entry:
+            entry["name"] = name
+            entry.setdefault("questions", [])
+        else:
+            self.subjects[code] = {"code": code, "name": name, "questions": []}
+
     def _load_local_store(self) -> None:
         if not self.local_store_path.exists():
             return
@@ -699,6 +812,23 @@ class HybridTestRepository:
             return
         if not isinstance(data, dict):
             return
+        subjects = data.get("local_subjects", {})
+        if isinstance(subjects, dict):
+            for raw_code, row in subjects.items():
+                if not isinstance(row, dict):
+                    continue
+                code = str(row.get("code") or raw_code or "").strip().upper()
+                name = str(row.get("name") or "").strip()
+                if not code or not name or code in BUILTIN_SUBJECT_CODES:
+                    continue
+                cleaned = {
+                    "code": code,
+                    "name": name,
+                    "created_by": row.get("created_by"),
+                    "created_at": row.get("created_at"),
+                }
+                self.local_subjects[code] = cleaned
+                self._register_subject(code, name)
         tests = data.get("local_custom_tests", {})
         if isinstance(tests, dict):
             for code, items in tests.items():
@@ -729,6 +859,7 @@ class HybridTestRepository:
             return
         payload = {
             "version": LOCAL_STORE_VERSION,
+            "local_subjects": self.local_subjects,
             "local_custom_tests": self.local_custom_tests,
             "local_drafts": {
                 self._draft_key(lecturer_id, subject_code): row
@@ -923,6 +1054,133 @@ class HybridTestRepository:
         self._cache_lecturer_row(result)
         return result
 
+    def list_subjects(self) -> list[dict[str, Any]]:
+        remote_rows = self._call_remote(
+            lambda: self.remote.list_subjects(),
+            lambda: list(self.local_subjects.values())
+        )
+        combined: dict[str, dict[str, Any]] = {}
+        for row in list(self.local_subjects.values()):
+            code = (row.get("code") or "").strip().upper()
+            name = (row.get("name") or "").strip()
+            if not code or not name or code in BUILTIN_SUBJECT_CODES:
+                continue
+            combined[code] = {
+                "code": code,
+                "name": name,
+                "created_by": row.get("created_by"),
+                "created_at": row.get("created_at"),
+            }
+            self._register_subject(code, name)
+        for row in remote_rows or []:
+            code = (row.get("code") or "").strip().upper()
+            name = (row.get("name") or "").strip()
+            if not code or not name or code in BUILTIN_SUBJECT_CODES:
+                continue
+            combined[code] = {
+                "code": code,
+                "name": name,
+                "created_by": row.get("created_by"),
+                "created_at": row.get("created_at"),
+            }
+            self._register_subject(code, name)
+        if combined:
+            self.local_subjects.update(combined)
+            self._persist_local_store()
+        return list(combined.values())
+
+    def create_subject(self, code: str, name: str, lecturer: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_supabase_for_write()
+        code = (code or "").strip().upper()
+        name = (name or "").strip()
+        if code in BUILTIN_SUBJECT_CODES or code in self.subjects:
+            raise ValueError("Subject code already exists.")
+        if self.remote is not None:
+            existing = self._call_remote(lambda: self.remote.get_subject(code), lambda: None)
+            if existing:
+                raise ValueError("Subject code already exists.")
+        def _local_create():
+            row = {
+                "code": code,
+                "name": name,
+                "created_by": lecturer.get("id"),
+                "created_at": datetime.utcnow().isoformat(),
+            }
+            self.local_subjects[code] = row
+            self._register_subject(code, name)
+            self._persist_local_store()
+            return row
+        def _remote_create():
+            try:
+                return self.remote.create_subject(code, name, lecturer["id"])
+            except RuntimeError as exc:
+                if "duplicate" in str(exc).lower():
+                    raise ValueError("Subject code already exists.")
+                raise
+        row = self._call_remote(_remote_create, _local_create)
+        if row:
+            self.local_subjects[code] = {
+                "code": code,
+                "name": row.get("name") or name,
+                "created_by": row.get("created_by") or lecturer.get("id"),
+                "created_at": row.get("created_at"),
+            }
+            self._register_subject(code, row.get("name") or name)
+            self._persist_local_store()
+        return row
+
+    def delete_subject(self, code: str, lecturer: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_supabase_for_write()
+        code = (code or "").strip().upper()
+        if code in BUILTIN_SUBJECT_CODES:
+            raise PermissionError("Built-in subjects cannot be deleted.")
+
+        def _local_delete():
+            row = self.local_subjects.get(code)
+            if not row:
+                raise KeyError("Subject not found")
+            if row.get("created_by") != lecturer.get("id"):
+                raise PermissionError("Only the lecturer who created this subject can delete it.")
+            if self.local_custom_tests.get(code):
+                raise ValueError("Cannot delete a subject with saved tests.")
+            self.local_subjects.pop(code, None)
+            if code in self.subjects and code not in BUILTIN_SUBJECT_CODES:
+                self.subjects.pop(code, None)
+            self.local_custom_tests.pop(code, None)
+            self._persist_local_store()
+            return row
+
+        def _remote_delete():
+            row = self.remote.get_subject(code)
+            if not row:
+                raise KeyError("Subject not found")
+            if row.get("created_by") != lecturer.get("id"):
+                raise PermissionError("Only the lecturer who created this subject can delete it.")
+            if self.remote.subject_has_tests(code) or self.local_custom_tests.get(code):
+                raise ValueError("Cannot delete a subject with saved tests.")
+            self.remote.delete_subject(code, lecturer.get("id"))
+            return row
+
+        row = self._call_remote(_remote_delete, _local_delete)
+        self.local_subjects.pop(code, None)
+        if code in self.subjects and code not in BUILTIN_SUBJECT_CODES:
+            self.subjects.pop(code, None)
+        self.local_custom_tests.pop(code, None)
+        self._persist_local_store()
+        return row
+
+    def list_tests_by_creator(self, lecturer_id: str) -> list[dict[str, Any]]:
+        remote_rows = self._call_remote(
+            lambda: self.remote.list_tests_by_creator(lecturer_id),
+            lambda: []
+        )
+        local_rows: list[dict[str, Any]] = []
+        for items in self.local_custom_tests.values():
+            for row in items.values():
+                if row.get("created_by") == lecturer_id:
+                    local_rows.append(row)
+        return list(remote_rows or []) + local_rows
+
     def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
         if subject_code not in self.subjects:
             raise KeyError(subject_code)
@@ -1015,6 +1273,32 @@ class HybridTestRepository:
             row.setdefault("created_by", lecturer["id"])
             return row
         return self._call_remote(_remote_update, _local_update)
+
+    def delete_test(self, subject_code: str, test_id: str, lecturer: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_supabase_for_write()
+        if test_id in self.builtin_tests.get(subject_code, {}):
+            raise PermissionError("Built-in tests cannot be deleted.")
+
+        def _local_delete():
+            row = self.local_custom_tests.get(subject_code, {}).get(test_id)
+            if not row:
+                raise KeyError("Test not found")
+            if row.get("created_by") != lecturer["id"]:
+                raise PermissionError("Only the lecturer who created this test can delete it.")
+            self.local_custom_tests.get(subject_code, {}).pop(test_id, None)
+            self._persist_local_store()
+            return row
+
+        def _remote_delete():
+            existing = self.remote.get_test(subject_code, test_id, lecturer.get("id"))
+            if not existing:
+                raise KeyError("Test not found")
+            if existing.get("created_by") != lecturer["id"]:
+                raise PermissionError("Only the lecturer who created this test can delete it.")
+            self.remote.delete_test(subject_code, test_id)
+            return existing
+
+        return self._call_remote(_remote_delete, _local_delete)
 
     def get_draft(self, subject_code: str, lecturer: dict[str, Any]) -> dict[str, Any] | None:
         return self._call_remote(
@@ -1118,15 +1402,43 @@ class GameRoom:
 rooms: dict[str, GameRoom] = {code: GameRoom(code) for code in SUBJECTS}
 
 
+def register_subject_in_catalog(code: str, name: str) -> None:
+    code = (code or "").strip().upper()
+    name = (name or "").strip()
+    if not code or not name or code in BUILTIN_SUBJECT_CODES:
+        return
+    entry = SUBJECTS.get(code)
+    if entry:
+        entry["name"] = name
+        entry.setdefault("questions", [])
+    else:
+        SUBJECTS[code] = {"code": code, "name": name, "questions": []}
+    room = rooms.get(code)
+    if room:
+        room.subject_name = SUBJECTS[code]["name"]
+    else:
+        rooms[code] = GameRoom(code)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI
 # ──────────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        subjects = repo.list_subjects()
+        for row in subjects:
+            register_subject_in_catalog(row.get("code"), row.get("name"))
+    except Exception as exc:
+        print(f"Failed to load subjects from Supabase: {exc}")
     yield
 
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").strip()
+allow_origins = ["*"] if ALLOWED_ORIGINS == "*" else [origin.strip() for origin in ALLOWED_ORIGINS.split(",") if origin.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=allow_origins, allow_methods=["*"], allow_headers=["*"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 BASE_DIR = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=BASE_DIR), name="static")
@@ -1209,6 +1521,7 @@ def lecturer_session(request: Request):
 
 
 @app.post("/api/lecturer/signup")
+@limiter.limit("5/minute")
 def lecturer_signup(payload: dict[str, Any], request: Request):
     try:
         validated = LecturerSignupPayload.model_validate(payload)
@@ -1227,6 +1540,7 @@ def lecturer_signup(payload: dict[str, Any], request: Request):
 
 
 @app.post("/api/lecturer/login")
+@limiter.limit("10/minute")
 def lecturer_login(payload: dict[str, Any], request: Request):
     try:
         validated = LecturerLoginPayload.model_validate(payload)
@@ -1268,7 +1582,56 @@ def get_subjects():
             "questionCount": total_questions,
             "testCount": len(tests)
         })
+    result.sort(key=lambda item: item["name"].lower())
     return result
+
+
+@app.post("/api/subjects")
+def create_subject(payload: dict[str, Any], request: Request):
+    lecturer = require_lecturer(request)
+    try:
+        validated = SubjectPayload.model_validate(payload)
+        code = validated.code
+        if code in SUBJECTS:
+            raise HTTPException(status_code=409, detail="Subject code already exists.")
+        created = repo.create_subject(code, validated.name, lecturer)
+        register_subject_in_catalog(code, created.get("name") or validated.name)
+        return {"ok": True, "subject": {"code": code, "name": created.get("name") or validated.name}}
+    except HTTPException:
+        raise
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors())
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except SupabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/api/subjects/{code}")
+def delete_subject(code: str, request: Request):
+    lecturer = require_lecturer(request)
+    normalized = (code or "").strip().upper()
+    if normalized in BUILTIN_SUBJECT_CODES:
+        raise HTTPException(status_code=403, detail="Built-in subjects cannot be deleted.")
+    if normalized not in SUBJECTS:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    try:
+        repo.delete_subject(normalized, lecturer)
+        SUBJECTS.pop(normalized, None)
+        rooms.pop(normalized, None)
+        return {"ok": True}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except SupabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/tests/{subject_code}")
@@ -1351,6 +1714,24 @@ def update_test(subject_code: str, test_id: str, payload: dict[str, Any], reques
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.delete("/api/tests/{subject_code}/{test_id}")
+def delete_test(subject_code: str, test_id: str, request: Request):
+    if subject_code not in SUBJECTS:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    lecturer = require_lecturer(request)
+    try:
+        repo.delete_test(subject_code, test_id, lecturer)
+        return {"ok": True}
+    except SupabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Test not found")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.get("/api/drafts/{subject_code}")
 def get_test_draft(subject_code: str, request: Request):
     if subject_code not in SUBJECTS:
@@ -1390,6 +1771,20 @@ def clear_test_draft(subject_code: str, request: Request):
         return {"ok": True}
     except SupabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/export/tests")
+def export_tests(request: Request):
+    lecturer = require_lecturer(request)
+    try:
+        tests = repo.list_tests_by_creator(lecturer["id"])
+        stamp = datetime.utcnow().strftime("%Y%m%d")
+        filename = f"quiz_backup_{stamp}.json"
+        payload = json.dumps(tests, ensure_ascii=False, indent=2)
+        headers = {"Content-Disposition": f"attachment; filename={filename}"}
+        return Response(content=payload, media_type="application/json", headers=headers)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

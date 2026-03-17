@@ -97,6 +97,15 @@ create unique index if not exists quiz_test_drafts_lecturer_subject_idx
 create index if not exists quiz_test_drafts_updated_idx
   on public.quiz_test_drafts(updated_at desc);
 
+create table if not exists public.quiz_subjects (
+  code text primary key,
+  name text not null,
+  created_by uuid references public.quiz_lecturers(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+alter table public.quiz_subjects enable row level security;
+
 drop trigger if exists trg_quiz_lecturers_updated_at on public.quiz_lecturers;
 create trigger trg_quiz_lecturers_updated_at
 before update on public.quiz_lecturers
