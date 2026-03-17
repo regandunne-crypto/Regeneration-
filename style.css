@@ -1586,6 +1586,12 @@ body::before {
   gap: var(--space-4);
 }
 
+#btn-backup-tests {
+  align-self: flex-start;
+  width: auto;
+  display: inline-flex;
+}
+
 .test-card {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
