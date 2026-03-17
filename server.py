@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import requests
+import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -502,30 +502,35 @@ class SupabaseStore:
     def __init__(self, base_url: str, service_role_key: str):
         self.base_url = base_url.rstrip("/")
         self.service_role_key = service_role_key
-        self.session = requests.Session()
-        self.session.headers.update({
-            "apikey": self.service_role_key,
-            "Authorization": f"Bearer {self.service_role_key}",
-            "Content-Type": "application/json",
-        })
+        self._client = httpx.AsyncClient(
+            headers={
+                "apikey": self.service_role_key,
+                "Authorization": f"Bearer {self.service_role_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
         self.quiz_tests_base = f"{self.base_url}/rest/v1/quiz_tests"
         self.lecturers_base = f"{self.base_url}/rest/v1/quiz_lecturers"
         self.drafts_base = f"{self.base_url}/rest/v1/quiz_test_drafts"
         self.subjects_base = f"{self.base_url}/rest/v1/quiz_subjects"
 
-    def _check_response(self, resp: requests.Response) -> None:
-        if not resp.ok:
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    def _check_response(self, resp: httpx.Response) -> None:
+        if not resp.is_success:
             try:
                 detail = resp.json()
             except Exception:
                 detail = resp.text
             raise RuntimeError(f"Supabase request failed: {detail}")
 
-    def _request(self, method: str, url: str, *, params=None, body=None, prefer: str | None = None) -> list[dict[str, Any]]:
-        headers = dict(self.session.headers)
+    async def _request(self, method: str, url: str, *, params=None, body=None, prefer: str | None = None) -> list[dict[str, Any]]:
+        headers = dict(self._client.headers)
         if prefer:
             headers["Prefer"] = prefer
-        resp = self.session.request(method, url, params=params, headers=headers, data=json.dumps(body) if body is not None else None, timeout=REQUEST_TIMEOUT)
+        resp = await self._client.request(method, url, params=params, headers=headers, json=body)
         self._check_response(resp)
         if not resp.text:
             return []
@@ -534,24 +539,24 @@ class SupabaseStore:
         except Exception:
             return []
 
-    def get_lecturer_by_email(self, email: str) -> dict[str, Any] | None:
-        rows = self._request("GET", self.lecturers_base, params={
+    async def get_lecturer_by_email(self, email: str) -> dict[str, Any] | None:
+        rows = await self._request("GET", self.lecturers_base, params={
             "select": "id,name,email,password_hash,created_at,updated_at",
             "email": f"eq.{email.lower()}",
             "limit": "1",
         })
         return rows[0] if rows else None
 
-    def get_lecturer_by_id(self, lecturer_id: str) -> dict[str, Any] | None:
-        rows = self._request("GET", self.lecturers_base, params={
+    async def get_lecturer_by_id(self, lecturer_id: str) -> dict[str, Any] | None:
+        rows = await self._request("GET", self.lecturers_base, params={
             "select": "id,name,email,created_at,updated_at",
             "id": f"eq.{lecturer_id}",
             "limit": "1",
         })
         return rows[0] if rows else None
 
-    def create_lecturer(self, name: str, email: str, password_hash: str) -> dict[str, Any]:
-        rows = self._request("POST", self.lecturers_base, body={
+    async def create_lecturer(self, name: str, email: str, password_hash: str) -> dict[str, Any]:
+        rows = await self._request("POST", self.lecturers_base, body={
             "name": name,
             "email": email.lower(),
             "password_hash": password_hash,
@@ -560,8 +565,8 @@ class SupabaseStore:
             raise RuntimeError("Supabase did not return the created lecturer.")
         return rows[0]
 
-    def list_subjects(self) -> list[dict[str, Any]]:
-        rows = self._request("GET", self.subjects_base, params={
+    async def list_subjects(self) -> list[dict[str, Any]]:
+        rows = await self._request("GET", self.subjects_base, params={
             "select": "code,name,created_by,created_at",
             "order": "name.asc",
         })
@@ -572,8 +577,8 @@ class SupabaseStore:
                 row["name"] = str(row["name"]).strip()
         return rows
 
-    def get_subject(self, code: str) -> dict[str, Any] | None:
-        rows = self._request("GET", self.subjects_base, params={
+    async def get_subject(self, code: str) -> dict[str, Any] | None:
+        rows = await self._request("GET", self.subjects_base, params={
             "select": "code,name,created_by,created_at",
             "code": f"ilike.{code}",
             "limit": "1",
@@ -585,8 +590,8 @@ class SupabaseStore:
         row["name"] = str(row.get("name") or "").strip()
         return row
 
-    def create_subject(self, code: str, name: str, lecturer_id: str) -> dict[str, Any]:
-        rows = self._request("POST", self.subjects_base, body={
+    async def create_subject(self, code: str, name: str, lecturer_id: str) -> dict[str, Any]:
+        rows = await self._request("POST", self.subjects_base, body={
             "code": code,
             "name": name,
             "created_by": lecturer_id,
@@ -598,22 +603,22 @@ class SupabaseStore:
         row["name"] = str(row.get("name") or "").strip()
         return row
 
-    def delete_subject(self, code: str, lecturer_id: str) -> None:
-        self._request("DELETE", self.subjects_base, params={
+    async def delete_subject(self, code: str, lecturer_id: str) -> None:
+        await self._request("DELETE", self.subjects_base, params={
             "code": f"ilike.{code}",
             "created_by": f"eq.{lecturer_id}",
         })
 
-    def subject_has_tests(self, subject_code: str) -> bool:
-        rows = self._request("GET", self.quiz_tests_base, params={
+    async def subject_has_tests(self, subject_code: str) -> bool:
+        rows = await self._request("GET", self.quiz_tests_base, params={
             "select": "id",
             "subject_code": f"eq.{subject_code}",
             "limit": "1",
         })
         return bool(rows)
 
-    def list_tests_by_creator(self, lecturer_id: str) -> list[dict[str, Any]]:
-        rows = self._request("GET", self.quiz_tests_base, params={
+    async def list_tests_by_creator(self, lecturer_id: str) -> list[dict[str, Any]]:
+        rows = await self._request("GET", self.quiz_tests_base, params={
             "select": "id,subject_code,title,chapter,description,questions,question_count,created_at,updated_at,created_by,owner_name",
             "created_by": f"eq.{lecturer_id}",
             "order": "subject_code.asc,updated_at.desc",
@@ -623,8 +628,8 @@ class SupabaseStore:
             row.setdefault("question_count", len(row.get("questions") or []))
         return rows
 
-    def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
-        rows = self._request("GET", self.quiz_tests_base, params={
+    async def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
+        rows = await self._request("GET", self.quiz_tests_base, params={
             "select": "id,subject_code,title,chapter,description,question_count,created_at,updated_at,created_by,owner_name",
             "subject_code": f"eq.{subject_code}",
             "order": "updated_at.desc",
@@ -634,8 +639,8 @@ class SupabaseStore:
             row["can_edit"] = bool(lecturer_id and row.get("created_by") == lecturer_id)
         return rows
 
-    def get_test(self, subject_code: str, test_id: str, lecturer_id: str | None = None) -> dict[str, Any] | None:
-        rows = self._request("GET", self.quiz_tests_base, params={
+    async def get_test(self, subject_code: str, test_id: str, lecturer_id: str | None = None) -> dict[str, Any] | None:
+        rows = await self._request("GET", self.quiz_tests_base, params={
             "select": "id,subject_code,title,chapter,description,questions,question_count,created_at,updated_at,created_by,owner_name",
             "subject_code": f"eq.{subject_code}",
             "id": f"eq.{test_id}",
@@ -648,8 +653,8 @@ class SupabaseStore:
         row["can_edit"] = bool(lecturer_id and row.get("created_by") == lecturer_id)
         return row
 
-    def create_test(self, subject_code: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
-        rows = self._request("POST", self.quiz_tests_base, body={
+    async def create_test(self, subject_code: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
+        rows = await self._request("POST", self.quiz_tests_base, body={
             "subject_code": subject_code,
             "title": payload.title,
             "chapter": payload.chapter or None,
@@ -667,19 +672,19 @@ class SupabaseStore:
         row["can_edit"] = True
         return row
 
-    def delete_test(self, subject_code: str, test_id: str) -> None:
-        self._request("DELETE", self.quiz_tests_base, params={
+    async def delete_test(self, subject_code: str, test_id: str) -> None:
+        await self._request("DELETE", self.quiz_tests_base, params={
             "subject_code": f"eq.{subject_code}",
             "id": f"eq.{test_id}",
         })
 
-    def update_test(self, subject_code: str, test_id: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
-        existing = self.get_test(subject_code, test_id, lecturer["id"])
+    async def update_test(self, subject_code: str, test_id: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
+        existing = await self.get_test(subject_code, test_id, lecturer["id"])
         if not existing:
             raise KeyError("Test not found")
         if existing.get("created_by") and existing.get("created_by") != lecturer["id"]:
             raise PermissionError("Only the lecturer who created this test can edit it.")
-        rows = self._request("PATCH", self.quiz_tests_base, params={
+        rows = await self._request("PATCH", self.quiz_tests_base, params={
             "subject_code": f"eq.{subject_code}",
             "id": f"eq.{test_id}",
         }, body={
@@ -699,8 +704,8 @@ class SupabaseStore:
         row["can_edit"] = True
         return row
 
-    def get_draft(self, subject_code: str, lecturer_id: str) -> dict[str, Any] | None:
-        rows = self._request("GET", self.drafts_base, params={
+    async def get_draft(self, subject_code: str, lecturer_id: str) -> dict[str, Any] | None:
+        rows = await self._request("GET", self.drafts_base, params={
             "select": "id,lecturer_id,subject_code,title,chapter,description,questions,question_count,editing_test_id,updated_at",
             "lecturer_id": f"eq.{lecturer_id}",
             "subject_code": f"eq.{subject_code}",
@@ -708,8 +713,8 @@ class SupabaseStore:
         })
         return rows[0] if rows else None
 
-    def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> dict[str, Any]:
-        existing = self.get_draft(subject_code, lecturer["id"])
+    async def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> dict[str, Any]:
+        existing = await self.get_draft(subject_code, lecturer["id"])
         body = {
             "lecturer_id": lecturer["id"],
             "subject_code": subject_code,
@@ -723,18 +728,18 @@ class SupabaseStore:
             "updated_at": datetime.utcnow().isoformat(),
         }
         if existing:
-            rows = self._request("PATCH", self.drafts_base, params={
+            rows = await self._request("PATCH", self.drafts_base, params={
                 "id": f"eq.{existing['id']}",
                 "lecturer_id": f"eq.{lecturer['id']}",
             }, body=body, prefer="return=representation")
         else:
-            rows = self._request("POST", self.drafts_base, body=body, prefer="return=representation")
+            rows = await self._request("POST", self.drafts_base, body=body, prefer="return=representation")
         if not rows:
             raise RuntimeError("Supabase did not return the saved draft.")
         return rows[0]
 
-    def clear_draft(self, subject_code: str, lecturer_id: str) -> None:
-        self._request("DELETE", self.drafts_base, params={
+    async def clear_draft(self, subject_code: str, lecturer_id: str) -> None:
+        await self._request("DELETE", self.drafts_base, params={
             "lecturer_id": f"eq.{lecturer_id}",
             "subject_code": f"eq.{subject_code}",
         })
@@ -905,16 +910,16 @@ class HybridTestRepository:
             return True
         return False
 
-    def _call_remote(self, fn, fallback):
-        if self.remote is None:
+    async def _call_remote(self, awaitable, fallback):
+        if self.remote is None or awaitable is None:
             return fallback()
         try:
-            return fn()
+            return await awaitable
         except RuntimeError as exc:
             if self._handle_supabase_error(exc):
                 return fallback()
             raise
-        except requests.RequestException as exc:
+        except httpx.RequestError as exc:
             self.supabase_error = str(exc)
             self.remote = None
             self.local_store_enabled = True
@@ -985,19 +990,19 @@ class HybridTestRepository:
             "canEdit": can_edit,
         }
 
-    def get_lecturer_by_email(self, email: str) -> dict[str, Any] | None:
+    async def get_lecturer_by_email(self, email: str) -> dict[str, Any] | None:
         email = email.strip().lower()
         def _local_lookup():
             return self.local_lecturers.get(email)
         if self.remote is None:
             return _local_lookup()
         try:
-            row = self.remote.get_lecturer_by_email(email)
+            row = await self.remote.get_lecturer_by_email(email)
         except RuntimeError as exc:
             if self._handle_supabase_error(exc):
                 return _local_lookup()
             raise
-        except requests.RequestException as exc:
+        except httpx.RequestError as exc:
             self.supabase_error = str(exc)
             self.remote = None
             self.local_store_enabled = True
@@ -1008,7 +1013,7 @@ class HybridTestRepository:
             return row
         return _local_lookup()
 
-    def get_lecturer_by_id(self, lecturer_id: str) -> dict[str, Any] | None:
+    async def get_lecturer_by_id(self, lecturer_id: str) -> dict[str, Any] | None:
         def _local_lookup():
             for row in self.local_lecturers.values():
                 if row["id"] == lecturer_id:
@@ -1017,12 +1022,12 @@ class HybridTestRepository:
         if self.remote is None:
             return _local_lookup()
         try:
-            row = self.remote.get_lecturer_by_id(lecturer_id)
+            row = await self.remote.get_lecturer_by_id(lecturer_id)
         except RuntimeError as exc:
             if self._handle_supabase_error(exc):
                 return _local_lookup()
             raise
-        except requests.RequestException as exc:
+        except httpx.RequestError as exc:
             self.supabase_error = str(exc)
             self.remote = None
             self.local_store_enabled = True
@@ -1030,9 +1035,9 @@ class HybridTestRepository:
             return _local_lookup()
         return row or _local_lookup()
 
-    def create_lecturer(self, payload: LecturerSignupPayload) -> dict[str, Any]:
+    async def create_lecturer(self, payload: LecturerSignupPayload) -> dict[str, Any]:
         self._ensure_supabase_for_write()
-        if self.get_lecturer_by_email(payload.email):
+        if await self.get_lecturer_by_email(payload.email):
             raise ValueError("An account with that email already exists.")
         password_hash = hash_password(payload.password)
         def _local_create():
@@ -1047,16 +1052,16 @@ class HybridTestRepository:
             self.local_lecturers[payload.email] = row
             self._persist_local_store()
             return {k: v for k, v in row.items() if k != "password_hash"}
-        result = self._call_remote(
-            lambda: self.remote.create_lecturer(payload.name, payload.email, password_hash),
+        result = await self._call_remote(
+            self.remote.create_lecturer(payload.name, payload.email, password_hash) if self.remote else None,
             _local_create
         )
         self._cache_lecturer_row(result)
         return result
 
-    def list_subjects(self) -> list[dict[str, Any]]:
-        remote_rows = self._call_remote(
-            lambda: self.remote.list_subjects(),
+    async def list_subjects(self) -> list[dict[str, Any]]:
+        remote_rows = await self._call_remote(
+            self.remote.list_subjects() if self.remote else None,
             lambda: list(self.local_subjects.values())
         )
         combined: dict[str, dict[str, Any]] = {}
@@ -1089,14 +1094,14 @@ class HybridTestRepository:
             self._persist_local_store()
         return list(combined.values())
 
-    def create_subject(self, code: str, name: str, lecturer: dict[str, Any]) -> dict[str, Any]:
+    async def create_subject(self, code: str, name: str, lecturer: dict[str, Any]) -> dict[str, Any]:
         self._ensure_supabase_for_write()
         code = (code or "").strip().upper()
         name = (name or "").strip()
         if code in BUILTIN_SUBJECT_CODES or code in self.subjects:
             raise ValueError("Subject code already exists.")
         if self.remote is not None:
-            existing = self._call_remote(lambda: self.remote.get_subject(code), lambda: None)
+            existing = await self._call_remote(self.remote.get_subject(code), lambda: None)
             if existing:
                 raise ValueError("Subject code already exists.")
         def _local_create():
@@ -1110,14 +1115,14 @@ class HybridTestRepository:
             self._register_subject(code, name)
             self._persist_local_store()
             return row
-        def _remote_create():
+        async def _remote_create():
             try:
-                return self.remote.create_subject(code, name, lecturer["id"])
+                return await self.remote.create_subject(code, name, lecturer["id"])
             except RuntimeError as exc:
                 if "duplicate" in str(exc).lower():
                     raise ValueError("Subject code already exists.")
                 raise
-        row = self._call_remote(_remote_create, _local_create)
+        row = await self._call_remote(_remote_create() if self.remote else None, _local_create)
         if row:
             self.local_subjects[code] = {
                 "code": code,
@@ -1129,7 +1134,7 @@ class HybridTestRepository:
             self._persist_local_store()
         return row
 
-    def delete_subject(self, code: str, lecturer: dict[str, Any]) -> dict[str, Any]:
+    async def delete_subject(self, code: str, lecturer: dict[str, Any]) -> dict[str, Any]:
         self._ensure_supabase_for_write()
         code = (code or "").strip().upper()
         if code in BUILTIN_SUBJECT_CODES:
@@ -1150,18 +1155,18 @@ class HybridTestRepository:
             self._persist_local_store()
             return row
 
-        def _remote_delete():
-            row = self.remote.get_subject(code)
+        async def _remote_delete():
+            row = await self.remote.get_subject(code)
             if not row:
                 raise KeyError("Subject not found")
             if row.get("created_by") != lecturer.get("id"):
                 raise PermissionError("Only the lecturer who created this subject can delete it.")
-            if self.remote.subject_has_tests(code) or self.local_custom_tests.get(code):
+            if await self.remote.subject_has_tests(code) or self.local_custom_tests.get(code):
                 raise ValueError("Cannot delete a subject with saved tests.")
-            self.remote.delete_subject(code, lecturer.get("id"))
+            await self.remote.delete_subject(code, lecturer.get("id"))
             return row
 
-        row = self._call_remote(_remote_delete, _local_delete)
+        row = await self._call_remote(_remote_delete() if self.remote else None, _local_delete)
         self.local_subjects.pop(code, None)
         if code in self.subjects and code not in BUILTIN_SUBJECT_CODES:
             self.subjects.pop(code, None)
@@ -1169,9 +1174,9 @@ class HybridTestRepository:
         self._persist_local_store()
         return row
 
-    def list_tests_by_creator(self, lecturer_id: str) -> list[dict[str, Any]]:
-        remote_rows = self._call_remote(
-            lambda: self.remote.list_tests_by_creator(lecturer_id),
+    async def list_tests_by_creator(self, lecturer_id: str) -> list[dict[str, Any]]:
+        remote_rows = await self._call_remote(
+            self.remote.list_tests_by_creator(lecturer_id) if self.remote else None,
             lambda: []
         )
         local_rows: list[dict[str, Any]] = []
@@ -1181,7 +1186,7 @@ class HybridTestRepository:
                     local_rows.append(row)
         return list(remote_rows or []) + local_rows
 
-    def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
+    async def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
         if subject_code not in self.subjects:
             raise KeyError(subject_code)
 
@@ -1189,8 +1194,8 @@ class HybridTestRepository:
         builtin_rows = list(self.builtin_tests.get(subject_code, {}).values())
         tests.extend(self._summary(row, lecturer_id) for row in builtin_rows)
 
-        remote_rows = self._call_remote(
-            lambda: self.remote.list_tests(subject_code, lecturer_id),
+        remote_rows = await self._call_remote(
+            self.remote.list_tests(subject_code, lecturer_id) if self.remote else None,
             lambda: []
         )
         local_rows = list(self.local_custom_tests.get(subject_code, {}).values())
@@ -1199,7 +1204,7 @@ class HybridTestRepository:
         tests.extend(self._summary(row, lecturer_id) for row in local_rows)
         return tests
 
-    def get_test(self, subject_code: str, test_id: str, lecturer_id: str | None = None) -> dict[str, Any] | None:
+    async def get_test(self, subject_code: str, test_id: str, lecturer_id: str | None = None) -> dict[str, Any] | None:
         if test_id in self.builtin_tests.get(subject_code, {}):
             row = self.builtin_tests[subject_code][test_id]
             row["can_edit"] = False
@@ -1208,12 +1213,12 @@ class HybridTestRepository:
             row = self.local_custom_tests[subject_code][test_id]
             row["can_edit"] = bool(lecturer_id and row.get("created_by") == lecturer_id)
             return row
-        return self._call_remote(
-            lambda: self.remote.get_test(subject_code, test_id, lecturer_id),
+        return await self._call_remote(
+            self.remote.get_test(subject_code, test_id, lecturer_id) if self.remote else None,
             lambda: None
         )
 
-    def create_test(self, subject_code: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
+    async def create_test(self, subject_code: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
         self._ensure_supabase_for_write()
         if subject_code not in self.subjects:
             raise KeyError(subject_code)
@@ -1236,16 +1241,16 @@ class HybridTestRepository:
             self.local_custom_tests.setdefault(subject_code, {})[test_id] = row
             self._persist_local_store()
             return row
-        def _remote_create():
-            row = self.remote.create_test(subject_code, payload, lecturer)
+        async def _remote_create():
+            row = await self.remote.create_test(subject_code, payload, lecturer)
             row.setdefault("question_count", len(payload.questions))
             row.setdefault("questions", [q.model_dump() for q in payload.questions])
             row.setdefault("owner_name", lecturer.get("name") or lecturer.get("email") or "Lecturer")
             row.setdefault("created_by", lecturer["id"])
             return row
-        return self._call_remote(_remote_create, _local_create)
+        return await self._call_remote(_remote_create() if self.remote else None, _local_create)
 
-    def update_test(self, subject_code: str, test_id: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
+    async def update_test(self, subject_code: str, test_id: str, payload: TestPayload, lecturer: dict[str, Any]) -> dict[str, Any]:
         self._ensure_supabase_for_write()
         if test_id in self.builtin_tests.get(subject_code, {}):
             raise PermissionError("Built-in tests cannot be edited.")
@@ -1265,16 +1270,16 @@ class HybridTestRepository:
             })
             self._persist_local_store()
             return row
-        def _remote_update():
-            row = self.remote.update_test(subject_code, test_id, payload, lecturer)
+        async def _remote_update():
+            row = await self.remote.update_test(subject_code, test_id, payload, lecturer)
             row.setdefault("question_count", len(payload.questions))
             row.setdefault("questions", [q.model_dump() for q in payload.questions])
             row.setdefault("owner_name", lecturer.get("name") or lecturer.get("email") or "Lecturer")
             row.setdefault("created_by", lecturer["id"])
             return row
-        return self._call_remote(_remote_update, _local_update)
+        return await self._call_remote(_remote_update() if self.remote else None, _local_update)
 
-    def delete_test(self, subject_code: str, test_id: str, lecturer: dict[str, Any]) -> dict[str, Any]:
+    async def delete_test(self, subject_code: str, test_id: str, lecturer: dict[str, Any]) -> dict[str, Any]:
         self._ensure_supabase_for_write()
         if test_id in self.builtin_tests.get(subject_code, {}):
             raise PermissionError("Built-in tests cannot be deleted.")
@@ -1289,24 +1294,24 @@ class HybridTestRepository:
             self._persist_local_store()
             return row
 
-        def _remote_delete():
-            existing = self.remote.get_test(subject_code, test_id, lecturer.get("id"))
+        async def _remote_delete():
+            existing = await self.remote.get_test(subject_code, test_id, lecturer.get("id"))
             if not existing:
                 raise KeyError("Test not found")
             if existing.get("created_by") != lecturer["id"]:
                 raise PermissionError("Only the lecturer who created this test can delete it.")
-            self.remote.delete_test(subject_code, test_id)
+            await self.remote.delete_test(subject_code, test_id)
             return existing
 
-        return self._call_remote(_remote_delete, _local_delete)
+        return await self._call_remote(_remote_delete() if self.remote else None, _local_delete)
 
-    def get_draft(self, subject_code: str, lecturer: dict[str, Any]) -> dict[str, Any] | None:
-        return self._call_remote(
-            lambda: self.remote.get_draft(subject_code, lecturer["id"]),
+    async def get_draft(self, subject_code: str, lecturer: dict[str, Any]) -> dict[str, Any] | None:
+        return await self._call_remote(
+            self.remote.get_draft(subject_code, lecturer["id"]) if self.remote else None,
             lambda: self.local_drafts.get((lecturer["id"], subject_code))
         )
 
-    def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> dict[str, Any]:
+    async def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> dict[str, Any]:
         self._ensure_supabase_for_write()
         def _local_save():
             row = {
@@ -1325,18 +1330,18 @@ class HybridTestRepository:
             self.local_drafts[(lecturer["id"], subject_code)] = row
             self._persist_local_store()
             return row
-        return self._call_remote(
-            lambda: self.remote.save_draft(subject_code, lecturer, payload),
+        return await self._call_remote(
+            self.remote.save_draft(subject_code, lecturer, payload) if self.remote else None,
             _local_save
         )
 
-    def clear_draft(self, subject_code: str, lecturer: dict[str, Any]) -> None:
+    async def clear_draft(self, subject_code: str, lecturer: dict[str, Any]) -> None:
         self._ensure_supabase_for_write()
         def _local_clear():
             self.local_drafts.pop((lecturer["id"], subject_code), None)
             self._persist_local_store()
-        return self._call_remote(
-            lambda: self.remote.clear_draft(subject_code, lecturer["id"]),
+        return await self._call_remote(
+            self.remote.clear_draft(subject_code, lecturer["id"]) if self.remote else None,
             _local_clear
         )
 
@@ -1426,12 +1431,17 @@ def register_subject_in_catalog(code: str, name: str) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        subjects = repo.list_subjects()
+        subjects = await repo.list_subjects()
         for row in subjects:
             register_subject_in_catalog(row.get("code"), row.get("name"))
     except Exception as exc:
         print(f"Failed to load subjects from Supabase: {exc}")
     yield
+    if repo.remote is not None:
+        try:
+            await repo.remote.aclose()
+        except Exception:
+            pass
 
 app = FastAPI(lifespan=lifespan)
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").strip()
@@ -1483,25 +1493,25 @@ def clear_session_cookie(response: JSONResponse) -> None:
     response.delete_cookie(SESSION_COOKIE_NAME, path="/")
 
 
-def current_lecturer_from_request(request: Request) -> dict[str, Any] | None:
+async def current_lecturer_from_request(request: Request) -> dict[str, Any] | None:
     lecturer_id = parse_session_token(request.cookies.get(SESSION_COOKIE_NAME))
     if not lecturer_id:
         return None
-    return repo.get_lecturer_by_id(lecturer_id)
+    return await repo.get_lecturer_by_id(lecturer_id)
 
 
-def require_lecturer(request: Request) -> dict[str, Any]:
-    lecturer = current_lecturer_from_request(request)
+async def require_lecturer(request: Request) -> dict[str, Any]:
+    lecturer = await current_lecturer_from_request(request)
     if not lecturer:
         raise HTTPException(status_code=401, detail="Lecturer sign-in required")
     return lecturer
 
 
-def current_lecturer_from_websocket(websocket: WebSocket) -> dict[str, Any] | None:
+async def current_lecturer_from_websocket(websocket: WebSocket) -> dict[str, Any] | None:
     lecturer_id = parse_session_token(websocket.cookies.get(SESSION_COOKIE_NAME))
     if not lecturer_id:
         return None
-    return repo.get_lecturer_by_id(lecturer_id)
+    return await repo.get_lecturer_by_id(lecturer_id)
 
 
 @app.get("/api/health")
@@ -1515,17 +1525,17 @@ def storage_status():
 
 
 @app.get("/api/lecturer/session")
-def lecturer_session(request: Request):
-    lecturer = current_lecturer_from_request(request)
+async def lecturer_session(request: Request):
+    lecturer = await current_lecturer_from_request(request)
     return {"authenticated": bool(lecturer), "lecturer": public_lecturer_view(lecturer) if lecturer else None}
 
 
 @app.post("/api/lecturer/signup")
 @limiter.limit("5/minute")
-def lecturer_signup(payload: dict[str, Any], request: Request):
+async def lecturer_signup(payload: dict[str, Any], request: Request):
     try:
         validated = LecturerSignupPayload.model_validate(payload)
-        lecturer = repo.create_lecturer(validated)
+        lecturer = await repo.create_lecturer(validated)
         response = JSONResponse({"ok": True, "lecturer": public_lecturer_view(lecturer)})
         set_session_cookie(response, lecturer["id"], request)
         return response
@@ -1541,10 +1551,10 @@ def lecturer_signup(payload: dict[str, Any], request: Request):
 
 @app.post("/api/lecturer/login")
 @limiter.limit("10/minute")
-def lecturer_login(payload: dict[str, Any], request: Request):
+async def lecturer_login(payload: dict[str, Any], request: Request):
     try:
         validated = LecturerLoginPayload.model_validate(payload)
-        lecturer = repo.get_lecturer_by_email(validated.email)
+        lecturer = await repo.get_lecturer_by_email(validated.email)
         if not lecturer:
             if repo.supabase_unavailable():
                 raise HTTPException(status_code=503, detail="Supabase is unavailable. Please try again once it is restored.")
@@ -1570,10 +1580,10 @@ def lecturer_logout():
 
 
 @app.get("/api/subjects")
-def get_subjects():
+async def get_subjects():
     result = []
     for code, info in SUBJECTS.items():
-        tests = repo.list_tests(code)
+        tests = await repo.list_tests(code)
         builtin_questions = len(info.get("questions", []))
         total_questions = sum(t.get("questionCount", 0) for t in tests) or builtin_questions
         result.append({
@@ -1587,14 +1597,14 @@ def get_subjects():
 
 
 @app.post("/api/subjects")
-def create_subject(payload: dict[str, Any], request: Request):
-    lecturer = require_lecturer(request)
+async def create_subject(payload: dict[str, Any], request: Request):
+    lecturer = await require_lecturer(request)
     try:
         validated = SubjectPayload.model_validate(payload)
         code = validated.code
         if code in SUBJECTS:
             raise HTTPException(status_code=409, detail="Subject code already exists.")
-        created = repo.create_subject(code, validated.name, lecturer)
+        created = await repo.create_subject(code, validated.name, lecturer)
         register_subject_in_catalog(code, created.get("name") or validated.name)
         return {"ok": True, "subject": {"code": code, "name": created.get("name") or validated.name}}
     except HTTPException:
@@ -1610,15 +1620,15 @@ def create_subject(payload: dict[str, Any], request: Request):
 
 
 @app.delete("/api/subjects/{code}")
-def delete_subject(code: str, request: Request):
-    lecturer = require_lecturer(request)
+async def delete_subject(code: str, request: Request):
+    lecturer = await require_lecturer(request)
     normalized = (code or "").strip().upper()
     if normalized in BUILTIN_SUBJECT_CODES:
         raise HTTPException(status_code=403, detail="Built-in subjects cannot be deleted.")
     if normalized not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
     try:
-        repo.delete_subject(normalized, lecturer)
+        await repo.delete_subject(normalized, lecturer)
         SUBJECTS.pop(normalized, None)
         rooms.pop(normalized, None)
         return {"ok": True}
@@ -1635,23 +1645,23 @@ def delete_subject(code: str, request: Request):
 
 
 @app.get("/api/tests/{subject_code}")
-def get_tests(subject_code: str, request: Request):
+async def get_tests(subject_code: str, request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
-    lecturer = require_lecturer(request)
+    lecturer = await require_lecturer(request)
     try:
-        return repo.list_tests(subject_code, lecturer.get("id"))
+        return await repo.list_tests(subject_code, lecturer.get("id"))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/tests/{subject_code}/{test_id}")
-def get_test_detail(subject_code: str, test_id: str, request: Request):
+async def get_test_detail(subject_code: str, test_id: str, request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
-    lecturer = require_lecturer(request)
+    lecturer = await require_lecturer(request)
     try:
-        row = repo.get_test(subject_code, test_id, lecturer.get("id"))
+        row = await repo.get_test(subject_code, test_id, lecturer.get("id"))
         if not row:
             raise HTTPException(status_code=404, detail="Test not found")
         return {
@@ -1673,14 +1683,14 @@ def get_test_detail(subject_code: str, test_id: str, request: Request):
 
 
 @app.post("/api/tests/{subject_code}")
-def create_test(subject_code: str, payload: dict[str, Any], request: Request):
+async def create_test(subject_code: str, payload: dict[str, Any], request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
-    lecturer = require_lecturer(request)
+    lecturer = await require_lecturer(request)
     try:
         validated = TestPayload.model_validate(payload)
-        created = repo.create_test(subject_code, validated, lecturer)
-        repo.clear_draft(subject_code, lecturer)
+        created = await repo.create_test(subject_code, validated, lecturer)
+        await repo.clear_draft(subject_code, lecturer)
         return {"ok": True, "test": repo._summary(created, lecturer.get("id"))}
     except SupabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -1693,14 +1703,14 @@ def create_test(subject_code: str, payload: dict[str, Any], request: Request):
 
 
 @app.put("/api/tests/{subject_code}/{test_id}")
-def update_test(subject_code: str, test_id: str, payload: dict[str, Any], request: Request):
+async def update_test(subject_code: str, test_id: str, payload: dict[str, Any], request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
-    lecturer = require_lecturer(request)
+    lecturer = await require_lecturer(request)
     try:
         validated = TestPayload.model_validate(payload)
-        updated = repo.update_test(subject_code, test_id, validated, lecturer)
-        repo.clear_draft(subject_code, lecturer)
+        updated = await repo.update_test(subject_code, test_id, validated, lecturer)
+        await repo.clear_draft(subject_code, lecturer)
         return {"ok": True, "test": repo._summary(updated, lecturer.get("id"))}
     except SupabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -1715,12 +1725,12 @@ def update_test(subject_code: str, test_id: str, payload: dict[str, Any], reques
 
 
 @app.delete("/api/tests/{subject_code}/{test_id}")
-def delete_test(subject_code: str, test_id: str, request: Request):
+async def delete_test(subject_code: str, test_id: str, request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
-    lecturer = require_lecturer(request)
+    lecturer = await require_lecturer(request)
     try:
-        repo.delete_test(subject_code, test_id, lecturer)
+        await repo.delete_test(subject_code, test_id, lecturer)
         return {"ok": True}
     except SupabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -1733,25 +1743,25 @@ def delete_test(subject_code: str, test_id: str, request: Request):
 
 
 @app.get("/api/drafts/{subject_code}")
-def get_test_draft(subject_code: str, request: Request):
+async def get_test_draft(subject_code: str, request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
-    lecturer = require_lecturer(request)
+    lecturer = await require_lecturer(request)
     try:
-        draft = repo.get_draft(subject_code, lecturer)
+        draft = await repo.get_draft(subject_code, lecturer)
         return {"draft": draft}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/api/drafts/{subject_code}")
-def save_test_draft(subject_code: str, payload: dict[str, Any], request: Request):
+async def save_test_draft(subject_code: str, payload: dict[str, Any], request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
-    lecturer = require_lecturer(request)
+    lecturer = await require_lecturer(request)
     try:
         validated = DraftPayload.model_validate(payload)
-        draft = repo.save_draft(subject_code, lecturer, validated)
+        draft = await repo.save_draft(subject_code, lecturer, validated)
         return {"ok": True, "draft": draft}
     except SupabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -1762,12 +1772,12 @@ def save_test_draft(subject_code: str, payload: dict[str, Any], request: Request
 
 
 @app.delete("/api/drafts/{subject_code}")
-def clear_test_draft(subject_code: str, request: Request):
+async def clear_test_draft(subject_code: str, request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
-    lecturer = require_lecturer(request)
+    lecturer = await require_lecturer(request)
     try:
-        repo.clear_draft(subject_code, lecturer)
+        await repo.clear_draft(subject_code, lecturer)
         return {"ok": True}
     except SupabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -1776,10 +1786,10 @@ def clear_test_draft(subject_code: str, request: Request):
 
 
 @app.get("/api/export/tests")
-def export_tests(request: Request):
-    lecturer = require_lecturer(request)
+async def export_tests(request: Request):
+    lecturer = await require_lecturer(request)
     try:
-        tests = repo.list_tests_by_creator(lecturer["id"])
+        tests = await repo.list_tests_by_creator(lecturer["id"])
         stamp = datetime.utcnow().strftime("%Y%m%d")
         filename = f"quiz_backup_{stamp}.json"
         payload = json.dumps(tests, ensure_ascii=False, indent=2)
@@ -2120,7 +2130,7 @@ async def websocket_endpoint(websocket: WebSocket):
             action = msg.get("action")
 
             if action == "host_join":
-                lecturer = current_lecturer_from_websocket(websocket)
+                lecturer = await current_lecturer_from_websocket(websocket)
                 if not lecturer:
                     await websocket.send_text(json.dumps({"type": "auth_required", "message": "Lecturer sign-in required"}))
                     continue
@@ -2129,7 +2139,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if subject_code not in rooms:
                     await websocket.send_text(json.dumps({"type": "error", "message": "Invalid subject"}))
                     continue
-                test_data = repo.get_test(subject_code, test_id) if test_id else None
+                test_data = await repo.get_test(subject_code, test_id) if test_id else None
                 if not test_data:
                     await websocket.send_text(json.dumps({"type": "error", "message": "Test not found"}))
                     continue
