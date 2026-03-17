@@ -1157,7 +1157,7 @@ async function showCreateTestScreen(options = {}) {
   showScreen('screen-host-create-test');
   $('#create-test-title').textContent = editorMode === 'edit' ? 'Edit Test' : 'Create Test';
   $('#create-test-subject').textContent = `${selectedSubject.name} (${selectedSubject.code})`;
-  $('#btn-save-test').textContent = editorMode === 'edit' ? 'Update Test & Use It' : 'Save Test & Use It';
+  $('#btn-save-test').textContent = 'Save';
   showInlineStatus('#host-create-status', '', false);
   resetDraftStatus('Loading editor...', false);
 
@@ -1248,7 +1248,7 @@ async function showCreateTestScreen(options = {}) {
   saveClone.addEventListener('click', async () => {
     showInlineStatus('#host-create-status', '', false);
     saveClone.disabled = true;
-    saveClone.textContent = editorMode === 'edit' ? 'Updating...' : 'Saving...';
+    saveClone.textContent = 'Saving...';
     try {
       const payload = collectTestFormPayload();
       const resp = editingTestId
@@ -1259,11 +1259,11 @@ async function showCreateTestScreen(options = {}) {
       draftDirty = false;
       editingTestId = null;
       originalEditingTest = null;
-      startHostForTest(resp.test);
+      await showHostTestLibrary();
     } catch (e) {
       showInlineStatus('#host-create-status', e.message, true);
       saveClone.disabled = false;
-      saveClone.textContent = editorMode === 'edit' ? 'Update Test & Use It' : 'Save Test & Use It';
+      saveClone.textContent = 'Save';
     }
   });
 }
@@ -1335,6 +1335,7 @@ function addQuestionEditor(data = { q: '', options: ['', '', '', ''], correct: 0
       showInlineStatus('#host-create-status', 'A test needs at least one question.', true);
       return;
     }
+    if (!confirm('Are you sure you want to delete this question?')) return;
     card.remove();
     refreshQuestionEditorLabels();
     markDraftDirty();
