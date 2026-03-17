@@ -1255,11 +1255,14 @@ async function showCreateTestScreen(options = {}) {
         ? await apiPut(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(editingTestId)}`, payload)
         : await apiPost(`/api/tests/${encodeURIComponent(selectedSubject.code)}`, payload);
       selectedTest = resp.test;
+      editingTestId = resp.test.id;
+      editorMode = 'edit';
+      originalEditingTest = resp.test;
       currentDraftLoaded = null;
       draftDirty = false;
-      editingTestId = null;
-      originalEditingTest = null;
-      await showHostTestLibrary();
+      showInlineStatus('#host-create-status', 'Test saved.', false);
+      saveClone.disabled = false;
+      saveClone.textContent = 'Save';
     } catch (e) {
       showInlineStatus('#host-create-status', e.message, true);
       saveClone.disabled = false;
