@@ -37,223 +37,11 @@ from slowapi.util import get_remote_address
 # ──────────────────────────────────────────────────────────────────────────────
 # Subject catalogue and built-in legacy question sets
 # ──────────────────────────────────────────────────────────────────────────────
-SUBJECTS = {'1EM105B': {'code': '1EM105B',
-             'name': 'Mechanics',
-             'questions': [{'correct': 0,
-                            'explanation': 'These are the SI base units for length, mass, and time. The chapter summary identifies meter, kilogram, and second as the basic SI units used to build many other units.',
-                            'options': ['meter, kilogram, second',
-                                        'centimeter, gram, second',
-                                        'foot, slug, second',
-                                        'meter, gram, minute'],
-                            'q': 'Which set contains the SI base units for length, mass, and time?'},
-                           {'correct': 1,
-                            'explanation': 'A derived unit comes from combining base units. For example, speed uses meters and seconds, so it is not a base unit by itself.',
-                            'options': ['a unit used only in laboratories',
-                                        'a unit formed by combining base units',
-                                        'a unit with no dimensions',
-                                        'a unit used only in the British system'],
-                            'q': 'A derived unit is best described as'},
-                           {'correct': 1,
-                            'explanation': 'Writing units through each step lets you see whether the conversion is arranged properly. If the unwanted units cancel and the wanted units remain, the setup is correct.',
-                            'options': ['It changes the physical quantity into a new one',
-                                        'It helps units cancel algebraically and shows whether the setup is correct',
-                                        'It makes the answer more accurate automatically',
-                                        'It removes the need for formulas'],
-                            'q': 'Why is it useful to write units explicitly during a conversion?'},
-                           {'correct': 1,
-                            'explanation': 'Multiplying a vector by -1 flips its direction but does not change its size. That is exactly how negative vectors are handled in the chapter.',
-                            'options': ['Its magnitude doubles and its direction stays the same',
-                                        'Its magnitude stays the same and its direction reverses',
-                                        'Its magnitude becomes zero',
-                                        'Its x-component changes, but not its y-component'],
-                            'q': 'When a vector is multiplied by (-1), what happens?'},
-                           {'correct': 1,
-                            'explanation': 'That is the rule for the tail-to-head method of vector addition.',
-                            'options': ['head of the first vector to the tail of the last vector',
-                                        'tail of the first vector to the head of the last vector',
-                                        'midpoint of the first vector to the midpoint of the last vector',
-                                        'longest vector to the shortest vector'],
-                            'q': 'In the tail-to-head method, the resultant vector is drawn from the'},
-                           {'correct': 2,
-                            'explanation': 'If vectors form a closed polygon, you end where you started. That means the overall or resultant vector is zero.',
-                            'options': ['equal to the longest vector',
-                                        'one unit vector',
-                                        'zero',
-                                        'twice the shortest vector'],
-                            'q': 'If several vectors form a closed polygon when placed head to tail, the resultant is'},
-                           {'correct': 3,
-                            'explanation': 'Two vectors are equal only if they have the same size and point in the same direction. Having just one of those is not enough.',
-                            'options': ['units and components only',
-                                        'direction only',
-                                        'magnitude only',
-                                        'magnitude and direction'],
-                            'q': 'Two vectors are equal only when they have the same'},
-                           {'correct': 1,
-                            'explanation': 'A vector straight down along the -y axis has no horizontal part, so Ax = 0, and its vertical part is negative.',
-                            'options': ['a positive x-component and zero y-component',
-                                        'zero x-component and a negative y-component',
-                                        'a negative x-component and zero y-component',
-                                        'zero x-component and a positive y-component'],
-                            'q': 'A vector pointing straight in the (-y) direction has'},
-                           {'correct': 0,
-                            'explanation': 'If both Ax and Ay double, the vector gets twice as large, but the ratio Ay/Ax stays the same, so the angle does not change.',
-                            'options': ['magnitude doubles and its direction stays the same',
-                                        'magnitude stays the same and its direction changes',
-                                        'magnitude doubles and its direction reverses',
-                                        'magnitude becomes four times larger'],
-                            'q': "If both (Ax) and (Ay) become twice as large, the vector's"},
-                           {'correct': 3,
-                            'explanation': 'Once Rx and Ry are known, they form a right triangle with the resultant R. The magnitude is therefore found using the Pythagorean theorem.',
-                            'options': ['law of sines',
-                                        'inverse tangent function',
-                                        'unit conversion method',
-                                        'Pythagorean theorem'],
-                            'q': 'After finding (Rx) and (Ry), the magnitude of the resultant vector is found using the'}]},
- 'DYN317B': {'code': 'DYN317B', 'name': 'Dynamics', 'questions': []},
- 'MEC105B': {'code': 'MEC105B',
-             'name': 'Mechanics',
-             'questions': [{'correct': 1,
-                            'explanation': 'Statics deals with the equilibrium of bodies at rest '
-                                           'or moving with constant velocity (zero acceleration).',
-                            'options': ['Dynamics', 'Statics', 'Kinematics', 'Thermodynamics'],
-                            'q': 'What is the study of bodies at rest or moving with constant '
-                                 'velocity called?'},
-                           {'correct': 2,
-                            'explanation': "Newton's Third Law: forces always occur in equal, "
-                                           'opposite, and collinear pairs between interacting '
-                                           'bodies.',
-                            'options': ['B exerts an equal force in the same direction',
-                                        'B exerts half the force in the opposite direction',
-                                        'B exerts an equal and opposite force on A',
-                                        'No reaction force exists'],
-                            'q': "According to Newton's Third Law, if body A exerts a force on "
-                                 'body B, what is true about the reaction?'},
-                           {'correct': 1,
-                            'explanation': 'A force is fully described by its magnitude, its '
-                                           'direction (line of action and sense), and its point of '
-                                           'application.',
-                            'options': ['Mass, length, and time',
-                                        'Magnitude, direction, and point of application',
-                                        'Speed, acceleration, and position',
-                                        'Weight, volume, and density'],
-                            'q': 'A force vector is characterised by which three properties?'},
-                           {'correct': 2,
-                            'explanation': 'Transmissibility allows a force to slide along its '
-                                           'line of action on a rigid body without altering the '
-                                           'external effects.',
-                            'options': ['A force can be replaced by a couple',
-                                        'A force can be moved to any point on the body',
-                                        'A force may be applied anywhere along its line of action '
-                                        'without changing the external effects on a rigid body',
-                                        'Forces always cancel in pairs'],
-                            'q': 'What does the Principle of Transmissibility state?'},
-                           {'correct': 1,
-                            'explanation': 'The parallelogram law constructs the resultant as the '
-                                           'diagonal of a parallelogram formed by the two force '
-                                           'vectors.',
-                            'options': ['One of the sides of the parallelogram',
-                                        'The diagonal of the parallelogram',
-                                        'The perimeter of the parallelogram',
-                                        'The area of the parallelogram'],
-                            'q': 'When adding two concurrent forces using the parallelogram law, '
-                                 'the resultant is represented by:'},
-                           {'correct': 1,
-                            'explanation': 'A moment measures the tendency of a force to cause '
-                                           'rotation about a specified point or axis (M = F × d).',
-                            'options': ['The force multiplied by the mass',
-                                        'The tendency of the force to cause rotation about that '
-                                        'point',
-                                        'The component of the force along the line to the point',
-                                        'The acceleration produced at that point'],
-                            'q': 'What is the moment of a force about a point?'},
-                           {'correct': 2,
-                            'explanation': 'A couple consists of two equal, opposite, '
-                                           'non-collinear forces. They cannot be combined into a '
-                                           'single force — their only effect is a pure rotational '
-                                           'tendency.',
-                            'options': ['Equal, parallel, and in the same direction',
-                                        'Unequal and perpendicular',
-                                        'Equal, opposite, and non-collinear (parallel)',
-                                        'Equal, opposite, and collinear'],
-                            'q': 'A couple is defined as two forces that are:'},
-                           {'correct': 2,
-                            'explanation': 'The moment of a couple (M = Fd) is the same about all '
-                                           'points — it is a free vector that can be moved '
-                                           'anywhere without changing its effect.',
-                            'options': ['It depends on the point about which you take the moment',
-                                        'It is always zero',
-                                        'It is the same about every point — it is a free vector',
-                                        'It only acts in the horizontal plane'],
-                            'q': 'What is unique about the moment produced by a couple?'},
-                           {'correct': 2,
-                            'explanation': 'The textbook emphasises: "The free-body diagram is the '
-                                           'most important single step in the solution of problems '
-                                           'in mechanics."',
-                            'options': ['Choosing the coordinate system',
-                                        'Calculating the resultant force',
-                                        'Drawing a correct and complete free-body diagram',
-                                        'Summing moments about the origin'],
-                            'q': 'What is the single most important step in solving statics '
-                                 'problems?'},
-                           {'correct': 2,
-                            'explanation': 'When isolating a body, every removed contact or '
-                                           'support must be replaced by the reactive forces it '
-                                           'would have exerted on the body.',
-                            'options': ['Nothing — the contact is simply removed',
-                                        'A displacement vector',
-                                        'The appropriate reaction force(s)',
-                                        'A fixed boundary condition'],
-                            'q': 'On a free-body diagram, what replaces a surface of contact that '
-                                 'has been removed during isolation?'},
-                           {'correct': 2,
-                            'explanation': 'For 2D equilibrium: ΣFx = 0, ΣFy = 0, and ΣMO = 0 — '
-                                           'three independent equations.',
-                            'options': ['1', '2', '3', '6'],
-                            'q': 'How many independent scalar equilibrium equations are available '
-                                 'for a general coplanar (2D) force system?'},
-                           {'correct': 1,
-                            'explanation': 'A roller (or rocker or ball) support can only exert a '
-                                           'compressive force normal to the supporting surface — '
-                                           'it cannot resist tangential forces.',
-                            'options': ['A force in any direction plus a couple',
-                                        'A force only normal (perpendicular) to the supporting '
-                                        'surface',
-                                        'A horizontal and vertical force',
-                                        'A couple only'],
-                            'q': 'A roller support on a flat surface provides what type of '
-                                 'reaction?'},
-                           {'correct': 0,
-                            'explanation': 'A pin free to rotate supports a force in any direction '
-                                           '(resolved into Rx and Ry) but cannot resist rotation, '
-                                           'so no couple.',
-                            'options': ['A force in any direction in the plane (2 components) but '
-                                        'no couple',
-                                        'Only a vertical force',
-                                        'A force and a couple (moment)',
-                                        'Only a horizontal force'],
-                            'q': 'A pin connection that is free to turn can support which of the '
-                                 'following?'},
-                           {'correct': 2,
-                            'explanation': 'When unknowns exceed the number of independent '
-                                           'equilibrium equations, the body is statically '
-                                           'indeterminate — additional equations from deformation '
-                                           'are needed.',
-                            'options': ['Statically determinate',
-                                        'In unstable equilibrium',
-                                        'Statically indeterminate',
-                                        'A two-force member'],
-                            'q': 'If a body has more unknown support reactions than available '
-                                 'independent equilibrium equations, it is called:'},
-                           {'correct': 1,
-                            'explanation': 'A two-force member in equilibrium requires the forces '
-                                           'to be equal, opposite, and collinear — regardless of '
-                                           "the member's shape.",
-                            'options': ['Perpendicular to each other',
-                                        'Equal in magnitude, opposite in direction, and collinear',
-                                        'Unequal but parallel',
-                                        'Applied at the same point'],
-                           'q': 'For a two-force member in equilibrium, the two forces must '
-                                 'be:'}]}}
+SUBJECTS = {
+    '1EM105B': {'code': '1EM105B', 'name': 'Mechanics', 'questions': []},
+    'DYN317B': {'code': 'DYN317B', 'name': 'Dynamics', 'questions': []},
+    'MEC105B': {'code': 'MEC105B', 'name': 'Mechanics', 'questions': []},
+}
 
 BUILTIN_SUBJECT_CODES = set(SUBJECTS.keys())
 SUBJECT_CODE_PATTERN = re.compile(r"^[A-Z0-9]{3,10}$")
@@ -927,26 +715,9 @@ class HybridTestRepository:
             return fallback()
 
     def _seed_builtin_tests(self) -> None:
-        for code, info in self.subjects.items():
-            questions = info.get("questions", []) or []
+        for code in self.subjects:
             self.builtin_tests[code] = {}
             self.local_custom_tests[code] = {}
-            if questions:
-                test_id = f"builtin:{code}:default"
-                self.builtin_tests[code][test_id] = {
-                    "id": test_id,
-                    "subject_code": code,
-                    "title": f"{info['name']} Core Quiz",
-                    "chapter": "Built-in starter quiz",
-                    "description": "Legacy built-in quiz packaged with the app.",
-                    "question_count": len(questions),
-                    "questions": questions,
-                    "created_at": None,
-                    "updated_at": None,
-                    "source": "built-in",
-                    "created_by": None,
-                    "owner_name": "System",
-                }
 
     def get_storage_status(self) -> dict[str, Any]:
         if self.remote is None:
@@ -1191,9 +962,6 @@ class HybridTestRepository:
             raise KeyError(subject_code)
 
         tests: list[dict[str, Any]] = []
-        builtin_rows = list(self.builtin_tests.get(subject_code, {}).values())
-        tests.extend(self._summary(row, lecturer_id) for row in builtin_rows)
-
         remote_rows = await self._call_remote(
             self.remote.list_tests(subject_code, lecturer_id) if self.remote else None,
             lambda: []
