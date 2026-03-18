@@ -174,7 +174,9 @@ function handleMessage(msg) {
 }
 
 function showInlineStatus(selector, text, isError = false) {
-  const el = $(selector);
+  const el = selector.startsWith('#') || selector.startsWith('.') || selector.startsWith('[')
+    ? $(selector)
+    : document.getElementById(selector);
   if (!el) return;
   el.textContent = text || '';
   el.hidden = !text;
@@ -1162,11 +1164,19 @@ async function showCreateTestScreen(options = {}) {
   resetDraftStatus('Loading editor...', false);
 
   let draft = null;
-  try {
-    const draftResp = await apiGet(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`);
-    draft = draftResp.draft;
-  } catch (e) {
-    draft = null;
+  if (editorMode === 'create') {
+    try {
+      await apiDelete(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`);
+    } catch (e) {
+      // Ignore draft deletion errors and still start with a blank editor.
+    }
+  } else {
+    try {
+      const draftResp = await apiGet(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`);
+      draft = draftResp.draft;
+    } catch (e) {
+      draft = null;
+    }
   }
 
   try {
@@ -1188,19 +1198,8 @@ async function showCreateTestScreen(options = {}) {
     } else {
       editingTestId = null;
       originalEditingTest = null;
-      if (draft && !getDraftEditingId(draft)) {
-        currentDraftLoaded = draft;
-        applyEditorData({
-          title: draft.title || '',
-          chapter: draft.chapter || '',
-          description: draft.description || '',
-          questions: draft.questions || []
-        });
-        resetDraftStatus(`Recovered your draft from ${formatDateTime(draft.updated_at)}.`, false);
-      } else {
-        applyEditorData({ title: '', chapter: '', description: '', questions: [] });
-        resetDraftStatus('Start building your test. Drafts save automatically.', false);
-      }
+      applyEditorData({ title: '', chapter: '', description: '', questions: [] });
+      resetDraftStatus('Start building your test. Drafts save automatically.', false);
     }
   } catch (e) {
     showInlineStatus('#host-create-status', e.message, true);
@@ -1335,10 +1334,10 @@ function addQuestionEditor(data = { q: '', options: ['', '', '', ''], correct: 0
   card.querySelector('.question-remove-btn').addEventListener('click', () => {
     const total = container.querySelectorAll('.question-editor-card').length;
     if (total <= 1) {
-      showInlineStatus('#host-create-status', 'A test needs at least one question.', true);
+      showInlineStatus('host-create-status', 'A test needs at least one question.', true);
       return;
     }
-    if (!confirm('Are you sure you want to delete this question?')) return;
+    if (!confirm('Are you sure you want to remove this question?')) return;
     card.remove();
     refreshQuestionEditorLabels();
     markDraftDirty();
