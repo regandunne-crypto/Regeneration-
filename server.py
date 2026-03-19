@@ -1149,6 +1149,7 @@ class GameRoom:
         self.host_visitor = None
         self.answers_this_round = {}
         self.question_timer_task = None
+        self.paused = False
 
     def archive_stats(self) -> None:
         if not self.players:
@@ -1832,6 +1833,7 @@ async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
     room.current_q = 0
     room.question_start_time = 0
     room.answers_this_round = {}
+    room.paused = False
 
     if keep_players:
         for player in room.players.values():
@@ -1939,6 +1941,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 if room.total_q == 0:
                     await websocket.send_text(json.dumps({"type": "error", "message": "No questions loaded for this test."}))
                     continue
+                room.paused = False
+                import random
+                if msg.get("shuffle"):
+                    random.shuffle(room.questions)
                 room.phase = "get_ready"
                 room.current_q = 0
                 for vid in room.players:
@@ -1953,6 +1959,16 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == "next_question":
                 if role == "host" and room is not None:
                     await advance_to_next(room)
+
+            elif action == "host_pause":
+                if role != "host" or room is None:
+                    continue
+                room.paused = not room.paused
+                await send_to_host(room, {"type": "pause_state", "paused": room.paused})
+                await broadcast_to_players(room, {
+                    "type": "pause_state",
+                    "paused": room.paused
+                })
 
             elif action == "reset_game":
                 if role == "host" and room is not None:
@@ -2021,13 +2037,31 @@ async def websocket_endpoint(websocket: WebSocket):
                         "answers": [],
                         "ws": websocket
                     }
-                await websocket.send_text(json.dumps({
+                joined_payload = {
                     "type": "joined",
                     "phase": room.phase,
                     "playerId": visitor_id,
                     "playerCount": len(room.players),
                     "activeTest": get_active_test_meta(room)
-                }))
+                }
+
+                if room.phase == "question":
+                    q = room.questions[room.current_q]
+                    elapsed = time.time() - room.question_start_time
+                    remaining = max(0, TIME_PER_Q - elapsed)
+                    joined_payload["currentQuestion"] = {
+                        "question": q["q"],
+                        "options": q["options"],
+                        "qNum": room.current_q + 1,
+                        "totalQ": room.total_q,
+                        "timeLimit": TIME_PER_Q,
+                        "remaining": round(remaining, 2)
+                    }
+                    joined_payload["alreadyAnswered"] = visitor_id in room.answers_this_round
+                elif room.phase in ("reveal", "get_ready"):
+                    joined_payload["phase"] = room.phase
+
+                await websocket.send_text(json.dumps(joined_payload))
                 await push_room_update(room)
 
             elif action == "player_leave":
@@ -2072,6 +2106,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     "correct": is_correct,
                     "points": points,
                     "totalScore": room.players[visitor_id]["score"],
+                    "streak": room.players[visitor_id]["streak"],
                     "correctAnswer": q["correct"],
                     "explanation": q["explanation"]
                 }))
@@ -2120,7 +2155,8 @@ async def send_question(room: GameRoom) -> None:
     q = room.questions[room.current_q]
     q_index = room.current_q
     room.phase = "question"
-    room.question_start_time = time.time()
+    server_ts = time.time()
+    room.question_start_time = server_ts
     room.answers_this_round = {}
     await broadcast_to_players(room, {
         "type": "question",
@@ -2128,7 +2164,8 @@ async def send_question(room: GameRoom) -> None:
         "totalQ": room.total_q,
         "question": q["q"],
         "options": q["options"],
-        "timeLimit": TIME_PER_Q
+        "timeLimit": TIME_PER_Q,
+        "serverTimestamp": server_ts
     })
     await send_to_host(room, {
         "type": "question",
@@ -2137,7 +2174,8 @@ async def send_question(room: GameRoom) -> None:
         "question": q["q"],
         "options": q["options"],
         "correctAnswer": q["correct"],
-        "timeLimit": TIME_PER_Q
+        "timeLimit": TIME_PER_Q,
+        "serverTimestamp": server_ts
     })
 
     async def _timer():
@@ -2186,7 +2224,13 @@ async def auto_reveal(room: GameRoom) -> None:
         "leaderboard": lb,
         "isLast": room.current_q >= room.total_q - 1
     })
-    await asyncio.sleep(5)
+    waited = 0
+    while waited < 5 or room.paused:
+        await asyncio.sleep(0.5)
+        if not room.paused:
+            waited += 0.5
+        else:
+            waited = 0
     if room.phase == "reveal":
         await advance_to_next(room)
 

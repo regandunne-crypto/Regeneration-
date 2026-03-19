@@ -71,6 +71,7 @@
       <h2 class="lobby-player-name" id="lobby-player-name"></h2>
       <p class="lobby-player-msg">You're in. Waiting for the lecturer to start the game...</p>
       <p class="lobby-player-count"><span id="lobby-p-count">0</span> players connected</p>
+      <p class="waiting-pulse">Waiting for lecturer to start…</p>
       <p class="lobby-subject-badge" id="lobby-subject-badge"></p>
       <button id="btn-leave-lobby" class="back-link lobby-leave-link">&larr; Leave lobby / change subject</button>
     </div>
@@ -87,7 +88,7 @@
 
   <!-- PLAYER: Question -->
   <div id="screen-question" class="screen">
-    <div class="question-header">
+    <div class="timer-container">
       <div class="q-progress">
         <span id="q-number">1</span> / <span id="q-total">15</span>
       </div>
@@ -96,6 +97,7 @@
       </div>
       <div class="timer-text" id="timer-text">30</div>
     </div>
+    <p id="player-pause-msg" hidden style="text-align:center;color:#ff9800;font-weight:700;"></p>
     <div class="question-body">
       <h2 class="question-text" id="question-text"></h2>
     </div>
@@ -112,6 +114,7 @@
         <span class="score-label">Your Score</span>
         <span class="score-value" id="result-score-value">0</span>
       </div>
+      <p id="streak-bonus-msg" hidden class="streak-bonus"></p>
     </div>
   </div>
 
@@ -313,6 +316,9 @@
         </div>
       </div>
       <div class="host-lobby-actions">
+        <label class="shuffle-toggle">
+          <input type="checkbox" id="chk-shuffle-questions"> Shuffle question order
+        </label>
         <button id="btn-start-game" class="btn btn-primary btn-large" disabled>Start Game</button>
         <button id="btn-download-stats" class="btn btn-secondary btn-stats" hidden>Download Previous Stats</button>
         <button id="btn-change-test" class="btn btn-secondary">Change Test</button>
@@ -336,6 +342,7 @@
         <span id="host-answered-count">0</span> / <span id="host-total-players">0</span> answered
       </div>
       <div class="host-live-controls" id="host-live-controls">
+        <button id="btn-pause-game" class="btn btn-secondary" onclick="send({action:'host_pause'})">⏸ Pause</button>
         <button id="btn-end-game" class="btn btn-secondary">End Game</button>
         <button id="btn-cancel-game" class="btn btn-danger">Cancel to Lobby</button>
       </div>
@@ -357,6 +364,7 @@
         </div>
       </div>
       <div class="host-reveal-controls" id="host-reveal-controls">
+        <button id="btn-pause-game" class="btn btn-secondary" onclick="send({action:'host_pause'})">⏸ Pause</button>
         <button id="btn-end-game-reveal" class="btn btn-secondary">End Game</button>
         <button id="btn-cancel-game-reveal" class="btn btn-danger">Cancel to Lobby</button>
       </div>

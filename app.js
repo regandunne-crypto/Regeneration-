@@ -51,6 +51,7 @@ let myStudentNumber = '';
 let timerInterval = null;
 let hostTimerInterval = null;
 let timeLeft = TIME_PER_Q;
+let wakeLock = null;
 let selectedSubject = null;
 let selectedTest = null;
 let storageInfo = null;
@@ -428,14 +429,28 @@ function handlePlayerMessage(msg) {
     }
     case 'joined': {
       myPlayerId = msg.playerId;
+      history.pushState({ quizActive: true }, '', location.href);
       $('#lobby-player-name').textContent = myPlayerName;
       $('#lobby-p-count').textContent = msg.playerCount;
       $('#lobby-subject-badge').textContent = formatActiveTestLabel(selectedSubject, msg.activeTest);
       const leaveBtn = $('#btn-leave-lobby');
       if (leaveBtn) leaveBtn.onclick = leaveLobby;
-      if (msg.phase === 'lobby') showScreen('screen-lobby-player');
       $('#btn-join').disabled = false;
       $('#btn-join').textContent = 'Join Game';
+
+      if (!msg.phase || msg.phase === 'lobby') {
+        showScreen('screen-lobby-player');
+      } else if (msg.phase === 'question' && msg.currentQuestion) {
+        if (msg.alreadyAnswered) {
+          showScreen('screen-lobby-player'); // safe fallback — wait for reveal
+        } else {
+          const q = msg.currentQuestion;
+          timeLeft = q.remaining || TIME_PER_Q;
+          playerShowQuestion(q);
+        }
+      } else if (msg.phase === 'reveal' || msg.phase === 'get_ready') {
+        showScreen('screen-lobby-player');
+      }
       break;
     }
     case 'player_update':
@@ -452,6 +467,16 @@ function handlePlayerMessage(msg) {
       break;
     case 'answer_result':
       playerShowResult(msg);
+      break;
+    case 'pause_state':
+      if (msg.paused) {
+        // freeze the player timer
+        clearTimer();
+        showInlineStatus('#player-pause-msg', '⏸ Paused by lecturer…');
+      } else {
+        $('#player-pause-msg') && ($('#player-pause-msg').hidden = true);
+        startPlayerTimer();
+      }
       break;
     case 'leaderboard':
       playerShowLeaderboard(msg.leaderboard);
@@ -503,8 +528,13 @@ function playerShowQuestion(msg) {
     grid.appendChild(btn);
   });
 
-  timeLeft = msg.timeLimit || TIME_PER_Q;
+  const elapsed = msg.serverTimestamp ? (Date.now() / 1000 - msg.serverTimestamp) : 0;
+  timeLeft = Math.max(0, (msg.timeLimit || TIME_PER_Q) - elapsed);
+  if (typeof msg.remaining === 'number') {
+    timeLeft = Math.max(0, msg.remaining);
+  }
   startPlayerTimer();
+  requestWakeLock();
 }
 
 function playerAnswer(choice, btnEl) {
@@ -551,6 +581,24 @@ function clearTimer() {
   }
 }
 
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    }
+  } catch (e) {}
+}
+
+async function releaseWakeLock() {
+  try {
+    if (wakeLock) {
+      await wakeLock.release();
+      wakeLock = null;
+    }
+  } catch (e) {}
+}
+
 function playerShowResult(msg) {
   showScreen('screen-result');
   const icon = $('#result-icon');
@@ -574,6 +622,16 @@ function playerShowResult(msg) {
 
   detail.textContent = msg.explanation;
   scoreVal.textContent = msg.totalScore.toLocaleString();
+
+  const streakEl = $('#streak-bonus-msg');
+  if (streakEl) {
+    if (msg.streak >= 3) {
+      streakEl.textContent = `🔥 ${msg.streak} streak! +20% bonus`;
+      streakEl.hidden = false;
+    } else {
+      streakEl.hidden = true;
+    }
+  }
 }
 
 function playerShowLeaderboard(lb) {
@@ -587,6 +645,7 @@ function playerShowFinal(lb) {
   $('#final-title').textContent = myRank === 1 ? 'You Win! 🏆' : `Game Over — You placed #${myRank}`;
   renderPodium($('#final-podium'), lb);
   renderFullList($('#final-full-list'), lb.slice(3), myPlayerId, 4);
+  releaseWakeLock();
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1408,7 +1467,10 @@ function startHostForTest(testSummary) {
   const newStart = startBtn.cloneNode(true);
   startBtn.replaceWith(newStart);
   newStart.addEventListener('click', () => {
-    send({ action: 'start_game' });
+    send({
+      action: 'start_game',
+      shuffle: $('#chk-shuffle-questions') ? $('#chk-shuffle-questions').checked : false
+    });
     newStart.disabled = true;
     newStart.textContent = 'Starting...';
   });
@@ -1560,6 +1622,12 @@ function handleHostMessage(msg) {
       $('#host-answered-count').textContent = msg.answered;
       $('#host-total-players').textContent = msg.total;
       break;
+    case 'pause_state': {
+      document.querySelectorAll('#btn-pause-game').forEach((pauseBtn) => {
+        pauseBtn.textContent = msg.paused ? '▶ Resume' : '⏸ Pause';
+      });
+      break;
+    }
     case 'reveal':
       hostShowReveal(msg);
       break;
@@ -1753,6 +1821,11 @@ function escapeHtml(text) {
 
 window.addEventListener('DOMContentLoaded', async () => {
   bindHostAuthUI();
+  window.addEventListener('popstate', (e) => {
+    if (myPlayerId) {
+      history.pushState({ quizActive: true }, '', location.href);
+    }
+  });
   if (location.hash === '#host') {
     await enterHostArea();
   } else {
