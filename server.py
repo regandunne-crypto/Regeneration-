@@ -1074,10 +1074,14 @@ class HybridTestRepository:
         return await self._call_remote(_remote_delete() if self.remote else None, _local_delete)
 
     async def get_draft(self, subject_code: str, lecturer: dict[str, Any]) -> dict[str, Any] | None:
-        return await self._call_remote(
-            self.remote.get_draft(subject_code, lecturer["id"]) if self.remote else None,
-            lambda: self.local_drafts.get((lecturer["id"], subject_code))
-        )
+        # Do NOT use _call_remote here — a failure on the quiz_test_drafts table must
+        # never disable self.remote (which would break all subsequent test reads/writes).
+        if self.remote is not None:
+            try:
+                return await self.remote.get_draft(subject_code, lecturer["id"])
+            except Exception:
+                pass  # Fall back to local silently
+        return self.local_drafts.get((lecturer["id"], subject_code))
 
     async def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> dict[str, Any]:
         self._ensure_supabase_for_write()
@@ -1098,20 +1102,26 @@ class HybridTestRepository:
             self.local_drafts[(lecturer["id"], subject_code)] = row
             self._persist_local_store()
             return row
-        return await self._call_remote(
-            self.remote.save_draft(subject_code, lecturer, payload) if self.remote else None,
-            _local_save
-        )
+        # Do NOT use _call_remote here — a failure on the quiz_test_drafts table must
+        # never disable self.remote (which would break all subsequent test reads/writes).
+        if self.remote is not None:
+            try:
+                return await self.remote.save_draft(subject_code, lecturer, payload)
+            except Exception:
+                pass  # Fall back to local silently; draft failure is non-critical
+        return _local_save()
 
     async def clear_draft(self, subject_code: str, lecturer: dict[str, Any]) -> None:
-        self._ensure_supabase_for_write()
-        def _local_clear():
-            self.local_drafts.pop((lecturer["id"], subject_code), None)
-            self._persist_local_store()
-        return await self._call_remote(
-            self.remote.clear_draft(subject_code, lecturer["id"]) if self.remote else None,
-            _local_clear
-        )
+        # Always clear the local draft copy first.
+        self.local_drafts.pop((lecturer["id"], subject_code), None)
+        self._persist_local_store()
+        # Do NOT use _call_remote here — a failure on the quiz_test_drafts table must
+        # never disable self.remote (which would break all subsequent test reads/writes).
+        if self.remote is not None:
+            try:
+                await self.remote.clear_draft(subject_code, lecturer["id"])
+            except Exception:
+                pass  # Non-critical; the test itself was already saved successfully
 
 
 repo = HybridTestRepository(SUBJECTS)
@@ -1459,7 +1469,10 @@ async def create_test(subject_code: str, payload: dict[str, Any], request: Reque
     try:
         validated = TestPayload.model_validate(payload)
         created = await repo.create_test(subject_code, validated, lecturer)
-        await repo.clear_draft(subject_code, lecturer)
+        try:
+            await repo.clear_draft(subject_code, lecturer)
+        except Exception:
+            pass  # Draft clear is non-critical — never let it mask a successful test save
         return {"ok": True, "test": repo._summary(created, lecturer.get("id"))}
     except SupabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -1479,7 +1492,10 @@ async def update_test(subject_code: str, test_id: str, payload: dict[str, Any], 
     try:
         validated = TestPayload.model_validate(payload)
         updated = await repo.update_test(subject_code, test_id, validated, lecturer)
-        await repo.clear_draft(subject_code, lecturer)
+        try:
+            await repo.clear_draft(subject_code, lecturer)
+        except Exception:
+            pass  # Draft clear is non-critical — never let it mask a successful test update
         return {"ok": True, "test": repo._summary(updated, lecturer.get("id"))}
     except SupabaseUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -1519,8 +1535,9 @@ async def get_test_draft(subject_code: str, request: Request):
     try:
         draft = await repo.get_draft(subject_code, lecturer)
         return {"draft": draft}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        # If the draft table doesn't exist yet, return no draft rather than erroring.
+        return {"draft": None}
 
 
 @app.post("/api/drafts/{subject_code}")
@@ -1536,8 +1553,10 @@ async def save_test_draft(subject_code: str, payload: dict[str, Any], request: R
         raise HTTPException(status_code=503, detail=str(exc))
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors())
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        # Draft save failure is non-critical. Return a soft ok so autosave
+        # errors never break the editor UI or cascade into test operations.
+        return {"ok": False, "draft": None, "error": "Draft could not be saved to storage (non-critical)."}
 
 
 @app.delete("/api/drafts/{subject_code}")
@@ -1548,10 +1567,9 @@ async def clear_test_draft(subject_code: str, request: Request):
     try:
         await repo.clear_draft(subject_code, lecturer)
         return {"ok": True}
-    except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        # Always return ok — draft clearing is never worth surfacing as an error.
+        return {"ok": True}
 
 
 @app.get("/api/export/tests")
