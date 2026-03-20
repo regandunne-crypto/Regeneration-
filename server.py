@@ -1757,8 +1757,25 @@ def download_stats(subject_code: str):
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
-    safe_title = (stats.get("test_title") or subject_code).replace(" ", "_").replace("/", "-")[:60]
-    safe_session = (room.last_game_stats.get("session_name") or safe_title).replace(" ", "_").replace("/", "-")[:60]
+    def _safe_filename_part(value: str) -> str:
+        """Strip non-ASCII and filesystem-unsafe characters, replace spaces with underscores."""
+        import unicodedata
+        # Normalise accented characters to their ASCII base where possible
+        value = unicodedata.normalize("NFKD", value)
+        # Keep only printable ASCII, replace spaces, drop the rest
+        result = []
+        for ch in value:
+            if ch == " ":
+                result.append("_")
+            elif ch in r'/\:*?"<>|':
+                result.append("-")
+            elif 0x20 <= ord(ch) <= 0x7E:
+                result.append(ch)
+            # Non-ASCII characters (e.g. em dash —) are silently dropped
+        return "".join(result)[:60].strip("_-") or "Stats"
+
+    safe_title = _safe_filename_part(stats.get("test_title") or subject_code)
+    safe_session = _safe_filename_part(room.last_game_stats.get("session_name") or safe_title)
     filename = f"Stats_{subject_code}_{safe_session}.xlsx"
     return StreamingResponse(
         out,

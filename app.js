@@ -1547,7 +1547,7 @@ function updateHostLobbyHeading() {
 
 function getDefaultSessionName(testSummary) {
   const title = testSummary && testSummary.title ? testSummary.title : 'Quiz Session';
-  return `${title} \u2014 ${new Date().toLocaleDateString()}`;
+  return `${title} - ${new Date().toLocaleDateString()}`;
 }
 
 function hideSessionNameModal() {
