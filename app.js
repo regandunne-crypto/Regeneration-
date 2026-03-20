@@ -54,6 +54,7 @@ let timeLeft = TIME_PER_Q;
 let wakeLock = null;
 let selectedSubject = null;
 let selectedTest = null;
+let sessionName = '';
 let storageInfo = null;
 let lecturerSession = null;
 let hostSubjectCode = null;
@@ -77,6 +78,7 @@ const SUBJECT_COLORS = {
   DYN317B: { bg: 'var(--accent-orange)', icon: '🚀' }
 };
 const DEFAULT_SUBJECT_COLOR = { bg: 'var(--accent-green)', icon: '📚' };
+const BUILTIN_SUBJECT_CODES = new Set(Object.keys(SUBJECT_COLORS));
 
 function showScreen(id) {
   document.querySelectorAll('.screen').forEach((s) => s.classList.remove('active'));
@@ -227,33 +229,84 @@ async function apiDelete(path) {
   return await parseApiResponse(resp);
 }
 
+function getSubjectMetaText(sub) {
+  if (typeof sub.testCount === 'number') {
+    return sub.testCount === 1 ? '1 saved test' : `${sub.testCount} saved tests`;
+  }
+  return sub.questionCount > 0 ? `${sub.questionCount} questions` : 'No questions yet';
+}
+
+function createSubjectCardButton(sub, onSelect) {
+  const colors = SUBJECT_COLORS[sub.code] || DEFAULT_SUBJECT_COLOR;
+  const card = document.createElement('button');
+  card.type = 'button';
+  card.className = 'subject-card';
+  card.style.setProperty('--card-accent', colors.bg);
+  card.innerHTML = `
+    <span class="subject-icon">${colors.icon}</span>
+    <div class="subject-info">
+      <span class="subject-name">${escapeHtml(sub.name)}</span>
+      <span class="subject-code-label">${escapeHtml(sub.code)}</span>
+      <span class="subject-q-count">${escapeHtml(getSubjectMetaText(sub))}</span>
+    </div>
+    <span class="subject-arrow">&rarr;</span>
+  `;
+  card.addEventListener('click', () => onSelect(sub));
+  return card;
+}
+
 function renderSubjectCards(containerId, subjects, onSelect) {
   const container = $(`#${containerId}`);
   container.innerHTML = '';
   subjects.forEach((sub) => {
-    const colors = SUBJECT_COLORS[sub.code] || DEFAULT_SUBJECT_COLOR;
-    const card = document.createElement('button');
-    card.className = 'subject-card';
-    card.style.setProperty('--card-accent', colors.bg);
+    container.appendChild(createSubjectCardButton(sub, onSelect));
+  });
+}
 
-    let metaText = '';
-    if (typeof sub.testCount === 'number') {
-      metaText = sub.testCount === 1 ? '1 saved test' : `${sub.testCount} saved tests`;
-    } else {
-      metaText = sub.questionCount > 0 ? `${sub.questionCount} questions` : 'No questions yet';
+function renderHostSubjectCards(subjects, onSelect, refreshSubjects) {
+  const container = $('#host-subject-list');
+  if (!container) return;
+  container.innerHTML = '';
+  showInlineStatus('#host-subject-status', '', false);
+
+  subjects.forEach((sub) => {
+    const row = document.createElement('div');
+    row.className = 'subject-card-row';
+    row.appendChild(createSubjectCardButton(sub, onSelect));
+
+    if (!BUILTIN_SUBJECT_CODES.has(sub.code)) {
+      const deleteBtn = document.createElement('button');
+      deleteBtn.type = 'button';
+      deleteBtn.className = 'btn btn-danger subject-card-delete';
+      deleteBtn.textContent = 'Delete';
+      deleteBtn.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        if (!confirm(`Delete subject '${sub.name}'? This will fail if the subject has saved tests.`)) {
+          return;
+        }
+        showInlineStatus('#host-subject-status', 'Deleting subject...', false);
+        deleteBtn.disabled = true;
+        deleteBtn.textContent = 'Deleting...';
+        try {
+          await apiDelete(`/api/subjects/${encodeURIComponent(sub.code)}`);
+          showInlineStatus('#host-subject-status', '', false);
+          await refreshSubjects();
+        } catch (err) {
+          if (err.status === 401) {
+            lecturerSession = null;
+            updateHostAccountBar();
+            showHostAuthScreen('login', 'Your lecturer session expired. Please sign in again.', true);
+            return;
+          }
+          showInlineStatus('#host-subject-status', err.message || 'Could not delete subject.', true);
+          deleteBtn.disabled = false;
+          deleteBtn.textContent = 'Delete';
+        }
+      });
+      row.appendChild(deleteBtn);
     }
 
-    card.innerHTML = `
-      <span class="subject-icon">${colors.icon}</span>
-      <div class="subject-info">
-        <span class="subject-name">${escapeHtml(sub.name)}</span>
-        <span class="subject-code-label">${escapeHtml(sub.code)}</span>
-        <span class="subject-q-count">${escapeHtml(metaText)}</span>
-      </div>
-      <span class="subject-arrow">→</span>
-    `;
-    card.addEventListener('click', () => onSelect(sub));
-    container.appendChild(card);
+    container.appendChild(row);
   });
 }
 
@@ -714,11 +767,13 @@ function resetToStudentView() {
   if (ws) closeWS({ reconnect: false });
   isHost = false;
   selectedTest = null;
+  sessionName = '';
   selectedSubject = null;
   hostSubjectCode = null;
   editingTestId = null;
   originalEditingTest = null;
   currentDraftLoaded = null;
+  hideSessionNameModal();
   location.hash = '';
   updateHostAccountBar();
   initPlayer();
@@ -897,21 +952,25 @@ async function initHost() {
     return;
   }
   isHost = true;
+  selectedSubject = null;
   selectedTest = null;
+  sessionName = '';
+  hostSubjectCode = null;
   editingTestId = null;
   currentDraftLoaded = null;
   originalEditingTest = null;
   if (ws) closeWS({ reconnect: false });
+  hideSessionNameModal();
   updateHostAccountBar();
   showScreen('screen-host-subject');
 
   const refreshSubjects = async () => {
     const subjects = await loadSubjects();
-    renderSubjectCards('host-subject-list', subjects, (sub) => {
+    renderHostSubjectCards(subjects, (sub) => {
       selectedSubject = sub;
       hostSubjectCode = sub.code;
       showHostTestLibrary();
-    });
+    }, refreshSubjects);
   };
   await refreshSubjects();
   bindAddSubjectControls(refreshSubjects);
@@ -929,6 +988,9 @@ async function showHostTestLibrary() {
     showHostAuthScreen('login', 'Please sign in as a lecturer.');
     return;
   }
+  sessionName = '';
+  hideSessionNameModal();
+  showInlineStatus('#host-subject-status', '', false);
   if (ws) closeWS({ reconnect: false });
   showScreen('screen-host-tests');
   $('#host-tests-title').textContent = `${selectedSubject.name} (${selectedSubject.code})`;
@@ -1038,7 +1100,7 @@ function renderHostTestCards(tests) {
     `;
     card.querySelector('.test-use-btn').addEventListener('click', () => {
       selectedTest = test;
-      startHostForTest(test);
+      promptSessionName(test);
     });
     const editBtn = card.querySelector('.test-edit-btn');
     if (editBtn) {
@@ -1436,15 +1498,85 @@ function updateHostLobbyHeading() {
     : 'No test selected';
 }
 
+function getDefaultSessionName(testSummary) {
+  const title = testSummary && testSummary.title ? testSummary.title : 'Quiz Session';
+  return `${title} \u2014 ${new Date().toLocaleDateString()}`;
+}
+
+function hideSessionNameModal() {
+  const modal = $('#session-name-modal');
+  if (!modal) return;
+  modal.hidden = true;
+}
+
+function promptSessionName(testSummary) {
+  selectedTest = testSummary;
+  const modal = $('#session-name-modal');
+  const titleEl = $('#modal-test-label');
+  const input = $('#session-name-input');
+  const confirmBtn = $('#btn-session-confirm');
+  const cancelBtn = $('#btn-session-cancel');
+  const defaultValue = getDefaultSessionName(testSummary).slice(0, 80);
+
+  if (!modal || !titleEl || !input || !confirmBtn || !cancelBtn) {
+    sessionName = defaultValue;
+    startHostForTest(testSummary);
+    return;
+  }
+
+  sessionName = '';
+  titleEl.textContent = testSummary && testSummary.title ? testSummary.title : 'Selected test';
+  input.value = defaultValue;
+  modal.hidden = false;
+
+  const closeModal = () => {
+    sessionName = '';
+    hideSessionNameModal();
+  };
+
+  const startSession = () => {
+    sessionName = (input.value.trim() || defaultValue).slice(0, 80);
+    hideSessionNameModal();
+    startHostForTest(testSummary);
+  };
+
+  const confirmClone = confirmBtn.cloneNode(true);
+  confirmBtn.replaceWith(confirmClone);
+  const cancelClone = cancelBtn.cloneNode(true);
+  cancelBtn.replaceWith(cancelClone);
+
+  confirmClone.addEventListener('click', startSession);
+  cancelClone.addEventListener('click', closeModal);
+  modal.onclick = (event) => {
+    if (event.target === modal) closeModal();
+  };
+  input.onkeydown = (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      startSession();
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      closeModal();
+    }
+  };
+
+  requestAnimationFrame(() => {
+    input.focus();
+    input.select();
+  });
+}
+
 function startHostForTest(testSummary) {
   selectedTest = testSummary;
+  sessionName = (sessionName || getDefaultSessionName(testSummary)).trim().slice(0, 80);
   statsAutoDownloaded = false;
+  hideSessionNameModal();
   showScreen('screen-host-lobby');
   updateHostLobbyHeading();
   updateHostAccountBar();
 
   connectWS(() => {
-    send({ action: 'host_join', subject: hostSubjectCode, testId: selectedTest.id });
+    send({ action: 'host_join', subject: hostSubjectCode, testId: selectedTest.id, sessionName: sessionName || '' });
   });
 
   const playerURL = new URL(location.origin + location.pathname);
@@ -1454,8 +1586,8 @@ function startHostForTest(testSummary) {
   try {
     new QRCode(qrContainer, {
       text: playerURL.toString(),
-      width: 160,
-      height: 160,
+      width: 480,
+      height: 480,
       colorDark: '#1a1027',
       colorLight: '#ffffff',
       correctLevel: QRCode.CorrectLevel.M
@@ -1534,12 +1666,16 @@ function downloadStatsNow(subjectCode, buttonEl) {
         const detail = await resp.json().catch(() => ({}));
         throw new Error(detail.detail || detail.error || 'Download failed');
       }
-      return resp.blob();
+      const disposition = resp.headers.get('content-disposition') || '';
+      const match = /filename="?([^"]+)"?/i.exec(disposition);
+      const filename = match ? match[1] : `Stats_${subjectCode}.xlsx`;
+      const blob = await resp.blob();
+      return { blob, filename };
     })
-    .then((blob) => {
+    .then(({ blob, filename }) => {
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = `Stats_${subjectCode}.xlsx`;
+      a.download = filename;
       a.click();
       URL.revokeObjectURL(a.href);
       if (buttonEl) buttonEl.textContent = 'Download Stats (Excel)';

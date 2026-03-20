@@ -2,7 +2,7 @@
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>Engineering Quiz</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -217,6 +217,7 @@
       <div class="subject-list" id="host-subject-list">
         <!-- Populated by JS -->
       </div>
+      <p id="host-subject-status" class="inline-status" hidden></p>
       <button id="btn-open-add-subject" class="btn btn-secondary btn-stats" type="button">+ Add New Subject</button>
       <form id="host-add-subject-form" class="create-test-form" hidden>
         <label for="new-subject-code" class="input-label">Subject code</label>
@@ -392,6 +393,21 @@
         <button id="btn-download-stats-final" class="btn btn-secondary btn-stats">Download Stats (Excel)</button>
         <button id="btn-play-again" class="btn btn-primary btn-large">New Game</button>
         <button id="btn-change-test-final" class="btn btn-secondary">Change Test</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SESSION NAME MODAL -->
+  <div id="session-name-modal" class="modal-overlay" hidden>
+    <div class="modal-card">
+      <h2 class="modal-title">Start a Session</h2>
+      <p class="modal-test-label" id="modal-test-label"></p>
+      <label for="session-name-input" class="input-label">Session name</label>
+      <input type="text" id="session-name-input" class="editor-input" placeholder="e.g. Group A, Tutorial 3, Monday 9am" maxlength="80">
+      <p class="modal-hint">This name will be used in the downloaded stats file.</p>
+      <div class="modal-actions">
+        <button id="btn-session-confirm" class="btn btn-primary btn-large" type="button">Start Session</button>
+        <button id="btn-session-cancel" class="btn btn-secondary" type="button">Cancel</button>
       </div>
     </div>
   </div>

@@ -1140,6 +1140,7 @@ class GameRoom:
         self.active_test_chapter = ""
         self.questions: list[dict[str, Any]] = []
         self.total_q = 0
+        self.session_name = ""
         self.reset_runtime_state(clear_players=True)
 
     def set_active_test(self, test_data: dict[str, Any] | None) -> None:
@@ -1170,6 +1171,7 @@ class GameRoom:
             "test_id": self.active_test_id,
             "test_title": self.active_test_title,
             "test_chapter": self.active_test_chapter,
+            "session_name": self.session_name,
             "timestamp": datetime.now().isoformat(),
             "questions": self.questions,
             "players": {}
@@ -1756,7 +1758,8 @@ def download_stats(subject_code: str):
     wb.save(out)
     out.seek(0)
     safe_title = (stats.get("test_title") or subject_code).replace(" ", "_").replace("/", "-")[:60]
-    filename = f"Stats_{subject_code}_{safe_title}.xlsx"
+    safe_session = (room.last_game_stats.get("session_name") or safe_title).replace(" ", "_").replace("/", "-")[:60]
+    filename = f"Stats_{subject_code}_{safe_session}.xlsx"
     return StreamingResponse(
         out,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1936,6 +1939,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 room = rooms[subject_code]
                 if room.phase == "lobby":
                     room.set_active_test(test_data)
+                room.session_name = msg.get("sessionName", "").strip()[:80] or room.active_test_title
                 room.host_ws = websocket
                 room.host_visitor = visitor_id
 
@@ -2242,13 +2246,14 @@ async def auto_reveal(room: GameRoom) -> None:
         "leaderboard": lb,
         "isLast": room.current_q >= room.total_q - 1
     })
-    waited = 0
-    while waited < 5 or room.paused:
+    waited = 0.0
+    while True:
         await asyncio.sleep(0.5)
-        if not room.paused:
-            waited += 0.5
-        else:
-            waited = 0
+        if room.paused:
+            continue
+        waited += 0.5
+        if waited >= 5.0:
+            break
     if room.phase == "reveal":
         await advance_to_next(room)
 
