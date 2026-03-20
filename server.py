@@ -1954,11 +1954,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 role = "host"
                 room = rooms[subject_code]
-                if room.phase == "lobby":
+                requested_new_test = bool(test_id and test_id != room.active_test_id)
+                if room.phase == "lobby" or (room.phase == "final" and requested_new_test):
                     room.set_active_test(test_data)
                 room.session_name = msg.get("sessionName", "").strip()[:80] or room.active_test_title
                 room.host_ws = websocket
                 room.host_visitor = visitor_id
+
+                if room.phase == "final" and requested_new_test:
+                    await return_room_to_lobby(room, keep_players=True)
+                    continue
 
                 await websocket.send_text(json.dumps({
                     "type": "host_joined",
