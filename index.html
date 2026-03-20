@@ -220,7 +220,8 @@
       <p id="host-subject-status" class="inline-status" hidden></p>
       <div class="subject-manage-row">
         <button id="btn-open-add-subject" class="btn btn-secondary" type="button">+ Add Subject</button>
-        <button id="btn-open-delete-subject" class="btn btn-danger" type="button">− Delete Subject</button>
+        <select id="delete-subject-select" class="editor-input subject-manage-select"></select>
+        <button id="btn-delete-subject" class="btn btn-danger" type="button">Delete Subject</button>
       </div>
       <form id="host-add-subject-form" class="create-test-form" hidden>
         <label for="new-subject-code" class="input-label">Subject code</label>
@@ -235,16 +236,6 @@
           <button id="btn-cancel-add-subject" class="btn btn-secondary" type="button">Cancel</button>
         </div>
       </form>
-      <div id="host-delete-subject-form" hidden>
-        <label for="delete-subject-select" class="input-label">Select subject to delete</label>
-        <select id="delete-subject-select" class="editor-input"></select>
-        <p class="modal-hint">This will fail if the subject has saved tests.</p>
-        <p id="host-delete-subject-status" class="inline-status" hidden></p>
-        <div class="host-test-library-actions">
-          <button id="btn-confirm-delete-subject" class="btn btn-danger" type="button">Delete Subject</button>
-          <button id="btn-cancel-delete-subject" class="btn btn-secondary" type="button">Cancel</button>
-        </div>
-      </div>
       <button id="btn-back-player" class="back-link">&larr; Back to student view</button>
     </div>
   </div>
