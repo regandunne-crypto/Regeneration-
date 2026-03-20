@@ -69,6 +69,7 @@ let editorInputBound = false;
 let hostCorrectAnswer = -1;
 let hostCurrentOptions = [];
 let hostCurrentQuestion = '';
+let hostTimeLeft = TIME_PER_Q;
 let playerAnswered = false;
 let statsAutoDownloaded = false;
 
@@ -263,50 +264,13 @@ function renderSubjectCards(containerId, subjects, onSelect) {
   });
 }
 
-function renderHostSubjectCards(subjects, onSelect, refreshSubjects) {
+function renderHostSubjectCards(subjects, onSelect) {
   const container = $('#host-subject-list');
   if (!container) return;
   container.innerHTML = '';
   showInlineStatus('#host-subject-status', '', false);
-
   subjects.forEach((sub) => {
-    const row = document.createElement('div');
-    row.className = 'subject-card-row';
-    row.appendChild(createSubjectCardButton(sub, onSelect));
-
-    if (!BUILTIN_SUBJECT_CODES.has(sub.code)) {
-      const deleteBtn = document.createElement('button');
-      deleteBtn.type = 'button';
-      deleteBtn.className = 'btn btn-danger subject-card-delete';
-      deleteBtn.textContent = 'Delete';
-      deleteBtn.addEventListener('click', async (event) => {
-        event.stopPropagation();
-        if (!confirm(`Delete subject '${sub.name}'? This will fail if the subject has saved tests.`)) {
-          return;
-        }
-        showInlineStatus('#host-subject-status', 'Deleting subject...', false);
-        deleteBtn.disabled = true;
-        deleteBtn.textContent = 'Deleting...';
-        try {
-          await apiDelete(`/api/subjects/${encodeURIComponent(sub.code)}`);
-          showInlineStatus('#host-subject-status', '', false);
-          await refreshSubjects();
-        } catch (err) {
-          if (err.status === 401) {
-            lecturerSession = null;
-            updateHostAccountBar();
-            showHostAuthScreen('login', 'Your lecturer session expired. Please sign in again.', true);
-            return;
-          }
-          showInlineStatus('#host-subject-status', err.message || 'Could not delete subject.', true);
-          deleteBtn.disabled = false;
-          deleteBtn.textContent = 'Delete';
-        }
-      });
-      row.appendChild(deleteBtn);
-    }
-
-    container.appendChild(row);
+    container.appendChild(createSubjectCardButton(sub, onSelect));
   });
 }
 
@@ -523,12 +487,26 @@ function handlePlayerMessage(msg) {
       break;
     case 'pause_state':
       if (msg.paused) {
-        // freeze the player timer
         clearTimer();
-        showInlineStatus('#player-pause-msg', '⏸ Paused by lecturer…');
+        const pauseMsg = $('#player-pause-msg');
+        if (pauseMsg) {
+          pauseMsg.textContent = '⏸ Paused by lecturer…';
+          pauseMsg.hidden = false;
+        }
       } else {
-        $('#player-pause-msg') && ($('#player-pause-msg').hidden = true);
-        startPlayerTimer();
+        const pauseMsg = $('#player-pause-msg');
+        if (pauseMsg) pauseMsg.hidden = true;
+        // Resume countdown from current timeLeft without resetting playerAnswered
+        if (!playerAnswered && timeLeft > 0) {
+          timerInterval = setInterval(() => {
+            timeLeft -= 0.1;
+            if (timeLeft <= 0) {
+              timeLeft = 0;
+              clearTimer();
+            }
+            updatePlayerTimerDisplay();
+          }, 100);
+        }
       }
       break;
     case 'leaderboard':
@@ -945,6 +923,77 @@ function bindAddSubjectControls(refreshSubjects) {
   resetForm();
 }
 
+function bindDeleteSubjectControls(subjects, refreshSubjects) {
+  const openBtn = $('#btn-open-delete-subject');
+  const form = $('#host-delete-subject-form');
+  const select = $('#delete-subject-select');
+  const confirmBtn = $('#btn-confirm-delete-subject');
+  const cancelBtn = $('#btn-cancel-delete-subject');
+  if (!openBtn || !form || !select || !confirmBtn || !cancelBtn) return;
+
+  // Populate the dropdown with only non-builtin subjects
+  select.innerHTML = '';
+  const custom = (subjects || []).filter((s) => !BUILTIN_SUBJECT_CODES.has(s.code));
+  if (custom.length === 0) {
+    openBtn.disabled = true;
+    openBtn.title = 'No custom subjects to delete';
+  } else {
+    openBtn.disabled = false;
+    openBtn.title = '';
+    custom.forEach((s) => {
+      const opt = document.createElement('option');
+      opt.value = s.code;
+      opt.textContent = `${escapeHtml(s.name)} (${escapeHtml(s.code)})`;
+      select.appendChild(opt);
+    });
+  }
+
+  // Clone buttons to remove stale listeners
+  const openClone = openBtn.cloneNode(true);
+  openBtn.replaceWith(openClone);
+  const confirmClone = confirmBtn.cloneNode(true);
+  confirmBtn.replaceWith(confirmClone);
+  const cancelClone = cancelBtn.cloneNode(true);
+  cancelBtn.replaceWith(cancelClone);
+
+  const hideForm = () => {
+    form.hidden = true;
+    showInlineStatus('#host-subject-status', '', false);
+  };
+
+  openClone.addEventListener('click', () => {
+    form.hidden = !form.hidden;
+    showInlineStatus('#host-subject-status', '', false);
+  });
+
+  cancelClone.addEventListener('click', hideForm);
+
+  confirmClone.addEventListener('click', async () => {
+    const code = select.value;
+    const name = select.options[select.selectedIndex]?.text || code;
+    if (!code) return;
+    if (!confirm(`Delete subject '${name}'? This will fail if the subject has saved tests.`)) return;
+    confirmClone.disabled = true;
+    confirmClone.textContent = 'Deleting...';
+    showInlineStatus('#host-subject-status', 'Deleting subject...', false);
+    try {
+      await apiDelete(`/api/subjects/${encodeURIComponent(code)}`);
+      hideForm();
+      await refreshSubjects();
+    } catch (err) {
+      if (err.status === 401) {
+        lecturerSession = null;
+        updateHostAccountBar();
+        showHostAuthScreen('login', 'Your lecturer session expired. Please sign in again.', true);
+        return;
+      }
+      showInlineStatus('#host-subject-status', err.message || 'Could not delete subject.', true);
+      confirmClone.disabled = false;
+      confirmClone.textContent = 'Delete Subject';
+    }
+  });
+}
+
 async function initHost() {
   const session = lecturerSession || await fetchLecturerSession();
   if (!session) {
@@ -970,7 +1019,8 @@ async function initHost() {
       selectedSubject = sub;
       hostSubjectCode = sub.code;
       showHostTestLibrary();
-    }, refreshSubjects);
+    });
+    bindDeleteSubjectControls(subjects, refreshSubjects);
   };
   await refreshSubjects();
   bindAddSubjectControls(refreshSubjects);
@@ -1762,6 +1812,28 @@ function handleHostMessage(msg) {
       document.querySelectorAll('#btn-pause-game').forEach((pauseBtn) => {
         pauseBtn.textContent = msg.paused ? '▶ Resume' : '⏸ Pause';
       });
+      if (msg.paused) {
+        // Freeze the host timer bar
+        if (hostTimerInterval) {
+          clearInterval(hostTimerInterval);
+          hostTimerInterval = null;
+        }
+      } else {
+        // Resume the host timer bar from wherever hostTimeLeft currently is
+        if (!hostTimerInterval && hostTimeLeft > 0) {
+          hostTimerInterval = setInterval(() => {
+            hostTimeLeft -= 0.1;
+            if (hostTimeLeft <= 0) {
+              hostTimeLeft = 0;
+              clearInterval(hostTimerInterval);
+              hostTimerInterval = null;
+            }
+            const pct = (hostTimeLeft / TIME_PER_Q) * 100;
+            $('#host-timer-bar').style.width = `${pct}%`;
+            $('#host-timer').textContent = Math.ceil(hostTimeLeft);
+          }, 100);
+        }
+      }
       break;
     }
     case 'reveal':
@@ -1838,13 +1910,14 @@ function hostShowQuestion(msg) {
     grid.appendChild(div);
   });
 
-  let hostTimeLeft = msg.timeLimit || TIME_PER_Q;
+  hostTimeLeft = msg.timeLimit || TIME_PER_Q;
   if (hostTimerInterval) clearInterval(hostTimerInterval);
   hostTimerInterval = setInterval(() => {
     hostTimeLeft -= 0.1;
     if (hostTimeLeft <= 0) {
       hostTimeLeft = 0;
       clearInterval(hostTimerInterval);
+      hostTimerInterval = null;
     }
     const pct = (hostTimeLeft / TIME_PER_Q) * 100;
     $('#host-timer-bar').style.width = `${pct}%`;

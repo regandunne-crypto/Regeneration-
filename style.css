@@ -78,8 +78,7 @@ input { font: inherit; color: inherit; }
   width: 100%;
   height: 100dvh;
   position: relative;
-  overflow-x: hidden;
-  overflow-y: auto;
+  overflow: hidden;
 }
 
 /* ===== Screen System ===== */
@@ -256,6 +255,17 @@ input { font: inherit; color: inherit; }
 .subject-card-delete {
   flex: 0 0 auto;
   min-width: 108px;
+}
+
+.subject-manage-row {
+  display: flex;
+  gap: var(--space-3);
+  width: 100%;
+  flex-wrap: wrap;
+}
+
+.subject-manage-row .btn {
+  flex: 1 1 auto;
 }
 
 .subject-card:hover {
