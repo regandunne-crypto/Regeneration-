@@ -927,11 +927,9 @@ function bindDeleteSubjectControls(subjects, refreshSubjects) {
   const openBtn = $('#btn-open-delete-subject');
   const form = $('#host-delete-subject-form');
   const select = $('#delete-subject-select');
-  const confirmBtn = $('#btn-confirm-delete-subject');
-  const cancelBtn = $('#btn-cancel-delete-subject');
-  if (!openBtn || !form || !select || !confirmBtn || !cancelBtn) return;
+  if (!openBtn || !form || !select) return;
 
-  // Populate the dropdown with only non-builtin subjects
+  // Populate dropdown with only non-builtin subjects
   select.innerHTML = '';
   const custom = (subjects || []).filter((s) => !BUILTIN_SUBJECT_CODES.has(s.code));
   if (custom.length === 0) {
@@ -943,55 +941,54 @@ function bindDeleteSubjectControls(subjects, refreshSubjects) {
     custom.forEach((s) => {
       const opt = document.createElement('option');
       opt.value = s.code;
-      opt.textContent = `${escapeHtml(s.name)} (${escapeHtml(s.code)})`;
+      opt.textContent = `${s.name} (${s.code})`;
       select.appendChild(opt);
     });
   }
 
-  // Clone buttons to remove stale listeners
-  const openClone = openBtn.cloneNode(true);
-  openBtn.replaceWith(openClone);
-  const confirmClone = confirmBtn.cloneNode(true);
-  confirmBtn.replaceWith(confirmClone);
-  const cancelClone = cancelBtn.cloneNode(true);
-  cancelBtn.replaceWith(cancelClone);
-
-  const hideForm = () => {
-    form.hidden = true;
+  // Use onclick to safely overwrite any previous listener on every refresh
+  openBtn.onclick = () => {
+    form.hidden = !form.hidden;
     showInlineStatus('#host-subject-status', '', false);
   };
 
-  openClone.addEventListener('click', () => {
-    form.hidden = !form.hidden;
-    showInlineStatus('#host-subject-status', '', false);
-  });
+  const cancelBtn = $('#btn-cancel-delete-subject');
+  if (cancelBtn) {
+    cancelBtn.onclick = () => {
+      form.hidden = true;
+      showInlineStatus('#host-subject-status', '', false);
+    };
+  }
 
-  cancelClone.addEventListener('click', hideForm);
-
-  confirmClone.addEventListener('click', async () => {
-    const code = select.value;
-    const name = select.options[select.selectedIndex]?.text || code;
-    if (!code) return;
-    if (!confirm(`Delete subject '${name}'? This will fail if the subject has saved tests.`)) return;
-    confirmClone.disabled = true;
-    confirmClone.textContent = 'Deleting...';
-    showInlineStatus('#host-subject-status', 'Deleting subject...', false);
-    try {
-      await apiDelete(`/api/subjects/${encodeURIComponent(code)}`);
-      hideForm();
-      await refreshSubjects();
-    } catch (err) {
-      if (err.status === 401) {
-        lecturerSession = null;
-        updateHostAccountBar();
-        showHostAuthScreen('login', 'Your lecturer session expired. Please sign in again.', true);
-        return;
+  const confirmBtn = $('#btn-confirm-delete-subject');
+  if (confirmBtn) {
+    confirmBtn.onclick = async () => {
+      const sel = $('#delete-subject-select');
+      const code = sel ? sel.value : '';
+      const name = (sel && sel.options[sel.selectedIndex]) ? sel.options[sel.selectedIndex].text : code;
+      if (!code) return;
+      if (!confirm(`Delete subject '${name}'? This will fail if the subject has saved tests.`)) return;
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = 'Deleting...';
+      showInlineStatus('#host-subject-status', 'Deleting subject...', false);
+      try {
+        await apiDelete(`/api/subjects/${encodeURIComponent(code)}`);
+        form.hidden = true;
+        showInlineStatus('#host-subject-status', '', false);
+        await refreshSubjects();
+      } catch (err) {
+        if (err.status === 401) {
+          lecturerSession = null;
+          updateHostAccountBar();
+          showHostAuthScreen('login', 'Your lecturer session expired. Please sign in again.', true);
+          return;
+        }
+        showInlineStatus('#host-subject-status', err.message || 'Could not delete subject.', true);
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = 'Delete Subject';
       }
-      showInlineStatus('#host-subject-status', err.message || 'Could not delete subject.', true);
-      confirmClone.disabled = false;
-      confirmClone.textContent = 'Delete Subject';
-    }
-  });
+    };
+  }
 }
 
 async function initHost() {

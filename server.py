@@ -2201,7 +2201,14 @@ async def send_question(room: GameRoom) -> None:
     })
 
     async def _timer():
-        await asyncio.sleep(TIME_PER_Q)
+        # Count elapsed time in 0.5s ticks, freezing while room.paused is True
+        elapsed = 0.0
+        while elapsed < TIME_PER_Q:
+            await asyncio.sleep(0.5)
+            if room.phase != "question" or room.current_q != q_index:
+                return  # Question already advanced (e.g. all answered early)
+            if not room.paused:
+                elapsed += 0.5
         if room.phase == "question" and room.current_q == q_index:
             for vid in room.players:
                 if vid not in room.answers_this_round:
