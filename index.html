@@ -60,7 +60,7 @@
         <p id="name-error" class="name-error" hidden></p>
         <button id="btn-join" class="btn btn-primary" disabled>Join Game</button>
       </div>
-      <button id="btn-back-subject" class="back-link">&larr; Change subject</button>
+      <button id="btn-back-subject" class="back-link" hidden>&larr; Change subject</button>
     </div>
   </div>
 
@@ -73,7 +73,7 @@
       <p class="lobby-player-count"><span id="lobby-p-count">0</span> players connected</p>
       <p class="waiting-pulse">Waiting for lecturer to start…</p>
       <p class="lobby-subject-badge" id="lobby-subject-badge"></p>
-      <button id="btn-leave-lobby" class="back-link lobby-leave-link">&larr; Leave lobby / change subject</button>
+      <button id="btn-leave-lobby" class="back-link lobby-leave-link" hidden>&larr; Leave lobby / change subject</button>
     </div>
   </div>
 
@@ -312,6 +312,7 @@
           <p class="qr-label">Students scan to join</p>
           <div id="qr-code"></div>
           <p class="qr-url" id="qr-url-text"></p>
+          <button id="btn-regenerate-qr" class="btn btn-secondary host-qr-refresh-btn" type="button">Regenerate QR Code</button>
         </div>
         <div class="host-players-panel">
           <h3 class="host-panel-title">Players <span class="player-count-badge" id="host-player-count">0</span></h3>
@@ -413,6 +414,32 @@
         <button id="btn-session-confirm" class="btn btn-primary btn-large" type="button">Start Session</button>
         <button id="btn-session-cancel" class="btn btn-secondary" type="button">Cancel</button>
       </div>
+    </div>
+  </div>
+
+  <!-- PLAYER: Token validation loading -->
+  <div id="screen-token-loading" class="screen">
+    <div class="ready-container">
+      <p class="ready-label">Checking session...</p>
+      <div class="pulse-ring"></div>
+    </div>
+  </div>
+
+  <!-- PLAYER: Token expired / invalid -->
+  <div id="screen-token-expired" class="screen">
+    <div class="join-container">
+      <div class="logo-area">
+        <svg class="logo-icon" viewBox="0 0 64 64" width="72" height="72" fill="none">
+          <rect x="8" y="48" width="48" height="6" rx="2" fill="var(--accent-blue)"/>
+          <polygon points="32,8 12,48 52,48" stroke="var(--accent-yellow)" stroke-width="3" fill="none" stroke-linejoin="round"/>
+          <line x1="32" y1="8" x2="32" y2="48" stroke="var(--accent-red)" stroke-width="2" stroke-dasharray="4 3"/>
+          <circle cx="32" cy="32" r="4" fill="var(--accent-green)"/>
+        </svg>
+        <h2 class="join-subject-title">Session Unavailable</h2>
+      </div>
+      <p id="token-expired-msg" class="lobby-player-msg token-expired-msg">
+        This session link has expired. Ask your lecturer for the current QR code.
+      </p>
     </div>
   </div>
 

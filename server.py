@@ -17,6 +17,7 @@ import json
 import os
 import re
 import secrets
+import string
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -1141,6 +1142,7 @@ class GameRoom:
         self.questions: list[dict[str, Any]] = []
         self.total_q = 0
         self.session_name = ""
+        self.current_token = ""
         self.reset_runtime_state(clear_players=True)
 
     def set_active_test(self, test_data: dict[str, Any] | None) -> None:
@@ -1156,6 +1158,7 @@ class GameRoom:
         self.question_start_time = 0
         if clear_players:
             self.players = {}
+            self.current_token = ""
         self.host_ws = None
         self.host_visitor = None
         self.answers_this_round = {}
@@ -1186,6 +1189,66 @@ class GameRoom:
 
 
 rooms: dict[str, GameRoom] = {code: GameRoom(code) for code in SUBJECTS}
+session_tokens: dict[str, dict[str, Any]] = {}
+SESSION_TOKEN_TTL = 60 * 20
+SESSION_TOKEN_LENGTH = 6
+SESSION_TOKEN_ALPHABET = string.ascii_uppercase + string.digits
+
+
+def consume_session_token(token: str) -> None:
+    normalized = (token or "").strip().upper()
+    if not normalized:
+        return
+    session_tokens.pop(normalized, None)
+
+
+def generate_session_token(subject_code: str) -> str:
+    normalized = (subject_code or "").strip().upper()
+    to_remove = [token for token, entry in list(session_tokens.items()) if entry.get("subject_code") == normalized]
+    for token in to_remove:
+        consume_session_token(token)
+    token = ""
+    while not token or token in session_tokens:
+        token = "".join(secrets.choice(SESSION_TOKEN_ALPHABET) for _ in range(SESSION_TOKEN_LENGTH))
+    session_tokens[token] = {
+        "subject_code": normalized,
+        "expires_at": time.time() + SESSION_TOKEN_TTL
+    }
+    return token
+
+
+def lookup_session_token(token: str) -> str | None:
+    normalized = (token or "").strip().upper()
+    if not normalized:
+        return None
+    entry = session_tokens.get(normalized)
+    if not entry:
+        return None
+    if time.time() > float(entry.get("expires_at") or 0):
+        consume_session_token(normalized)
+        return None
+    subject_code = (entry.get("subject_code") or "").strip().upper()
+    return subject_code or None
+
+
+def get_room_active_token(room: GameRoom | None) -> str:
+    if room is None:
+        return ""
+    token = (room.current_token or "").strip().upper()
+    if not token:
+        return ""
+    if lookup_session_token(token) == room.subject_code:
+        return token
+    return ""
+
+
+async def _cleanup_expired_tokens() -> None:
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+        expired = [token for token, entry in list(session_tokens.items()) if now > float(entry.get("expires_at") or 0)]
+        for token in expired:
+            consume_session_token(token)
 
 
 def register_subject_in_catalog(code: str, name: str) -> None:
@@ -1217,12 +1280,20 @@ async def lifespan(app: FastAPI):
             register_subject_in_catalog(row.get("code"), row.get("name"))
     except Exception as exc:
         print(f"Failed to load subjects from Supabase: {exc}")
-    yield
-    if repo.remote is not None:
+    cleanup_task = asyncio.create_task(_cleanup_expired_tokens())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
         try:
-            await repo.remote.aclose()
-        except Exception:
+            await cleanup_task
+        except asyncio.CancelledError:
             pass
+        if repo.remote is not None:
+            try:
+                await repo.remote.aclose()
+            except Exception:
+                pass
 
 app = FastAPI(lifespan=lifespan)
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").strip()
@@ -1377,6 +1448,32 @@ async def get_subjects():
     return result
 
 
+@app.post("/api/session-token/{subject_code}")
+async def create_session_token_endpoint(subject_code: str, request: Request):
+    await require_lecturer(request)
+    normalized = (subject_code or "").strip().upper()
+    if normalized not in SUBJECTS:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    token = generate_session_token(normalized)
+    room = rooms.get(normalized)
+    if room:
+        room.current_token = token
+    return {"ok": True, "token": token, "subject_code": normalized}
+
+
+@app.get("/api/session-token/{token}/validate")
+async def validate_session_token_endpoint(token: str):
+    subject_code = lookup_session_token(token)
+    if not subject_code:
+        raise HTTPException(status_code=404, detail="This session link has expired or is invalid. Ask your lecturer for the current QR code.")
+    subject = SUBJECTS.get(subject_code)
+    return {
+        "valid": True,
+        "subject_code": subject_code,
+        "subject_name": subject["name"] if subject else subject_code
+    }
+
+
 @app.post("/api/subjects")
 async def create_subject(payload: dict[str, Any], request: Request):
     lecturer = await require_lecturer(request)
@@ -1410,6 +1507,9 @@ async def delete_subject(code: str, request: Request):
         raise HTTPException(status_code=404, detail="Subject not found")
     try:
         await repo.delete_subject(normalized, lecturer)
+        for token, entry in list(session_tokens.items()):
+            if (entry.get("subject_code") or "").strip().upper() == normalized:
+                consume_session_token(token)
         SUBJECTS.pop(normalized, None)
         rooms.pop(normalized, None)
         return {"ok": True}
@@ -1944,6 +2044,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 subject_code = msg.get("subject")
                 test_id = msg.get("testId")
+                host_token = (msg.get("token") or "").strip().upper()
                 if subject_code not in rooms:
                     await websocket.send_text(json.dumps({"type": "error", "message": "Invalid subject"}))
                     continue
@@ -1958,6 +2059,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 if room.phase == "lobby" or (room.phase == "final" and requested_new_test):
                     room.set_active_test(test_data)
                 room.session_name = msg.get("sessionName", "").strip()[:80] or room.active_test_title
+                if host_token and lookup_session_token(host_token) == subject_code:
+                    room.current_token = host_token
+                elif room.phase == "lobby":
+                    room.current_token = ""
                 room.host_ws = websocket
                 room.host_visitor = visitor_id
 
@@ -1985,6 +2090,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 if room.total_q == 0:
                     await websocket.send_text(json.dumps({"type": "error", "message": "No questions loaded for this test."}))
                     continue
+                active_token = get_room_active_token(room)
+                if active_token:
+                    consume_session_token(active_token)
                 room.paused = False
                 import random
                 if msg.get("shuffle"):
@@ -2031,11 +2139,21 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"type": "pong"}))
 
             elif action == "player_join":
-                subject_code = msg.get("subject")
-                if subject_code not in rooms:
-                    await websocket.send_text(json.dumps({"type": "error", "message": "Invalid subject"}))
+                token = (msg.get("token") or "").strip().upper()
+                subject_code_from_token = lookup_session_token(token) if token else None
+                subject_code = subject_code_from_token or (msg.get("subject") or "").strip().upper()
+                if token and not subject_code_from_token:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "This session link has expired. Ask your lecturer for the current QR code."
+                    }))
                     continue
-                role = "player"
+                if subject_code not in rooms:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "This session link has expired or is invalid. Ask your lecturer for the current QR code."
+                    }))
+                    continue
                 room = rooms[subject_code]
                 name = msg.get("name", "Anonymous").strip()[:20]
                 student_number = msg.get("studentNumber", "").strip()[:20]
@@ -2056,6 +2174,23 @@ async def websocket_endpoint(websocket: WebSocket):
                             existing_vid = vid
                             existing_player = player
                             break
+                required_room_token = (room.current_token or "").strip().upper()
+                is_known_player = visitor_id in room.players or existing_player is not None
+                if not subject_code_from_token and required_room_token and not is_known_player:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "This session link has expired or is invalid. Ask your lecturer for the current QR code."
+                    }))
+                    continue
+                if not subject_code_from_token and room.phase != "lobby" and not is_known_player:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "This session has already started. Ask your lecturer for the current QR code before joining."
+                    }))
+                    continue
+                if subject_code_from_token and room.current_token != token:
+                    room.current_token = token
+                role = "player"
                 if existing_player:
                     old_ws = existing_player.get("ws")
                     if old_ws is not None:

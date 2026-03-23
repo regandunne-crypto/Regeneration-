@@ -55,6 +55,7 @@ let wakeLock = null;
 let selectedSubject = null;
 let selectedTest = null;
 let sessionName = '';
+let sessionToken = '';
 let storageInfo = null;
 let lecturerSession = null;
 let hostSubjectCode = null;
@@ -156,6 +157,29 @@ function closeWS({ reconnect = false } = {}) {
   wsOnOpen = null;
 }
 
+function showPlayerJoinError(message, { expired = false } = {}) {
+  const text = message || 'Could not join this session.';
+  const joinBtn = $('#btn-join');
+  if (joinBtn) {
+    joinBtn.disabled = false;
+    joinBtn.textContent = 'Join Game';
+  }
+  const errEl = $('#name-error');
+  if (errEl) {
+    errEl.textContent = text;
+    errEl.hidden = expired;
+  }
+  if (expired) {
+    sessionToken = '';
+    closeWS({ reconnect: false });
+    showScreen('screen-token-expired');
+    const expiredMsg = $('#token-expired-msg');
+    if (expiredMsg) expiredMsg.textContent = text;
+    return;
+  }
+  showScreen('screen-join');
+}
+
 function handleMessage(msg) {
   if (msg.type === 'pong') return;
   if (msg.type === 'auth_required') {
@@ -165,8 +189,14 @@ function handleMessage(msg) {
     return;
   }
   if (msg.type === 'error') {
-    showInlineStatus('#host-library-status', msg.message, true);
-    showInlineStatus('#host-create-status', msg.message, true);
+    if (isHost) {
+      showInlineStatus('#host-library-status', msg.message, true);
+      showInlineStatus('#host-create-status', msg.message, true);
+    } else {
+      const message = msg.message || 'Could not join this session.';
+      const expired = /current qr code|session link|session has already started/i.test(message);
+      showPlayerJoinError(message, { expired });
+    }
     console.error('Server error:', msg.message);
     return;
   }
@@ -320,16 +350,37 @@ function formatActiveTestLabel(subject, activeTest) {
 
 async function initPlayer() {
   isHost = false;
+  sessionToken = '';
+  const params = new URLSearchParams(location.search);
+  const token = (params.get('token') || '').trim().toUpperCase();
+
+  if (token) {
+    showScreen('screen-token-loading');
+    try {
+      const result = await apiGet(`/api/session-token/${encodeURIComponent(token)}/validate`);
+      selectedSubject = { code: result.subject_code, name: result.subject_name };
+      sessionToken = token;
+      showPlayerJoinScreen();
+    } catch (e) {
+      selectedSubject = null;
+      showScreen('screen-token-expired');
+      $('#token-expired-msg').textContent = e.message || 'This session link has expired. Ask your lecturer for the current QR code.';
+    }
+    return;
+  }
+
   showScreen('screen-subject');
   const subjects = await loadSubjects();
   renderSubjectCards('subject-list', subjects, (sub) => {
     selectedSubject = sub;
+    sessionToken = '';
     showPlayerJoinScreen();
   });
 
   const preselected = getPrefilledSubjectFromURL(subjects);
   if (preselected) {
     selectedSubject = preselected;
+    sessionToken = '';
     showPlayerJoinScreen();
   }
 }
@@ -410,7 +461,8 @@ function joinAsPlayer() {
       action: 'player_join',
       name: myPlayerName,
       studentNumber: myStudentNumber,
-      subject: selectedSubject.code
+      subject: selectedSubject.code,
+      token: sessionToken || ''
     });
   });
 }
@@ -746,6 +798,7 @@ function resetToStudentView() {
   isHost = false;
   selectedTest = null;
   sessionName = '';
+  sessionToken = '';
   selectedSubject = null;
   hostSubjectCode = null;
   editingTestId = null;
@@ -1614,22 +1667,19 @@ function promptSessionName(testSummary) {
   });
 }
 
-function startHostForTest(testSummary) {
-  selectedTest = testSummary;
-  sessionName = (sessionName || getDefaultSessionName(testSummary)).trim().slice(0, 80);
-  statsAutoDownloaded = false;
-  hideSessionNameModal();
-  showScreen('screen-host-lobby');
-  updateHostLobbyHeading();
-  updateHostAccountBar();
-
-  connectWS(() => {
-    send({ action: 'host_join', subject: hostSubjectCode, testId: selectedTest.id, sessionName: sessionName || '' });
-  });
-
+function buildPlayerJoinURL(subjectCode, token = '') {
   const playerURL = new URL(location.origin + location.pathname);
-  playerURL.searchParams.set('subject', hostSubjectCode);
+  if (token) {
+    playerURL.searchParams.set('token', token);
+  } else if (subjectCode) {
+    playerURL.searchParams.set('subject', subjectCode);
+  }
+  return playerURL;
+}
+
+function renderHostJoinQRCode(playerURL) {
   const qrContainer = $('#qr-code');
+  if (!qrContainer) return;
   qrContainer.innerHTML = '';
   try {
     new QRCode(qrContainer, {
@@ -1641,7 +1691,66 @@ function startHostForTest(testSummary) {
       correctLevel: QRCode.CorrectLevel.M
     });
   } catch (e) {}
-  $('#qr-url-text').textContent = playerURL.toString();
+  const urlText = $('#qr-url-text');
+  if (urlText) urlText.textContent = playerURL.toString();
+}
+
+async function requestHostSessionToken(subjectCode) {
+  const tokenResp = await apiPost(`/api/session-token/${encodeURIComponent(subjectCode)}`, {});
+  const token = (tokenResp.token || '').trim().toUpperCase();
+  if (!token) {
+    throw new Error('Token generation returned an empty token.');
+  }
+  return token;
+}
+
+async function startHostForTest(testSummary) {
+  selectedTest = testSummary;
+  sessionName = (sessionName || getDefaultSessionName(testSummary)).trim().slice(0, 80);
+  sessionToken = '';
+  statsAutoDownloaded = false;
+  hideSessionNameModal();
+  showScreen('screen-host-lobby');
+  updateHostLobbyHeading();
+  updateHostAccountBar();
+
+  try {
+    sessionToken = await requestHostSessionToken(hostSubjectCode);
+  } catch (e) {
+    sessionToken = '';
+    console.warn('Could not generate session token, falling back to subject URL', e);
+  }
+
+  connectWS(() => {
+    send({
+      action: 'host_join',
+      subject: hostSubjectCode,
+      testId: selectedTest.id,
+      sessionName: sessionName || '',
+      token: sessionToken || ''
+    });
+  });
+
+  renderHostJoinQRCode(buildPlayerJoinURL(hostSubjectCode, sessionToken));
+
+  const regenBtn = $('#btn-regenerate-qr');
+  if (regenBtn) {
+    const newRegen = regenBtn.cloneNode(true);
+    regenBtn.replaceWith(newRegen);
+    newRegen.addEventListener('click', async () => {
+      newRegen.disabled = true;
+      newRegen.textContent = 'Regenerating...';
+      try {
+        sessionToken = await requestHostSessionToken(hostSubjectCode);
+        renderHostJoinQRCode(buildPlayerJoinURL(hostSubjectCode, sessionToken));
+      } catch (e) {
+        console.error('Could not regenerate QR code', e);
+      } finally {
+        newRegen.disabled = false;
+        newRegen.textContent = 'Regenerate QR Code';
+      }
+    });
+  }
 
   const startBtn = $('#btn-start-game');
   const newStart = startBtn.cloneNode(true);
