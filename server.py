@@ -1962,6 +1962,67 @@ async def push_room_update(room: GameRoom) -> None:
     await broadcast_to_players(room, payload)
 
 
+def mark_unanswered_players(room: GameRoom) -> None:
+    for vid in room.players:
+        if vid not in room.answers_this_round:
+            room.players[vid]["streak"] = 0
+            room.players[vid]["answers"].append({
+                "q": room.current_q,
+                "choice": -1,
+                "correct": False,
+                "points": 0,
+                "time": 0
+            })
+
+
+async def sync_answer_count(room: GameRoom) -> None:
+    if room.phase != "question":
+        return
+    answered_count = len(room.answers_this_round)
+    total_connected = sum(1 for _, player in room.players.items() if player.get("ws") is not None)
+    await send_to_host(room, {
+        "type": "answer_count",
+        "answered": answered_count,
+        "total": total_connected
+    })
+
+
+async def maybe_finish_question_early(room: GameRoom) -> None:
+    if room.phase != "question":
+        return
+    answered_count = len(room.answers_this_round)
+    total_connected = sum(1 for _, player in room.players.items() if player.get("ws") is not None)
+    if answered_count >= total_connected and total_connected > 0:
+        if room.question_timer_task and not room.question_timer_task.done():
+            room.question_timer_task.cancel()
+        mark_unanswered_players(room)
+        await auto_reveal(room)
+
+
+async def kick_player_from_room(room: GameRoom, player_id: str, *, message: str) -> bool:
+    player = room.players.pop(player_id, None)
+    if not player:
+        return False
+    room.answers_this_round.pop(player_id, None)
+    ws = player.get("ws")
+    if ws is not None:
+        try:
+            await ws.send_text(json.dumps({
+                "type": "kicked",
+                "message": message
+            }))
+        except Exception:
+            pass
+        try:
+            await ws.close(code=4002)
+        except Exception:
+            pass
+    await push_room_update(room)
+    await sync_answer_count(room)
+    await maybe_finish_question_early(room)
+    return True
+
+
 async def cancel_question_timer(room: GameRoom) -> None:
     if room.question_timer_task and not room.question_timer_task.done():
         room.question_timer_task.cancel()
@@ -2169,6 +2230,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 if role == "host" and room is not None:
                     await force_end_game(room)
 
+            elif action == "kick_player":
+                if role != "host" or room is None:
+                    continue
+                player_id = (msg.get("playerId") or "").strip()
+                if not player_id:
+                    continue
+                await kick_player_from_room(
+                    room,
+                    player_id,
+                    message="The lecturer removed you from this session."
+                )
+
             elif action == "ping":
                 await websocket.send_text(json.dumps({"type": "pong"}))
 
@@ -2336,27 +2409,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     "correctAnswer": q["correct"],
                     "explanation": q["explanation"]
                 }))
-                answered_count = len(room.answers_this_round)
-                total_connected = sum(1 for _, player in room.players.items() if player.get("ws") is not None)
-                await send_to_host(room, {
-                    "type": "answer_count",
-                    "answered": answered_count,
-                    "total": total_connected
-                })
-                if answered_count >= total_connected and total_connected > 0:
-                    if room.question_timer_task and not room.question_timer_task.done():
-                        room.question_timer_task.cancel()
-                    for vid2 in room.players:
-                        if vid2 not in room.answers_this_round:
-                            room.players[vid2]["streak"] = 0
-                            room.players[vid2]["answers"].append({
-                                "q": room.current_q,
-                                "choice": -1,
-                                "correct": False,
-                                "points": 0,
-                                "time": 0
-                            })
-                    await auto_reveal(room)
+                await sync_answer_count(room)
+                await maybe_finish_question_early(room)
 
     except WebSocketDisconnect:
         if role == "host" and room:
@@ -2414,16 +2468,7 @@ async def send_question(room: GameRoom) -> None:
             if not room.paused:
                 elapsed += 0.5
         if room.phase == "question" and room.current_q == q_index:
-            for vid in room.players:
-                if vid not in room.answers_this_round:
-                    room.players[vid]["streak"] = 0
-                    room.players[vid]["answers"].append({
-                        "q": room.current_q,
-                        "choice": -1,
-                        "correct": False,
-                        "points": 0,
-                        "time": 0
-                    })
+            mark_unanswered_players(room)
             await auto_reveal(room)
 
     room.question_timer_task = asyncio.create_task(_timer())

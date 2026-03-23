@@ -679,6 +679,19 @@ function handlePlayerMessage(msg) {
       closeWS({ reconnect: false });
       showPlayerJoinScreen();
       break;
+    case 'kicked': {
+      closeWS({ reconnect: false });
+      myPlayerId = null;
+      myPlayerName = '';
+      myStudentNumber = '';
+      showPlayerJoinScreen();
+      const errEl = $('#name-error');
+      if (errEl) {
+        errEl.textContent = msg.message || 'The lecturer removed you from this session.';
+        errEl.hidden = false;
+      }
+      break;
+    }
   }
 }
 
@@ -2097,10 +2110,22 @@ function updateHostLobby(players, activeTest = selectedTest) {
   players.forEach((p) => {
     const el = document.createElement('div');
     el.className = 'host-player-item';
+    const actionLabel = p.connected ? 'Kick' : 'Remove';
     el.innerHTML = `
       <span class="host-player-dot ${p.connected ? 'connected' : 'disconnected'}"></span>
       <span class="host-player-name-text">${escapeHtml(p.name)}</span>
+      <button type="button" class="host-player-kick-btn">${actionLabel}</button>
     `;
+    const kickBtn = el.querySelector('.host-player-kick-btn');
+    if (kickBtn) {
+      kickBtn.addEventListener('click', () => {
+        const prompt = p.connected
+          ? `Kick ${p.name} out of this session?`
+          : `Remove ${p.name} from this session?`;
+        if (!confirm(prompt)) return;
+        send({ action: 'kick_player', playerId: p.id });
+      });
+    }
     list.appendChild(el);
   });
 }
