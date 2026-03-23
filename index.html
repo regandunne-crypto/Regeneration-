@@ -64,6 +64,22 @@
     </div>
   </div>
 
+  <!-- PLAYER: Game code entry -->
+  <div id="screen-game-code" class="screen">
+    <div class="join-container">
+      <div class="logo-area">
+        <h2 class="join-subject-title" id="code-subject-title"></h2>
+        <p class="join-subject-code">Enter the code shown on the screen</p>
+      </div>
+      <div class="join-form">
+        <label for="game-code-input" class="input-label">4-digit code</label>
+        <input type="tel" id="game-code-input" class="nickname-input" placeholder="e.g. 4827" maxlength="4" autocomplete="off" inputmode="numeric" pattern="[0-9]*">
+        <p id="game-code-error" class="name-error" hidden></p>
+        <button id="btn-submit-game-code" class="btn btn-primary" disabled>Join Game</button>
+      </div>
+    </div>
+  </div>
+
   <!-- PLAYER: Waiting in lobby -->
   <div id="screen-lobby-player" class="screen">
     <div class="lobby-player-container">
@@ -325,6 +341,9 @@
         <label class="shuffle-toggle">
           <input type="checkbox" id="chk-shuffle-questions"> Shuffle question order
         </label>
+        <label class="shuffle-toggle">
+          <input type="checkbox" id="chk-use-game-code"> Require entry code
+        </label>
         <button id="btn-start-game" class="btn btn-primary btn-large" disabled>Start Game</button>
         <button id="btn-download-stats" class="btn btn-secondary btn-stats" hidden>Download Previous Stats</button>
         <button id="btn-change-test" class="btn btn-secondary">Change Test</button>
@@ -332,9 +351,21 @@
     </div>
   </div>
 
+  <!-- HOST: Game code display (20-second countdown) -->
+  <div id="screen-host-game-code" class="screen">
+    <div class="host-game-code-container">
+      <p class="host-game-code-label">Entry Code</p>
+      <div class="host-game-code-display" id="host-game-code-display">----</div>
+      <p class="host-code-countdown" id="host-code-countdown">Game starts in 20s</p>
+    </div>
+  </div>
+
   <!-- HOST: Question view -->
   <div id="screen-host-question" class="screen">
     <div class="host-question-container">
+      <div class="host-game-code-bar" hidden>
+        Code: <span class="host-game-code-persistent-value"></span>
+      </div>
       <div class="host-q-header">
         <span class="host-q-num" id="host-q-num">Q1 / 15</span>
         <span class="host-timer" id="host-timer">30</span>
@@ -358,6 +389,9 @@
   <!-- HOST: Reveal + Leaderboard -->
   <div id="screen-host-reveal" class="screen">
     <div class="host-reveal-container">
+      <div class="host-game-code-bar" hidden>
+        Code: <span class="host-game-code-persistent-value"></span>
+      </div>
       <div class="host-reveal-top">
         <div class="host-reveal-answer-panel">
           <h3 class="host-reveal-section-title">Correct Answer</h3>

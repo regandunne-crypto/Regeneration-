@@ -388,6 +388,39 @@ input { font: inherit; color: inherit; }
   gap: var(--space-3);
 }
 
+.host-game-code-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-6);
+  width: 100%;
+  min-height: 60vh;
+}
+
+.host-game-code-label {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.host-game-code-display {
+  font-family: var(--font-display);
+  font-size: clamp(5rem, 20vw, 12rem);
+  font-weight: 700;
+  color: var(--accent-yellow);
+  letter-spacing: 0.2em;
+  text-shadow: 0 0 40px rgba(241, 196, 15, 0.4);
+}
+
+.host-code-countdown {
+  font-size: var(--text-lg);
+  color: var(--color-text-muted);
+  font-weight: 500;
+}
+
 .shuffle-toggle {
   display: inline-flex;
   align-items: center;
@@ -1229,6 +1262,27 @@ input { font: inherit; color: inherit; }
   align-items: center;
   gap: var(--space-6);
   padding: var(--space-8) var(--space-4);
+}
+
+.host-game-code-bar {
+  background: rgba(241, 196, 15, 0.12);
+  border: 1px solid rgba(241, 196, 15, 0.3);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-align: center;
+  margin-bottom: var(--space-3);
+}
+
+.host-game-code-persistent-value {
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: 700;
+  color: var(--accent-yellow);
+  letter-spacing: 0.15em;
+  margin-left: var(--space-2);
 }
 
 .host-q-header {

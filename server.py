@@ -1143,6 +1143,8 @@ class GameRoom:
         self.total_q = 0
         self.session_name = ""
         self.current_token = ""
+        self.game_code = ""
+        self.game_code_enabled = False
         self.reset_runtime_state(clear_players=True)
 
     def set_active_test(self, test_data: dict[str, Any] | None) -> None:
@@ -1156,6 +1158,8 @@ class GameRoom:
         self.phase = "lobby"
         self.current_q = 0
         self.question_start_time = 0
+        self.game_code = ""
+        self.game_code_enabled = False
         if clear_players:
             self.players = {}
             self.current_token = ""
@@ -1190,7 +1194,7 @@ class GameRoom:
 
 rooms: dict[str, GameRoom] = {code: GameRoom(code) for code in SUBJECTS}
 session_tokens: dict[str, dict[str, Any]] = {}
-SESSION_TOKEN_TTL = 60 * 20
+SESSION_TOKEN_TTL = 60 * 90
 SESSION_TOKEN_LENGTH = 6
 SESSION_TOKEN_ALPHABET = string.ascii_uppercase + string.digits
 
@@ -1240,6 +1244,11 @@ def get_room_active_token(room: GameRoom | None) -> str:
     if lookup_session_token(token) == room.subject_code:
         return token
     return ""
+
+
+def generate_game_code() -> str:
+    """Generate a random 4-digit numeric code."""
+    return f"{secrets.randbelow(9000) + 1000}"
 
 
 async def _cleanup_expired_tokens() -> None:
@@ -1966,6 +1975,11 @@ async def cancel_question_timer(room: GameRoom) -> None:
 
 
 async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
+    active_token = get_room_active_token(room)
+    if active_token:
+        consume_session_token(active_token)
+    room.game_code = ""
+    room.game_code_enabled = False
     await cancel_question_timer(room)
     room.phase = "lobby"
     room.current_q = 0
@@ -2002,6 +2016,8 @@ async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
         "subjectCode": room.subject_code,
         "subjectName": room.subject_name,
         "selectedTest": get_active_test_meta(room),
+        "gameCode": room.game_code,
+        "gameCodeEnabled": room.game_code_enabled,
         "hasQuestions": room.total_q > 0,
         "hasStats": room.last_game_stats is not None
     })
@@ -2009,6 +2025,11 @@ async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
 
 
 async def force_end_game(room: GameRoom) -> None:
+    active_token = get_room_active_token(room)
+    if active_token:
+        consume_session_token(active_token)
+    room.game_code = ""
+    room.game_code_enabled = False
     await cancel_question_timer(room)
     room.phase = "final"
     room.archive_stats()
@@ -2079,6 +2100,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     "subjectCode": room.subject_code,
                     "subjectName": room.subject_name,
                     "selectedTest": get_active_test_meta(room),
+                    "gameCode": room.game_code,
+                    "gameCodeEnabled": room.game_code_enabled,
                     "hasQuestions": room.total_q > 0,
                     "hasStats": room.last_game_stats is not None
                 }))
@@ -2090,9 +2113,20 @@ async def websocket_endpoint(websocket: WebSocket):
                 if room.total_q == 0:
                     await websocket.send_text(json.dumps({"type": "error", "message": "No questions loaded for this test."}))
                     continue
-                active_token = get_room_active_token(room)
-                if active_token:
-                    consume_session_token(active_token)
+                use_code = msg.get("useCode", False)
+                if use_code:
+                    room.game_code = generate_game_code()
+                    room.game_code_enabled = True
+                else:
+                    room.game_code = ""
+                    room.game_code_enabled = False
+                if room.game_code_enabled:
+                    await send_to_host(room, {
+                        "type": "game_code_display",
+                        "code": room.game_code,
+                        "countdown": 20
+                    })
+                    await asyncio.sleep(20)
                 room.paused = False
                 import random
                 if msg.get("shuffle"):
@@ -2155,6 +2189,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     }))
                     continue
                 room = rooms[subject_code]
+                if room.game_code_enabled:
+                    provided_code = (msg.get("gameCode") or "").strip()
+                    student_number_for_check = (msg.get("studentNumber") or "").strip()
+                    is_reconnect = any(
+                        student_number_for_check and p.get("student_number") == student_number_for_check
+                        for p in room.players.values()
+                    )
+                    if not is_reconnect and provided_code != room.game_code:
+                        await websocket.send_text(json.dumps({
+                            "type": "error_game_code",
+                            "message": "Incorrect code. Please check the screen and try again."
+                        }))
+                        continue
                 name = msg.get("name", "Anonymous").strip()[:20]
                 student_number = msg.get("studentNumber", "").strip()[:20]
                 name_lower = name.lower()
@@ -2176,16 +2223,16 @@ async def websocket_endpoint(websocket: WebSocket):
                             break
                 required_room_token = (room.current_token or "").strip().upper()
                 is_known_player = visitor_id in room.players or existing_player is not None
-                if not subject_code_from_token and required_room_token and not is_known_player:
+                if required_room_token and not subject_code_from_token:
                     await websocket.send_text(json.dumps({
                         "type": "error",
                         "message": "This session link has expired or is invalid. Ask your lecturer for the current QR code."
                     }))
                     continue
-                if not subject_code_from_token and room.phase != "lobby" and not is_known_player:
+                if room.phase != "lobby" and not is_known_player:
                     await websocket.send_text(json.dumps({
                         "type": "error",
-                        "message": "This session has already started. Ask your lecturer for the current QR code before joining."
+                        "message": "The game is already in progress. You cannot join as a new player at this stage."
                     }))
                     continue
                 if subject_code_from_token and room.current_token != token:

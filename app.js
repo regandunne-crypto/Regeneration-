@@ -56,6 +56,8 @@ let selectedSubject = null;
 let selectedTest = null;
 let sessionName = '';
 let sessionToken = '';
+let hostGameCode = '';
+let hostGameCodeCountdownInterval = null;
 let storageInfo = null;
 let lecturerSession = null;
 let hostSubjectCode = null;
@@ -177,7 +179,43 @@ function showPlayerJoinError(message, { expired = false } = {}) {
     if (expiredMsg) expiredMsg.textContent = text;
     return;
   }
+  const codeScreen = $('#screen-game-code');
+  if (codeScreen && codeScreen.classList.contains('active')) {
+    showGameCodeError(text);
+    return;
+  }
   showScreen('screen-join');
+}
+
+function showGameCodeError(message) {
+  const text = message || 'Incorrect code.';
+  const errEl = $('#game-code-error');
+  if (errEl) {
+    errEl.textContent = text;
+    errEl.hidden = false;
+  }
+  const btn = $('#btn-submit-game-code');
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = 'Join Game';
+  }
+}
+
+function clearHostGameCodeCountdown() {
+  if (hostGameCodeCountdownInterval) {
+    clearInterval(hostGameCodeCountdownInterval);
+    hostGameCodeCountdownInterval = null;
+  }
+}
+
+function setHostGameCode(code = '') {
+  hostGameCode = code || '';
+  document.querySelectorAll('.host-game-code-persistent-value').forEach((el) => {
+    el.textContent = hostGameCode;
+  });
+  document.querySelectorAll('.host-game-code-bar').forEach((bar) => {
+    bar.hidden = !hostGameCode;
+  });
 }
 
 function handleMessage(msg) {
@@ -445,6 +483,60 @@ function showPlayerJoinScreen() {
   nameInput.focus();
 }
 
+function showGameCodeScreen() {
+  showScreen('screen-game-code');
+  $('#code-subject-title').textContent = selectedSubject ? selectedSubject.name : '';
+  const input = $('#game-code-input');
+  const btn = $('#btn-submit-game-code');
+  const errEl = $('#game-code-error');
+  input.value = '';
+  btn.disabled = true;
+  btn.textContent = 'Join Game';
+  if (errEl) {
+    errEl.hidden = true;
+    errEl.textContent = '';
+  }
+
+  input.oninput = () => {
+    input.value = input.value.replace(/\D+/g, '').slice(0, 4);
+    btn.disabled = input.value.trim().length !== 4;
+  };
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter' && input.value.trim().length === 4) {
+      submitGameCode();
+    }
+  };
+  btn.onclick = submitGameCode;
+  setTimeout(() => input.focus(), 100);
+}
+
+function submitGameCode() {
+  const input = $('#game-code-input');
+  input.value = input.value.replace(/\D+/g, '').slice(0, 4);
+  const code = input.value.trim();
+  if (code.length !== 4) return;
+  const errEl = $('#game-code-error');
+  if (errEl) errEl.hidden = true;
+  const btn = $('#btn-submit-game-code');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Joining...';
+  }
+  const payload = {
+    action: 'player_join',
+    name: myPlayerName,
+    studentNumber: myStudentNumber,
+    subject: selectedSubject.code,
+    token: sessionToken || '',
+    gameCode: code
+  };
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    send(payload);
+  } else {
+    connectWS(() => send(payload));
+  }
+}
+
 function joinAsPlayer() {
   const name = $('#nickname-input').value.trim();
   const studentNum = $('#student-number-input').value.trim();
@@ -462,7 +554,8 @@ function joinAsPlayer() {
       name: myPlayerName,
       studentNumber: myStudentNumber,
       subject: selectedSubject.code,
-      token: sessionToken || ''
+      token: sessionToken || '',
+      gameCode: ''
     });
   });
 }
@@ -494,6 +587,16 @@ function handlePlayerMessage(msg) {
       $('#btn-join').textContent = 'Join Game';
       $('#nickname-input').focus();
       $('#nickname-input').select();
+      break;
+    }
+    case 'error_game_code': {
+      const codeScreen = $('#screen-game-code');
+      if (!codeScreen || !codeScreen.classList.contains('active')) {
+        showGameCodeScreen();
+      }
+      showGameCodeError(msg.message || 'Incorrect code.');
+      $('#btn-join').disabled = false;
+      $('#btn-join').textContent = 'Join Game';
       break;
     }
     case 'joined': {
@@ -795,6 +898,8 @@ async function enterHostArea() {
 
 function resetToStudentView() {
   if (ws) closeWS({ reconnect: false });
+  clearHostGameCodeCountdown();
+  setHostGameCode('');
   isHost = false;
   selectedTest = null;
   sessionName = '';
@@ -1708,6 +1813,8 @@ async function startHostForTest(testSummary) {
   selectedTest = testSummary;
   sessionName = (sessionName || getDefaultSessionName(testSummary)).trim().slice(0, 80);
   sessionToken = '';
+  clearHostGameCodeCountdown();
+  setHostGameCode('');
   statsAutoDownloaded = false;
   hideSessionNameModal();
   showScreen('screen-host-lobby');
@@ -1758,7 +1865,8 @@ async function startHostForTest(testSummary) {
   newStart.addEventListener('click', () => {
     send({
       action: 'start_game',
-      shuffle: $('#chk-shuffle-questions') ? $('#chk-shuffle-questions').checked : false
+      shuffle: $('#chk-shuffle-questions') ? $('#chk-shuffle-questions').checked : false,
+      useCode: $('#chk-use-game-code') ? $('#chk-use-game-code').checked : false
     });
     newStart.disabled = true;
     newStart.textContent = 'Starting...';
@@ -1885,6 +1993,12 @@ function downloadTestsBackup(buttonEl) {
 function handleHostMessage(msg) {
   switch (msg.type) {
     case 'host_joined':
+      clearHostGameCodeCountdown();
+      if (msg.gameCodeEnabled && msg.gameCode) {
+        setHostGameCode(msg.gameCode);
+      } else {
+        setHostGameCode('');
+      }
       if (msg.selectedTest) {
         selectedTest = { ...selectedTest, ...msg.selectedTest };
         updateHostLobbyHeading();
@@ -1897,6 +2011,9 @@ function handleHostMessage(msg) {
         startBtn.disabled = true;
         startBtn.textContent = 'This test has no questions';
       }
+      break;
+    case 'game_code_display':
+      hostShowGameCode(msg.code, msg.countdown);
       break;
     case 'player_update':
       if (msg.activeTest) {
@@ -1989,7 +2106,11 @@ function updateHostLobby(players, activeTest = selectedTest) {
 }
 
 function hostGetReady(qNum, totalQ) {
+  clearHostGameCodeCountdown();
   showScreen('screen-host-question');
+  document.querySelectorAll('.host-game-code-bar').forEach((bar) => {
+    bar.hidden = !hostGameCode;
+  });
   $('#host-q-num').textContent = `Q${qNum} / ${totalQ}`;
   $('#host-timer').textContent = '...';
   $('#host-q-text').textContent = 'Get Ready...';
@@ -2000,7 +2121,11 @@ function hostGetReady(qNum, totalQ) {
 }
 
 function hostShowQuestion(msg) {
+  clearHostGameCodeCountdown();
   showScreen('screen-host-question');
+  document.querySelectorAll('.host-game-code-bar').forEach((bar) => {
+    bar.hidden = !hostGameCode;
+  });
   $('#host-q-num').textContent = `Q${msg.qNum} / ${msg.totalQ}`;
   $('#host-q-text').textContent = msg.question;
   $('#host-answered-count').textContent = '0';
@@ -2033,11 +2158,15 @@ function hostShowQuestion(msg) {
 }
 
 function hostShowReveal(msg) {
+  clearHostGameCodeCountdown();
   if (hostTimerInterval) {
     clearInterval(hostTimerInterval);
     hostTimerInterval = null;
   }
   showScreen('screen-host-reveal');
+  document.querySelectorAll('.host-game-code-bar').forEach((bar) => {
+    bar.hidden = !hostGameCode;
+  });
   const answerEl = $('#host-reveal-answer');
   const correctIdx = msg.correctAnswer !== undefined ? msg.correctAnswer : hostCorrectAnswer;
   const correctText = hostCurrentOptions[correctIdx] || '';
@@ -2069,6 +2198,8 @@ function hostShowReveal(msg) {
 }
 
 function hostShowFinal(lb) {
+  clearHostGameCodeCountdown();
+  setHostGameCode('');
   if (hostTimerInterval) {
     clearInterval(hostTimerInterval);
     hostTimerInterval = null;
@@ -2076,6 +2207,24 @@ function hostShowFinal(lb) {
   showScreen('screen-host-final');
   renderPodium($('#host-final-podium'), lb);
   renderFullList($('#host-final-list'), lb.slice(3), null, 4);
+}
+
+function hostShowGameCode(code, countdown) {
+  clearHostGameCodeCountdown();
+  setHostGameCode(code || '');
+  showScreen('screen-host-game-code');
+  $('#host-game-code-display').textContent = code || '----';
+  let remaining = countdown;
+  $('#host-code-countdown').textContent = `Game starts in ${remaining}s`;
+  hostGameCodeCountdownInterval = setInterval(() => {
+    remaining -= 1;
+    if (remaining <= 0) {
+      clearHostGameCodeCountdown();
+      $('#host-code-countdown').textContent = 'Game starting...';
+    } else {
+      $('#host-code-countdown').textContent = `Game starts in ${remaining}s`;
+    }
+  }, 1000);
 }
 
 // ════════════════════════════════════════════════════════════
