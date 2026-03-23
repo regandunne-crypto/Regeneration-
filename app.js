@@ -74,6 +74,7 @@ let hostCurrentOptions = [];
 let hostCurrentQuestion = '';
 let hostTimeLeft = TIME_PER_Q;
 let playerAnswered = false;
+let playerNeedsGameCode = false;
 let statsAutoDownloaded = false;
 
 const SUBJECT_COLORS = {
@@ -197,7 +198,18 @@ function showGameCodeError(message) {
   const btn = $('#btn-submit-game-code');
   if (btn) {
     btn.disabled = false;
-    btn.textContent = 'Join Game';
+    btn.textContent = myPlayerId ? 'Continue' : 'Join Game';
+  }
+}
+
+function getGameCodeSubmitLabel() {
+  return myPlayerId ? 'Continue' : 'Join Game';
+}
+
+function ensureGameCodeScreen() {
+  const codeScreen = $('#screen-game-code');
+  if (!codeScreen || !codeScreen.classList.contains('active')) {
+    showGameCodeScreen();
   }
 }
 
@@ -424,6 +436,7 @@ async function initPlayer() {
 }
 
 function showPlayerJoinScreen() {
+  playerNeedsGameCode = false;
   showScreen('screen-join');
   $('#join-subject-title').textContent = selectedSubject.name;
   $('#join-subject-code').textContent = selectedSubject.code;
@@ -484,6 +497,8 @@ function showPlayerJoinScreen() {
 }
 
 function showGameCodeScreen() {
+  playerNeedsGameCode = true;
+  clearTimer();
   showScreen('screen-game-code');
   $('#code-subject-title').textContent = selectedSubject ? selectedSubject.name : '';
   const input = $('#game-code-input');
@@ -491,7 +506,7 @@ function showGameCodeScreen() {
   const errEl = $('#game-code-error');
   input.value = '';
   btn.disabled = true;
-  btn.textContent = 'Join Game';
+  btn.textContent = getGameCodeSubmitLabel();
   if (errEl) {
     errEl.hidden = true;
     errEl.textContent = '';
@@ -520,9 +535,9 @@ function submitGameCode() {
   const btn = $('#btn-submit-game-code');
   if (btn) {
     btn.disabled = true;
-    btn.textContent = 'Joining...';
+    btn.textContent = myPlayerId ? 'Continuing...' : 'Joining...';
   }
-  const payload = {
+  const joinPayload = {
     action: 'player_join',
     name: myPlayerName,
     studentNumber: myStudentNumber,
@@ -530,10 +545,15 @@ function submitGameCode() {
     token: sessionToken || '',
     gameCode: code
   };
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    send(payload);
+  if (myPlayerId && ws && ws.readyState === WebSocket.OPEN) {
+    send({
+      action: 'verify_game_code',
+      gameCode: code
+    });
+  } else if (ws && ws.readyState === WebSocket.OPEN) {
+    send(joinPayload);
   } else {
-    connectWS(() => send(payload));
+    connectWS(() => send(joinPayload));
   }
 }
 
@@ -590,16 +610,17 @@ function handlePlayerMessage(msg) {
       break;
     }
     case 'error_game_code': {
-      const codeScreen = $('#screen-game-code');
-      if (!codeScreen || !codeScreen.classList.contains('active')) {
-        showGameCodeScreen();
-      }
+      ensureGameCodeScreen();
       showGameCodeError(msg.message || 'Incorrect code.');
       $('#btn-join').disabled = false;
       $('#btn-join').textContent = 'Join Game';
       break;
     }
+    case 'game_code_required':
+      ensureGameCodeScreen();
+      break;
     case 'joined': {
+      playerNeedsGameCode = false;
       myPlayerId = msg.playerId;
       history.pushState({ quizActive: true }, '', location.href);
       $('#lobby-player-name').textContent = myPlayerName;
@@ -626,15 +647,26 @@ function handlePlayerMessage(msg) {
       break;
     }
     case 'player_update':
+      if (playerNeedsGameCode) {
+        ensureGameCodeScreen();
+      }
       if (msg.players) $('#lobby-p-count').textContent = msg.players.length;
       if (selectedSubject) {
         $('#lobby-subject-badge').textContent = formatActiveTestLabel(selectedSubject, msg.activeTest);
       }
       break;
     case 'get_ready':
+      if (playerNeedsGameCode) {
+        ensureGameCodeScreen();
+        break;
+      }
       playerGetReady(msg.qNum, msg.totalQ);
       break;
     case 'question':
+      if (playerNeedsGameCode) {
+        ensureGameCodeScreen();
+        break;
+      }
       playerShowQuestion(msg);
       break;
     case 'answer_result':
@@ -671,6 +703,7 @@ function handlePlayerMessage(msg) {
       playerShowFinal(msg.leaderboard);
       break;
     case 'reset':
+      playerNeedsGameCode = false;
       if (typeof msg.playerCount === 'number') $('#lobby-p-count').textContent = msg.playerCount;
       if (selectedSubject) $('#lobby-subject-badge').textContent = formatActiveTestLabel(selectedSubject, msg.activeTest);
       showScreen('screen-lobby-player');
