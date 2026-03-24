@@ -1907,9 +1907,63 @@ def get_active_test_meta(room: GameRoom) -> dict[str, Any] | None:
     }
 
 
-def get_player_list(room: GameRoom) -> list[dict[str, Any]]:
+def is_participating_player(room: GameRoom, player: dict[str, Any] | None) -> bool:
+    if not room.game_code_enabled:
+        return True
+    return bool(player and player.get("game_code_verified"))
+
+
+def find_existing_player(
+    room: GameRoom,
+    *,
+    visitor_id: str,
+    name: str,
+    student_number: str
+) -> tuple[str | None, dict[str, Any] | None]:
+    name_lower = name.lower()
+    match_by_student = bool(student_number)
+    for vid, player in room.players.items():
+        if vid == visitor_id:
+            continue
+        if match_by_student:
+            if player.get("student_number") == student_number:
+                return vid, player
+        elif player.get("name", "").lower() == name_lower:
+            return vid, player
+    return None, None
+
+
+def build_joined_payload(room: GameRoom, visitor_id: str) -> dict[str, Any]:
+    joined_payload = {
+        "type": "joined",
+        "phase": room.phase,
+        "playerId": visitor_id,
+        "playerCount": len(room.players),
+        "activeTest": get_active_test_meta(room)
+    }
+    if room.phase == "question":
+        q = room.questions[room.current_q]
+        elapsed = time.time() - room.question_start_time
+        remaining = max(0, TIME_PER_Q - elapsed)
+        joined_payload["currentQuestion"] = {
+            "question": q["q"],
+            "options": q["options"],
+            "qNum": room.current_q + 1,
+            "totalQ": room.total_q,
+            "timeLimit": TIME_PER_Q,
+            "remaining": round(remaining, 2)
+        }
+        joined_payload["alreadyAnswered"] = visitor_id in room.answers_this_round
+    elif room.phase in ("reveal", "get_ready", "final"):
+        joined_payload["phase"] = room.phase
+    return joined_payload
+
+
+def get_player_list(room: GameRoom, *, participant_only: bool = False) -> list[dict[str, Any]]:
     players = []
     for vid, p in room.players.items():
+        if participant_only and not is_participating_player(room, p):
+            continue
         players.append({
             "id": vid,
             "name": p["name"],
@@ -1920,14 +1974,14 @@ def get_player_list(room: GameRoom) -> list[dict[str, Any]]:
     return players
 
 
-def get_leaderboard(room: GameRoom) -> list[dict[str, Any]]:
-    players = get_player_list(room)
+def get_leaderboard(room: GameRoom, *, participant_only: bool = False) -> list[dict[str, Any]]:
+    players = get_player_list(room, participant_only=participant_only)
     for i, p in enumerate(players):
         p["rank"] = i + 1
     return players
 
 
-async def broadcast_to_players(room: GameRoom, msg: dict[str, Any]) -> None:
+async def broadcast_to_players(room: GameRoom, msg: dict[str, Any], *, participant_only: bool = False) -> None:
     async def _safe_send(ws: WebSocket):
         try:
             await ws.send_text(json.dumps(msg))
@@ -1936,6 +1990,26 @@ async def broadcast_to_players(room: GameRoom, msg: dict[str, Any]) -> None:
 
     tasks = []
     for _, player in list(room.players.items()):
+        if participant_only and not is_participating_player(room, player):
+            continue
+        ws = player.get("ws")
+        if ws is not None:
+            tasks.append(_safe_send(ws))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def broadcast_to_selected_players(room: GameRoom, msg: dict[str, Any], player_ids: set[str]) -> None:
+    async def _safe_send(ws: WebSocket):
+        try:
+            await ws.send_text(json.dumps(msg))
+        except Exception:
+            pass
+
+    tasks = []
+    for vid, player in list(room.players.items()):
+        if vid not in player_ids:
+            continue
         ws = player.get("ws")
         if ws is not None:
             tasks.append(_safe_send(ws))
@@ -1964,6 +2038,8 @@ async def push_room_update(room: GameRoom) -> None:
 
 def mark_unanswered_players(room: GameRoom) -> None:
     for vid in room.players:
+        if not is_participating_player(room, room.players.get(vid)):
+            continue
         if vid not in room.answers_this_round:
             room.players[vid]["streak"] = 0
             room.players[vid]["answers"].append({
@@ -1979,7 +2055,11 @@ async def sync_answer_count(room: GameRoom) -> None:
     if room.phase != "question":
         return
     answered_count = len(room.answers_this_round)
-    total_connected = sum(1 for _, player in room.players.items() if player.get("ws") is not None)
+    total_connected = sum(
+        1
+        for _, player in room.players.items()
+        if player.get("ws") is not None and is_participating_player(room, player)
+    )
     await send_to_host(room, {
         "type": "answer_count",
         "answered": answered_count,
@@ -1991,7 +2071,11 @@ async def maybe_finish_question_early(room: GameRoom) -> None:
     if room.phase != "question":
         return
     answered_count = len(room.answers_this_round)
-    total_connected = sum(1 for _, player in room.players.items() if player.get("ws") is not None)
+    total_connected = sum(
+        1
+        for _, player in room.players.items()
+        if player.get("ws") is not None and is_participating_player(room, player)
+    )
     if answered_count >= total_connected and total_connected > 0:
         if room.question_timer_task and not room.question_timer_task.done():
             room.question_timer_task.cancel()
@@ -2086,6 +2170,11 @@ async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
 
 
 async def force_end_game(room: GameRoom) -> None:
+    lb = get_leaderboard(room, participant_only=True)
+    participant_ids = {
+        vid for vid, player in room.players.items()
+        if is_participating_player(room, player)
+    }
     active_token = get_room_active_token(room)
     if active_token:
         consume_session_token(active_token)
@@ -2094,8 +2183,7 @@ async def force_end_game(room: GameRoom) -> None:
     await cancel_question_timer(room)
     room.phase = "final"
     room.archive_stats()
-    lb = get_leaderboard(room)
-    await broadcast_to_players(room, {"type": "final", "leaderboard": lb})
+    await broadcast_to_selected_players(room, {"type": "final", "leaderboard": lb}, participant_ids)
     await send_to_host(room, {"type": "final", "leaderboard": lb, "hasStats": True})
 
 
@@ -2178,13 +2266,21 @@ async def websocket_endpoint(websocket: WebSocket):
                 if use_code:
                     room.game_code = generate_game_code()
                     room.game_code_enabled = True
+                    for player in room.players.values():
+                        player["game_code_verified"] = False
                 else:
                     room.game_code = ""
                     room.game_code_enabled = False
+                    for player in room.players.values():
+                        player["game_code_verified"] = True
                 if room.game_code_enabled:
                     await send_to_host(room, {
                         "type": "game_code_display",
                         "code": room.game_code,
+                        "countdown": 20
+                    })
+                    await broadcast_to_players(room, {
+                        "type": "game_code_required",
                         "countdown": 20
                     })
                     await asyncio.sleep(20)
@@ -2198,7 +2294,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     room.players[vid]["score"] = 0
                     room.players[vid]["streak"] = 0
                     room.players[vid]["answers"] = []
-                await broadcast_to_players(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q})
+                await broadcast_to_players(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q}, participant_only=True)
                 await send_to_host(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q})
                 await asyncio.sleep(3)
                 await send_question(room)
@@ -2262,44 +2358,32 @@ async def websocket_endpoint(websocket: WebSocket):
                     }))
                     continue
                 room = rooms[subject_code]
-                if room.game_code_enabled:
-                    provided_code = (msg.get("gameCode") or "").strip()
-                    student_number_for_check = (msg.get("studentNumber") or "").strip()
-                    is_reconnect = any(
-                        student_number_for_check and p.get("student_number") == student_number_for_check
-                        for p in room.players.values()
-                    )
-                    if not is_reconnect and provided_code != room.game_code:
-                        await websocket.send_text(json.dumps({
-                            "type": "error_game_code",
-                            "message": "Incorrect code. Please check the screen and try again."
-                        }))
-                        continue
                 name = msg.get("name", "Anonymous").strip()[:20]
                 student_number = msg.get("studentNumber", "").strip()[:20]
-                name_lower = name.lower()
-                existing_vid = None
-                existing_player = None
-                match_by_student = bool(student_number)
-                for vid, player in room.players.items():
-                    if vid == visitor_id:
-                        continue
-                    if match_by_student:
-                        if player.get("student_number") == student_number:
-                            existing_vid = vid
-                            existing_player = player
-                            break
-                    else:
-                        if player.get("name", "").lower() == name_lower:
-                            existing_vid = vid
-                            existing_player = player
-                            break
+                provided_code = (msg.get("gameCode") or "").strip()
+                existing_vid, existing_player = find_existing_player(
+                    room,
+                    visitor_id=visitor_id,
+                    name=name,
+                    student_number=student_number
+                )
                 required_room_token = (room.current_token or "").strip().upper()
                 is_known_player = visitor_id in room.players or existing_player is not None
                 if required_room_token and not subject_code_from_token:
                     await websocket.send_text(json.dumps({
                         "type": "error",
                         "message": "This session link has expired or is invalid. Ask your lecturer for the current QR code."
+                    }))
+                    continue
+                current_player = room.players.get(visitor_id)
+                can_bypass_game_code = (
+                    is_participating_player(room, existing_player)
+                    or is_participating_player(room, current_player)
+                )
+                if room.game_code_enabled and not can_bypass_game_code and provided_code != room.game_code:
+                    await websocket.send_text(json.dumps({
+                        "type": "error_game_code",
+                        "message": "Enter the 4-digit code shown on the lecturer screen to continue."
                     }))
                     continue
                 if room.phase != "lobby" and not is_known_player:
@@ -2322,11 +2406,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     existing_player["name"] = name
                     existing_player["student_number"] = student_number
                     existing_player["ws"] = websocket
+                    existing_player["game_code_verified"] = (
+                        is_participating_player(room, existing_player)
+                        or not room.game_code_enabled
+                        or provided_code == room.game_code
+                    )
                     room.players[visitor_id] = existing_player
                 elif visitor_id in room.players:
                     room.players[visitor_id]["ws"] = websocket
                     room.players[visitor_id]["name"] = name
                     room.players[visitor_id]["student_number"] = student_number
+                    room.players[visitor_id]["game_code_verified"] = (
+                        is_participating_player(room, room.players[visitor_id])
+                        or not room.game_code_enabled
+                        or provided_code == room.game_code
+                    )
                 else:
                     room.players[visitor_id] = {
                         "name": name,
@@ -2334,34 +2428,30 @@ async def websocket_endpoint(websocket: WebSocket):
                         "score": 0,
                         "streak": 0,
                         "answers": [],
-                        "ws": websocket
+                        "ws": websocket,
+                        "game_code_verified": (not room.game_code_enabled or provided_code == room.game_code)
                     }
-                joined_payload = {
-                    "type": "joined",
-                    "phase": room.phase,
-                    "playerId": visitor_id,
-                    "playerCount": len(room.players),
-                    "activeTest": get_active_test_meta(room)
-                }
-
-                if room.phase == "question":
-                    q = room.questions[room.current_q]
-                    elapsed = time.time() - room.question_start_time
-                    remaining = max(0, TIME_PER_Q - elapsed)
-                    joined_payload["currentQuestion"] = {
-                        "question": q["q"],
-                        "options": q["options"],
-                        "qNum": room.current_q + 1,
-                        "totalQ": room.total_q,
-                        "timeLimit": TIME_PER_Q,
-                        "remaining": round(remaining, 2)
-                    }
-                    joined_payload["alreadyAnswered"] = visitor_id in room.answers_this_round
-                elif room.phase in ("reveal", "get_ready"):
-                    joined_payload["phase"] = room.phase
-
-                await websocket.send_text(json.dumps(joined_payload))
+                await websocket.send_text(json.dumps(build_joined_payload(room, visitor_id)))
                 await push_room_update(room)
+                await sync_answer_count(room)
+
+            elif action == "verify_game_code":
+                if role != "player" or room is None or visitor_id not in room.players:
+                    continue
+                if not room.game_code_enabled:
+                    await websocket.send_text(json.dumps(build_joined_payload(room, visitor_id)))
+                    continue
+                provided_code = (msg.get("gameCode") or "").strip()
+                if provided_code != room.game_code:
+                    await websocket.send_text(json.dumps({
+                        "type": "error_game_code",
+                        "message": "Enter the 4-digit code shown on the lecturer screen to continue."
+                    }))
+                    continue
+                room.players[visitor_id]["game_code_verified"] = True
+                await websocket.send_text(json.dumps(build_joined_payload(room, visitor_id)))
+                await push_room_update(room)
+                await sync_answer_count(room)
 
             elif action == "player_leave":
                 if role != "player" or room is None:
@@ -2369,11 +2459,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 room.players.pop(visitor_id, None)
                 await websocket.send_text(json.dumps({"type": "left"}))
                 await push_room_update(room)
+                await sync_answer_count(room)
+                await maybe_finish_question_early(room)
                 await websocket.close()
                 break
 
             elif action == "answer":
                 if role != "player" or room is None or room.phase != "question":
+                    continue
+                if not is_participating_player(room, room.players.get(visitor_id)):
+                    await websocket.send_text(json.dumps({
+                        "type": "error_game_code",
+                        "message": "Enter the 4-digit code shown on the lecturer screen to continue."
+                    }))
                     continue
                 if visitor_id in room.answers_this_round:
                     continue
@@ -2421,6 +2519,8 @@ async def websocket_endpoint(websocket: WebSocket):
             else:
                 room.players[visitor_id]["ws"] = None
             await push_room_update(room)
+            await sync_answer_count(room)
+            await maybe_finish_question_early(room)
     except Exception:
         if role == "host" and room:
             room.host_ws = None
@@ -2429,6 +2529,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 room.players.pop(visitor_id, None)
             else:
                 room.players[visitor_id]["ws"] = None
+            await push_room_update(room)
+            await sync_answer_count(room)
+            await maybe_finish_question_early(room)
 
 
 async def send_question(room: GameRoom) -> None:
@@ -2446,7 +2549,7 @@ async def send_question(room: GameRoom) -> None:
         "options": q["options"],
         "timeLimit": TIME_PER_Q,
         "serverTimestamp": server_ts
-    })
+    }, participant_only=True)
     await send_to_host(room, {
         "type": "question",
         "qNum": room.current_q + 1,
@@ -2457,6 +2560,7 @@ async def send_question(room: GameRoom) -> None:
         "timeLimit": TIME_PER_Q,
         "serverTimestamp": server_ts
     })
+    await sync_answer_count(room)
 
     async def _timer():
         # Count elapsed time in 0.5s ticks, freezing while room.paused is True
@@ -2477,8 +2581,10 @@ async def send_question(room: GameRoom) -> None:
 async def auto_reveal(room: GameRoom) -> None:
     q = room.questions[room.current_q]
     room.phase = "reveal"
-    lb = get_leaderboard(room)
+    lb = get_leaderboard(room, participant_only=True)
     for vid, player in room.players.items():
+        if not is_participating_player(room, player):
+            continue
         if vid not in room.answers_this_round:
             ws = player.get("ws")
             if ws:
@@ -2494,7 +2600,7 @@ async def auto_reveal(room: GameRoom) -> None:
                     }))
                 except Exception:
                     pass
-    await broadcast_to_players(room, {"type": "leaderboard", "leaderboard": lb})
+    await broadcast_to_players(room, {"type": "leaderboard", "leaderboard": lb}, participant_only=True)
     await send_to_host(room, {
         "type": "reveal",
         "correctAnswer": q["correct"],
@@ -2520,7 +2626,7 @@ async def advance_to_next(room: GameRoom) -> None:
         await force_end_game(room)
     else:
         room.phase = "get_ready"
-        await broadcast_to_players(room, {"type": "get_ready", "qNum": room.current_q + 1, "totalQ": room.total_q})
+        await broadcast_to_players(room, {"type": "get_ready", "qNum": room.current_q + 1, "totalQ": room.total_q}, participant_only=True)
         await send_to_host(room, {"type": "get_ready", "qNum": room.current_q + 1, "totalQ": room.total_q})
         await asyncio.sleep(3)
         await send_question(room)

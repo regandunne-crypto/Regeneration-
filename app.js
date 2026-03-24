@@ -670,9 +670,17 @@ function handlePlayerMessage(msg) {
       playerShowQuestion(msg);
       break;
     case 'answer_result':
+      if (playerNeedsGameCode) {
+        ensureGameCodeScreen();
+        break;
+      }
       playerShowResult(msg);
       break;
     case 'pause_state':
+      if (playerNeedsGameCode) {
+        ensureGameCodeScreen();
+        break;
+      }
       if (msg.paused) {
         clearTimer();
         const pauseMsg = $('#player-pause-msg');
@@ -697,9 +705,17 @@ function handlePlayerMessage(msg) {
       }
       break;
     case 'leaderboard':
+      if (playerNeedsGameCode) {
+        ensureGameCodeScreen();
+        break;
+      }
       playerShowLeaderboard(msg.leaderboard);
       break;
     case 'final':
+      if (playerNeedsGameCode) {
+        ensureGameCodeScreen();
+        break;
+      }
       playerShowFinal(msg.leaderboard);
       break;
     case 'reset':
