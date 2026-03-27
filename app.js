@@ -484,10 +484,7 @@ function showPlayerJoinScreen() {
   };
   btn.onclick = joinAsPlayer;
 
-  $('#btn-back-subject').onclick = () => {
-    selectedSubject = null;
-    showScreen('screen-subject');
-  };
+  $('#btn-back-subject').hidden = true;
 
   checkReady();
   setTimeout(checkReady, 0);
@@ -627,7 +624,10 @@ function handlePlayerMessage(msg) {
       $('#lobby-p-count').textContent = msg.playerCount;
       $('#lobby-subject-badge').textContent = formatActiveTestLabel(selectedSubject, msg.activeTest);
       const leaveBtn = $('#btn-leave-lobby');
-      if (leaveBtn) leaveBtn.onclick = leaveLobby;
+      if (leaveBtn) {
+        leaveBtn.hidden = false;
+        leaveBtn.onclick = leaveLobby;
+      }
       $('#btn-join').disabled = false;
       $('#btn-join').textContent = 'Join Game';
 
@@ -739,6 +739,12 @@ function handlePlayerMessage(msg) {
         errEl.textContent = msg.message || 'The lecturer removed you from this session.';
         errEl.hidden = false;
       }
+      break;
+    }
+    case 'game_ended': {
+      closeWS({ reconnect: false });
+      myPlayerId = null;
+      showPlayerJoinScreen();
       break;
     }
   }

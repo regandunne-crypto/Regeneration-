@@ -2175,6 +2175,7 @@ async def force_end_game(room: GameRoom) -> None:
         vid for vid, player in room.players.items()
         if is_participating_player(room, player)
     }
+    non_participant_ids = set(room.players.keys()) - participant_ids
     active_token = get_room_active_token(room)
     if active_token:
         consume_session_token(active_token)
@@ -2184,7 +2185,9 @@ async def force_end_game(room: GameRoom) -> None:
     room.phase = "final"
     room.archive_stats()
     await broadcast_to_selected_players(room, {"type": "final", "leaderboard": lb}, participant_ids)
+    await broadcast_to_selected_players(room, {"type": "game_ended"}, non_participant_ids)
     await send_to_host(room, {"type": "final", "leaderboard": lb, "hasStats": True})
+    room.players = {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2369,7 +2372,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
                 required_room_token = (room.current_token or "").strip().upper()
                 is_known_player = visitor_id in room.players or existing_player is not None
-                if required_room_token and not subject_code_from_token:
+                if required_room_token and not subject_code_from_token and not is_known_player:
                     await websocket.send_text(json.dumps({
                         "type": "error",
                         "message": "This session link has expired or is invalid. Ask your lecturer for the current QR code."
