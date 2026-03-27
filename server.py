@@ -2349,12 +2349,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 token = (msg.get("token") or "").strip().upper()
                 subject_code_from_token = lookup_session_token(token) if token else None
                 subject_code = subject_code_from_token or (msg.get("subject") or "").strip().upper()
-                if token and not subject_code_from_token:
-                    await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "This session link has expired. Ask your lecturer for the current QR code."
-                    }))
-                    continue
                 if subject_code not in rooms:
                     await websocket.send_text(json.dumps({
                         "type": "error",
@@ -2373,6 +2367,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
                 required_room_token = (room.current_token or "").strip().upper()
                 is_known_player = visitor_id in room.players or existing_player is not None
+                # Reject on expired/invalid token only for players not already in the room.
+                # Known players (already mid-game) must always be allowed to reconnect.
+                if token and not subject_code_from_token and not is_known_player:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "This session link has expired. Ask your lecturer for the current QR code."
+                    }))
+                    continue
                 if required_room_token and not subject_code_from_token and not is_known_player:
                     await websocket.send_text(json.dumps({
                         "type": "error",
