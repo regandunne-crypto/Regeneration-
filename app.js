@@ -1854,7 +1854,12 @@ function renderHostJoinQRCode(playerURL) {
   const qrContainer = $('#qr-code');
   if (!qrContainer) return;
   qrContainer.innerHTML = '';
+  const urlText = $('#qr-url-text');
+  if (urlText) urlText.textContent = playerURL.toString();
   try {
+    if (typeof QRCode === 'undefined') {
+      throw new Error('QRCode library not loaded');
+    }
     new QRCode(qrContainer, {
       text: playerURL.toString(),
       width: 480,
@@ -1863,9 +1868,10 @@ function renderHostJoinQRCode(playerURL) {
       colorLight: '#ffffff',
       correctLevel: QRCode.CorrectLevel.M
     });
-  } catch (e) {}
-  const urlText = $('#qr-url-text');
-  if (urlText) urlText.textContent = playerURL.toString();
+  } catch (e) {
+    qrContainer.textContent = 'QR code unavailable — students can use the link below.';
+    console.error('QR code generation failed:', e);
+  }
 }
 
 async function requestHostSessionToken(subjectCode) {
@@ -2072,7 +2078,13 @@ function handleHostMessage(msg) {
         updateHostLobbyHeading();
       }
       updateHostLobby(msg.players, msg.selectedTest || selectedTest);
-      if (msg.phase === 'lobby') showScreen('screen-host-lobby');
+      if (msg.phase === 'lobby') {
+        showScreen('screen-host-lobby');
+        if (msg.sessionToken) {
+          sessionToken = msg.sessionToken;
+        }
+        renderHostJoinQRCode(buildPlayerJoinURL(hostSubjectCode, sessionToken));
+      }
       $('#btn-download-stats').hidden = !msg.hasStats;
       if (!msg.hasQuestions) {
         const startBtn = $('#btn-start-game');

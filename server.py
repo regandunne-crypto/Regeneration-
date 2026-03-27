@@ -2120,9 +2120,9 @@ async def cancel_question_timer(room: GameRoom) -> None:
 
 
 async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
-    active_token = get_room_active_token(room)
-    if active_token:
-        consume_session_token(active_token)
+    # Generate a fresh session token (this also consumes the previous one)
+    new_token = generate_session_token(room.subject_code)
+    room.current_token = new_token
     room.game_code = ""
     room.game_code_enabled = False
     await cancel_question_timer(room)
@@ -2164,7 +2164,8 @@ async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
         "gameCode": room.game_code,
         "gameCodeEnabled": room.game_code_enabled,
         "hasQuestions": room.total_q > 0,
-        "hasStats": room.last_game_stats is not None
+        "hasStats": room.last_game_stats is not None,
+        "sessionToken": new_token
     })
     await push_room_update(room)
 
