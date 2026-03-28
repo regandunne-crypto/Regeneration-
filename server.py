@@ -1158,6 +1158,7 @@ class GameRoom:
         self.phase = "lobby"
         self.current_q = 0
         self.question_start_time = 0
+        self.question_elapsed = 0.0
         self.game_code = ""
         self.game_code_enabled = False
         if clear_players:
@@ -1194,7 +1195,7 @@ class GameRoom:
 
 rooms: dict[str, GameRoom] = {code: GameRoom(code) for code in SUBJECTS}
 session_tokens: dict[str, dict[str, Any]] = {}
-SESSION_TOKEN_TTL = 60 * 90
+SESSION_TOKEN_TTL = 60 * 60 * 24 * 7  # 7 days — links should not expire during a quiz session
 SESSION_TOKEN_LENGTH = 6
 SESSION_TOKEN_ALPHABET = string.ascii_uppercase + string.digits
 
@@ -1943,8 +1944,7 @@ def build_joined_payload(room: GameRoom, visitor_id: str) -> dict[str, Any]:
     }
     if room.phase == "question":
         q = room.questions[room.current_q]
-        elapsed = time.time() - room.question_start_time
-        remaining = max(0, TIME_PER_Q - elapsed)
+        remaining = max(0, TIME_PER_Q - room.question_elapsed)
         joined_payload["currentQuestion"] = {
             "question": q["q"],
             "options": q["options"],
@@ -2546,6 +2546,7 @@ async def send_question(room: GameRoom) -> None:
     room.phase = "question"
     server_ts = time.time()
     room.question_start_time = server_ts
+    room.question_elapsed = 0.0
     room.answers_this_round = {}
     await broadcast_to_players(room, {
         "type": "question",
@@ -2577,6 +2578,7 @@ async def send_question(room: GameRoom) -> None:
                 return  # Question already advanced (e.g. all answered early)
             if not room.paused:
                 elapsed += 0.5
+                room.question_elapsed = elapsed
         if room.phase == "question" and room.current_q == q_index:
             mark_unanswered_players(room)
             await auto_reveal(room)

@@ -412,9 +412,42 @@ async function initPlayer() {
       sessionToken = token;
       showPlayerJoinScreen();
     } catch (e) {
+      // Token invalid or expired — try to recover using the last known subject
       selectedSubject = null;
-      showScreen('screen-token-expired');
-      $('#token-expired-msg').textContent = e.message || 'This session link has expired. Ask your lecturer for the current QR code.';
+      sessionToken = '';
+      let recovered = false;
+      try {
+        const cachedCode = localStorage.getItem('quiz_last_subject_code');
+        if (cachedCode) {
+          const subjects = await loadSubjects();
+          const cached = subjects.find((s) => s.code === cachedCode);
+          if (cached) {
+            selectedSubject = cached;
+            recovered = true;
+            showPlayerJoinScreen();
+            const errEl = $('#name-error');
+            if (errEl) {
+              errEl.textContent = 'Your session link has changed — please enter your details to rejoin.';
+              errEl.hidden = false;
+            }
+          }
+        }
+      } catch (loadErr) {}
+      if (!recovered) {
+        // Fall back to subject selection instead of a dead-end expired screen
+        showScreen('screen-subject');
+        try {
+          const subjects = await loadSubjects();
+          renderSubjectCards('subject-list', subjects, (sub) => {
+            selectedSubject = sub;
+            sessionToken = '';
+            showPlayerJoinScreen();
+          });
+        } catch (loadErr) {
+          showScreen('screen-token-expired');
+          $('#token-expired-msg').textContent = e.message || 'This session link has expired. Ask your lecturer for the current QR code.';
+        }
+      }
     }
     return;
   }
@@ -620,6 +653,9 @@ function handlePlayerMessage(msg) {
       playerNeedsGameCode = false;
       myPlayerId = msg.playerId;
       history.pushState({ quizActive: true }, '', location.href);
+      if (selectedSubject && selectedSubject.code) {
+        try { localStorage.setItem('quiz_last_subject_code', selectedSubject.code); } catch (e) {}
+      }
       $('#lobby-player-name').textContent = myPlayerName;
       $('#lobby-p-count').textContent = msg.playerCount;
       $('#lobby-subject-badge').textContent = formatActiveTestLabel(selectedSubject, msg.activeTest);
