@@ -2520,10 +2520,7 @@ async def websocket_endpoint(websocket: WebSocket):
         if role == "host" and room:
             room.host_ws = None
         elif role == "player" and room and visitor_id in room.players:
-            if room.phase == "lobby":
-                room.players.pop(visitor_id, None)
-            else:
-                room.players[visitor_id]["ws"] = None
+            room.players[visitor_id]["ws"] = None
             await push_room_update(room)
             await sync_answer_count(room)
             await maybe_finish_question_early(room)
@@ -2531,10 +2528,7 @@ async def websocket_endpoint(websocket: WebSocket):
         if role == "host" and room:
             room.host_ws = None
         elif role == "player" and room and visitor_id in room.players:
-            if room.phase == "lobby":
-                room.players.pop(visitor_id, None)
-            else:
-                room.players[visitor_id]["ws"] = None
+            room.players[visitor_id]["ws"] = None
             await push_room_update(room)
             await sync_answer_count(room)
             await maybe_finish_question_early(room)
