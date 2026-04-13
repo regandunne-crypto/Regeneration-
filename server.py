@@ -1169,6 +1169,7 @@ class GameRoom:
         self.answers_this_round = {}
         self.question_timer_task = None
         self.paused = False
+        self._pending_room_update: asyncio.Task | None = None
 
     def archive_stats(self) -> None:
         if not self.players:
@@ -1981,10 +1982,12 @@ def get_leaderboard(room: GameRoom, *, participant_only: bool = False) -> list[d
     return players
 
 
-async def broadcast_to_players(room: GameRoom, msg: dict[str, Any], *, participant_only: bool = False) -> None:
+async def broadcast_to_players(room: GameRoom, msg: dict[str, Any] | str, *, participant_only: bool = False) -> None:
+    text = msg if isinstance(msg, str) else json.dumps(msg)
+
     async def _safe_send(ws: WebSocket):
         try:
-            await ws.send_text(json.dumps(msg))
+            await ws.send_text(text)
         except Exception:
             pass
 
@@ -1999,10 +2002,12 @@ async def broadcast_to_players(room: GameRoom, msg: dict[str, Any], *, participa
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def broadcast_to_selected_players(room: GameRoom, msg: dict[str, Any], player_ids: set[str]) -> None:
+async def broadcast_to_selected_players(room: GameRoom, msg: dict[str, Any] | str, player_ids: set[str]) -> None:
+    text = msg if isinstance(msg, str) else json.dumps(msg)
+
     async def _safe_send(ws: WebSocket):
         try:
-            await ws.send_text(json.dumps(msg))
+            await ws.send_text(text)
         except Exception:
             pass
 
@@ -2026,14 +2031,36 @@ async def send_to_host(room: GameRoom, msg: dict[str, Any]) -> None:
         room.host_ws = None
 
 
-async def push_room_update(room: GameRoom) -> None:
-    payload = {
+async def _do_push_room_update(room: GameRoom) -> None:
+    host_payload = {
         "type": "player_update",
         "players": get_player_list(room),
         "activeTest": get_active_test_meta(room)
     }
-    await send_to_host(room, payload)
-    await broadcast_to_players(room, payload)
+    player_payload = json.dumps({
+        "type": "player_update",
+        "playerCount": len(room.players)
+    })
+    await send_to_host(room, host_payload)
+    await broadcast_to_players(room, player_payload)
+
+
+async def push_room_update(room: GameRoom) -> None:
+    # Skip debounce during active game phases so answer counts stay responsive.
+    if room.phase in ("question", "reveal"):
+        await _do_push_room_update(room)
+        return
+
+    # Cancel any already-pending debounced broadcast and schedule a fresh one.
+    if room._pending_room_update is not None:
+        room._pending_room_update.cancel()
+
+    async def _debounced():
+        await asyncio.sleep(0.3)
+        room._pending_room_update = None
+        await _do_push_room_update(room)
+
+    room._pending_room_update = asyncio.create_task(_debounced())
 
 
 def mark_unanswered_players(room: GameRoom) -> None:

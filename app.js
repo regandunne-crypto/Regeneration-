@@ -686,7 +686,7 @@ function handlePlayerMessage(msg) {
       if (playerNeedsGameCode) {
         ensureGameCodeScreen();
       }
-      if (msg.players) $('#lobby-p-count').textContent = msg.players.length;
+      $('#lobby-p-count').textContent = msg.playerCount ?? (msg.players ? msg.players.length : 0);
       if (selectedSubject) {
         $('#lobby-subject-badge').textContent = formatActiveTestLabel(selectedSubject, msg.activeTest);
       }
