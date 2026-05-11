@@ -526,6 +526,45 @@ function showPlayerJoinScreen() {
   nameInput.focus();
 }
 
+function showKickedScreen(message) {
+  showScreen('screen-kicked');
+  const msgEl = $('#kicked-msg');
+  if (msgEl) msgEl.textContent = message;
+  const nameEl = $('#kicked-player-name');
+  if (nameEl) nameEl.textContent = myPlayerName ? `Playing as: ${myPlayerName}` : '';
+
+  const rejoinBtn = $('#btn-rejoin-game');
+  if (rejoinBtn) {
+    const canRejoin = !!(myPlayerName && myStudentNumber && selectedSubject);
+    rejoinBtn.hidden = !canRejoin;
+    rejoinBtn.disabled = false;
+    rejoinBtn.textContent = 'Rejoin Game';
+    rejoinBtn.onclick = () => {
+      rejoinBtn.disabled = true;
+      rejoinBtn.textContent = 'Rejoining…';
+      connectWS(() => {
+        send({
+          action: 'player_join',
+          name: myPlayerName,
+          studentNumber: myStudentNumber,
+          subject: selectedSubject.code,
+          token: sessionToken || '',
+          gameCode: ''
+        });
+      });
+    };
+  }
+
+  const startOverBtn = $('#btn-start-over');
+  if (startOverBtn) {
+    startOverBtn.onclick = () => {
+      myPlayerName = '';
+      myStudentNumber = '';
+      showPlayerJoinScreen();
+    };
+  }
+}
+
 function showGameCodeScreen() {
   playerNeedsGameCode = true;
   clearTimer();
@@ -661,7 +700,7 @@ function handlePlayerMessage(msg) {
       $('#lobby-subject-badge').textContent = formatActiveTestLabel(selectedSubject, msg.activeTest);
       const leaveBtn = $('#btn-leave-lobby');
       if (leaveBtn) {
-        leaveBtn.hidden = false;
+        leaveBtn.hidden = !(!msg.phase || msg.phase === 'lobby');
         leaveBtn.onclick = leaveLobby;
       }
       $('#btn-join').disabled = false;
@@ -767,14 +806,8 @@ function handlePlayerMessage(msg) {
     case 'kicked': {
       closeWS({ reconnect: false });
       myPlayerId = null;
-      myPlayerName = '';
-      myStudentNumber = '';
-      showPlayerJoinScreen();
-      const errEl = $('#name-error');
-      if (errEl) {
-        errEl.textContent = msg.message || 'The lecturer removed you from this session.';
-        errEl.hidden = false;
-      }
+      // Keep myPlayerName and myStudentNumber so the student can rejoin
+      showKickedScreen(msg.message || 'You were disconnected from the game.');
       break;
     }
     case 'game_ended': {

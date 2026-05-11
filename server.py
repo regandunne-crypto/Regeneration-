@@ -2111,11 +2111,13 @@ async def maybe_finish_question_early(room: GameRoom) -> None:
 
 
 async def kick_player_from_room(room: GameRoom, player_id: str, *, message: str) -> bool:
-    player = room.players.pop(player_id, None)
+    player = room.players.get(player_id)
     if not player:
         return False
     room.answers_this_round.pop(player_id, None)
     ws = player.get("ws")
+    # Keep player record so they can rejoin; only disconnect the WebSocket.
+    player["ws"] = None
     if ws is not None:
         try:
             await ws.send_text(json.dumps({
@@ -2547,18 +2549,22 @@ async def websocket_endpoint(websocket: WebSocket):
         if role == "host" and room:
             room.host_ws = None
         elif role == "player" and room and visitor_id in room.players:
-            room.players[visitor_id]["ws"] = None
-            await push_room_update(room)
-            await sync_answer_count(room)
-            await maybe_finish_question_early(room)
+            # Only clear ws if it's still the current connection — a reconnect may
+            # have already replaced it, and we must not overwrite the new socket.
+            if room.players[visitor_id].get("ws") is websocket:
+                room.players[visitor_id]["ws"] = None
+                await push_room_update(room)
+                await sync_answer_count(room)
+                await maybe_finish_question_early(room)
     except Exception:
         if role == "host" and room:
             room.host_ws = None
         elif role == "player" and room and visitor_id in room.players:
-            room.players[visitor_id]["ws"] = None
-            await push_room_update(room)
-            await sync_answer_count(room)
-            await maybe_finish_question_early(room)
+            if room.players[visitor_id].get("ws") is websocket:
+                room.players[visitor_id]["ws"] = None
+                await push_room_update(room)
+                await sync_answer_count(room)
+                await maybe_finish_question_early(room)
 
 
 async def send_question(room: GameRoom) -> None:
