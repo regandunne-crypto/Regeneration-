@@ -22,7 +22,7 @@ import string
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,11 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 import docx_import
+
+# `datetime.UTC` only exists on Python 3.11+. Render pins a Python version per
+# service, so importing it directly risks a boot failure on an older runtime.
+# `timezone.utc` is identical and available everywhere.
+UTC = timezone.utc
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Subject catalogue and built-in legacy question sets

@@ -8,6 +8,8 @@ select = ["E", "F", "W", "B", "UP", "DTZ"]
 ignore = [
     "E501",   # long lines are pervasive in this codebase and not worth a mass reformat
     "B008",   # FastAPI dependency defaults
+    "UP017",  # `timezone.utc` is used deliberately: `datetime.UTC` needs 3.11+,
+              # and Render pins a Python version per service.
 ]
 
 [tool.ruff.lint.per-file-ignores]
