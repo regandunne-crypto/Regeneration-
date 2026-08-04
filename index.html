@@ -108,6 +108,17 @@
     </div>
   </div>
 
+  <!-- PLAYER: Answer submitted / waiting for the rest of the class -->
+  <div id="screen-answer-submitted" class="screen">
+    <div class="lobby-player-container">
+      <div class="pulse-ring"></div>
+      <h2 class="lobby-player-name" id="answer-submitted-title">Answer submitted</h2>
+      <p class="lobby-player-msg" id="answer-submitted-detail">Your answer was received. Waiting for the other students…</p>
+      <p class="lobby-player-count" id="answer-submitted-progress" hidden></p>
+      <p class="lobby-subject-badge" id="answer-submitted-name"></p>
+    </div>
+  </div>
+
   <!-- PLAYER: Get Ready countdown -->
   <div id="screen-ready" class="screen">
     <div class="ready-container">
@@ -395,7 +406,7 @@
         <span id="host-answered-count">0</span> / <span id="host-total-players">0</span> answered
       </div>
       <div class="host-live-controls" id="host-live-controls">
-        <button id="btn-pause-game" class="btn btn-secondary" onclick="send({action:'host_pause'})">⏸ Pause</button>
+        <button type="button" class="btn btn-secondary btn-pause-game" onclick="send({action:'host_pause'})">⏸ Pause</button>
         <button id="btn-end-game" class="btn btn-secondary">End Game</button>
         <button id="btn-cancel-game" class="btn btn-danger">Cancel to Lobby</button>
       </div>
@@ -420,7 +431,7 @@
         </div>
       </div>
       <div class="host-reveal-controls" id="host-reveal-controls">
-        <button id="btn-pause-game" class="btn btn-secondary" onclick="send({action:'host_pause'})">⏸ Pause</button>
+        <button type="button" class="btn btn-secondary btn-pause-game" onclick="send({action:'host_pause'})">⏸ Pause</button>
         <button id="btn-end-game-reveal" class="btn btn-secondary">End Game</button>
         <button id="btn-cancel-game-reveal" class="btn btn-danger">Cancel to Lobby</button>
       </div>

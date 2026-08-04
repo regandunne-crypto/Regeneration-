@@ -15,6 +15,7 @@ import hmac
 import io
 import json
 import os
+import random
 import re
 import secrets
 import string
@@ -47,7 +48,7 @@ SUBJECTS = {
 BUILTIN_SUBJECT_CODES = set(SUBJECTS.keys())
 SUBJECT_CODE_PATTERN = re.compile(r"^[A-Z0-9]{3,10}$")
 
-TIME_PER_Q = 30
+TIME_PER_Q = int(os.environ.get("TIME_PER_Q", "30"))
 MAX_POINTS = 1000
 MIN_POINTS = 200
 REQUEST_TIMEOUT = 20
@@ -101,6 +102,17 @@ def verify_password(password: str, stored: str) -> bool:
         return False
     candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), rounds).hex()
     return hmac.compare_digest(candidate, digest)
+
+
+# 260k PBKDF2 rounds take 100-200 ms. Run them on a worker thread: on the event
+# loop they stall every other request, including live games — a class signing in
+# would freeze the quiz everyone else is playing.
+async def hash_password_async(password: str) -> str:
+    return await asyncio.to_thread(hash_password, password)
+
+
+async def verify_password_async(password: str, stored: str) -> bool:
+    return await asyncio.to_thread(verify_password, password, stored)
 
 
 def create_session_token(lecturer_id: str) -> str:
@@ -422,6 +434,12 @@ class SupabaseStore:
             row["source"] = "supabase"
             row.setdefault("question_count", len(row.get("questions") or []))
         return rows
+
+    async def list_all_test_counts(self) -> list[dict[str, Any]]:
+        """Every test's subject and question count, for the subject list."""
+        return await self._request("GET", self.quiz_tests_base, params={
+            "select": "subject_code,question_count",
+        })
 
     async def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
         rows = await self._request("GET", self.quiz_tests_base, params={
@@ -820,7 +838,7 @@ class HybridTestRepository:
         self._ensure_supabase_for_write()
         if await self.get_lecturer_by_email(payload.email):
             raise ValueError("An account with that email already exists.")
-        password_hash = hash_password(payload.password)
+        password_hash = await hash_password_async(payload.password)
         def _local_create():
             row = {
                 "id": str(uuid.uuid4()),
@@ -966,6 +984,31 @@ class HybridTestRepository:
                 if row.get("created_by") == lecturer_id:
                     local_rows.append(row)
         return list(remote_rows or []) + local_rows
+
+    async def get_test_counts(self) -> dict[str, dict[str, int]]:
+        """Test and question counts per subject, in a single Supabase round trip.
+
+        Replaces one list_tests() call per subject on GET /api/subjects.
+        """
+        counts: dict[str, dict[str, int]] = {}
+
+        def _add(subject_code: str, question_count: int) -> None:
+            entry = counts.setdefault(subject_code, {"tests": 0, "questions": 0})
+            entry["tests"] += 1
+            entry["questions"] += question_count
+
+        remote_rows = await self._call_remote(
+            self.remote.list_all_test_counts() if self.remote else None,
+            lambda: []
+        )
+        for row in remote_rows or []:
+            code = (row.get("subject_code") or "").strip().upper()
+            if code:
+                _add(code, int(row.get("question_count") or 0))
+        for code, items in self.local_custom_tests.items():
+            for row in items.values():
+                _add(code, int(row.get("question_count") or len(row.get("questions") or [])))
+        return counts
 
     async def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
         if subject_code not in self.subjects:
@@ -1180,10 +1223,24 @@ repo = HybridTestRepository(SUBJECTS)
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-room live game state
 # ──────────────────────────────────────────────────────────────────────────────
+MAX_PLAYERS_PER_ROOM = int(os.environ.get("MAX_PLAYERS_PER_ROOM", "300"))
+MAX_WS_MESSAGE_BYTES = int(os.environ.get("MAX_WS_MESSAGE_BYTES", str(64 * 1024)))
+
+
 class GameRoom:
     def __init__(self, subject_code: str):
         self.subject_code = subject_code
-        self.subject_name = SUBJECTS[subject_code]["name"]
+        subject = SUBJECTS.get(subject_code)
+        if subject is None:
+            # A room for a subject that is not in the catalogue used to raise
+            # KeyError and take down whatever was constructing it.
+            self.subject_name = subject_code
+        else:
+            self.subject_name = subject.get("name") or subject_code
+        # Serialises question advance / reveal so a double click on "Next
+        # Question", or a click racing the auto-reveal timer, cannot increment
+        # current_q twice and skip a question.
+        self.advance_lock = asyncio.Lock()
         self.last_game_stats = None
         self.active_test_id = None
         self.active_test_title = ""
@@ -1217,6 +1274,7 @@ class GameRoom:
         self.host_visitor = None
         self.answers_this_round = {}
         self.question_timer_task = None
+        self.start_task: asyncio.Task | None = None
         self.paused = False
         self._pending_room_update: asyncio.Task | None = None
 
@@ -1494,7 +1552,7 @@ async def lecturer_login(payload: dict[str, Any], request: Request):
             if repo.supabase_unavailable():
                 raise HTTPException(status_code=503, detail="Supabase is unavailable. Please try again once it is restored.")
             raise HTTPException(status_code=401, detail="Incorrect email or password")
-        if not verify_password(validated.password, lecturer.get("password_hash", "")):
+        if not await verify_password_async(validated.password, lecturer.get("password_hash", "")):
             raise HTTPException(status_code=401, detail="Incorrect email or password")
         response = JSONResponse({"ok": True, "lecturer": public_lecturer_view(lecturer)})
         set_session_cookie(response, lecturer["id"], request)
@@ -1516,16 +1574,24 @@ def lecturer_logout():
 
 @app.get("/api/subjects")
 async def get_subjects():
+    # Iterate a snapshot: a concurrent DELETE /api/subjects pops from SUBJECTS
+    # while this coroutine is suspended on an await, which used to raise
+    # "RuntimeError: dictionary changed size during iteration".
+    subjects = list(SUBJECTS.items())
+    # One query for every subject's counts instead of one round trip per
+    # subject (the old code called list_tests() inside the loop).
+    counts = await repo.get_test_counts()
     result = []
-    for code, info in SUBJECTS.items():
-        tests = await repo.list_tests(code)
+    for code, info in subjects:
+        if code not in SUBJECTS:
+            continue          # deleted while we were awaiting the counts query
+        stats = counts.get(code, {"tests": 0, "questions": 0})
         builtin_questions = len(info.get("questions", []))
-        total_questions = sum(t.get("questionCount", 0) for t in tests) or builtin_questions
         result.append({
             "code": code,
             "name": info["name"],
-            "questionCount": total_questions,
-            "testCount": len(tests)
+            "questionCount": stats["questions"] or builtin_questions,
+            "testCount": stats["tests"],
         })
     result.sort(key=lambda item: item["name"].lower())
     return result
@@ -2226,19 +2292,26 @@ async def sync_answer_count(room: GameRoom) -> None:
 
 
 async def maybe_finish_question_early(room: GameRoom) -> None:
-    if room.phase != "question":
-        return
-    answered_count = len(room.answers_this_round)
-    total_connected = sum(
-        1
-        for _, player in room.players.items()
-        if player.get("ws") is not None and is_participating_player(room, player)
-    )
-    if answered_count >= total_connected and total_connected > 0:
+    # The lock makes the phase check and the phase change atomic across
+    # concurrent answer handlers and the question timer, so
+    # mark_unanswered_players() can never run twice for one question and append
+    # duplicate answer records.
+    async with room.advance_lock:
+        if room.phase != "question":
+            return
+        answered_count = len(room.answers_this_round)
+        total_connected = sum(
+            1
+            for _, player in room.players.items()
+            if player.get("ws") is not None and is_participating_player(room, player)
+        )
+        if answered_count < total_connected or total_connected <= 0:
+            return
         if room.question_timer_task and not room.question_timer_task.done():
             room.question_timer_task.cancel()
         mark_unanswered_players(room)
-        await auto_reveal(room)
+        room.phase = "reveal"
+    await auto_reveal(room)
 
 
 async def kick_player_from_room(room: GameRoom, player_id: str, *, message: str) -> bool:
@@ -2268,15 +2341,25 @@ async def kick_player_from_room(room: GameRoom, player_id: str, *, message: str)
 
 
 async def cancel_question_timer(room: GameRoom) -> None:
-    if room.question_timer_task and not room.question_timer_task.done():
-        room.question_timer_task.cancel()
+    current = asyncio.current_task()
+    for attr in ("question_timer_task", "start_task"):
+        task = getattr(room, attr, None)
+        setattr(room, attr, None)
+        if task is None or task.done():
+            continue
+        if task is current:
+            # We are running *inside* that task — reached here via
+            # _timer -> auto_reveal -> advance_to_next -> force_end_game.
+            # Cancelling would abort the end-of-game work we are doing, and
+            # awaiting it raises "Task cannot await on itself". Just detach.
+            continue
+        task.cancel()
         try:
-            await room.question_timer_task
+            await task
         except asyncio.CancelledError:
             pass
         except Exception:
             pass
-    room.question_timer_task = None
 
 
 async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
@@ -2368,7 +2451,18 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             raw = await websocket.receive_text()
-            msg = json.loads(raw)
+            # Cheap resource-exhaustion guard: a single socket could otherwise
+            # push arbitrarily large frames at the server.
+            if len(raw) > MAX_WS_MESSAGE_BYTES:
+                await websocket.send_text(json.dumps({"type": "error", "message": "Message too large."}))
+                await websocket.close(code=1009)
+                break
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(msg, dict):
+                continue
             action = msg.get("action")
 
             if action == "host_join":
@@ -2426,46 +2520,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 if room.total_q == 0:
                     await websocket.send_text(json.dumps({"type": "error", "message": "No questions loaded for this test."}))
                     continue
-                use_code = msg.get("useCode", False)
-                if use_code:
-                    room.game_code = generate_game_code()
-                    room.game_code_enabled = True
-                    for player in room.players.values():
-                        player["game_code_verified"] = False
-                else:
-                    room.game_code = ""
-                    room.game_code_enabled = False
-                    for player in room.players.values():
-                        player["game_code_verified"] = True
-                if room.game_code_enabled:
-                    await send_to_host(room, {
-                        "type": "game_code_display",
-                        "code": room.game_code,
-                        "countdown": GAME_CODE_COUNTDOWN_SECONDS
-                    })
-                    await broadcast_to_players(room, {
-                        "type": "game_code_required",
-                        "countdown": GAME_CODE_COUNTDOWN_SECONDS
-                    })
-                    await asyncio.sleep(GAME_CODE_COUNTDOWN_SECONDS)
-                room.paused = False
-                import random
-                if msg.get("shuffle"):
-                    random.shuffle(room.questions)
-                room.phase = "get_ready"
-                room.current_q = 0
-                for vid in room.players:
-                    room.players[vid]["score"] = 0
-                    room.players[vid]["streak"] = 0
-                    room.players[vid]["answers"] = []
-                await broadcast_to_players(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q}, participant_only=True)
-                await send_to_host(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q})
-                await asyncio.sleep(GET_READY_SECONDS)
-                await send_question(room)
+                if room.start_task is not None and not room.start_task.done():
+                    continue                       # already starting
+                # Run the countdown in the background. It used to sit inside this
+                # receive loop, so for 20 seconds the host could not pause or
+                # cancel and every queued message stalled behind it.
+                room.start_task = asyncio.create_task(run_game_start(room, shuffle=bool(msg.get("shuffle")), use_code=bool(msg.get("useCode"))))
 
             elif action == "next_question":
                 if role == "host" and room is not None:
-                    await advance_to_next(room)
+                    await advance_to_next(room, from_question=room.current_q)
 
             elif action == "host_pause":
                 if role != "host" or room is None:
@@ -2558,6 +2622,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": "The game is already in progress. You cannot join as a new player at this stage."
                     }))
                     continue
+                if not is_known_player and len(room.players) >= MAX_PLAYERS_PER_ROOM:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": f"This session is full ({MAX_PLAYERS_PER_ROOM} students). Ask your lecturer to start another session."
+                    }))
+                    continue
                 if subject_code_from_token and room.current_token != token:
                     room.current_token = token
                 role = "player"
@@ -2641,7 +2711,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 if visitor_id in room.answers_this_round:
                     continue
-                choice = msg.get("choice", -1)
+                # Validate the choice. It used to be taken as-is, so a client
+                # could submit a string, a list or an out-of-range index and it
+                # would be stored and later written into the results workbook.
+                raw_choice = msg.get("choice", -1)
+                if isinstance(raw_choice, bool) or not isinstance(raw_choice, int):
+                    # Not "error": the player client treats that as a join
+                    # failure and would throw the student back to the join screen.
+                    await websocket.send_text(json.dumps({"type": "invalid_answer", "message": "That answer was not understood."}))
+                    continue
+                choice = raw_choice
+                if not 0 <= choice < len(room.questions[room.current_q]["options"]):
+                    # Not "error": the player client treats that as a join
+                    # failure and would throw the student back to the join screen.
+                    await websocket.send_text(json.dumps({"type": "invalid_answer", "message": "That answer was not understood."}))
+                    continue
                 answer_time = time.time() - room.question_start_time
                 room.answers_this_round[visitor_id] = {"choice": choice, "time": answer_time}
 
@@ -2698,6 +2782,49 @@ async def websocket_endpoint(websocket: WebSocket):
                 await maybe_finish_question_early(room)
 
 
+async def run_game_start(room: GameRoom, *, shuffle: bool, use_code: bool) -> None:
+    """Start sequence, run as a background task so the host socket stays live."""
+    if use_code:
+        room.game_code = generate_game_code()
+        room.game_code_enabled = True
+        for player in room.players.values():
+            player["game_code_verified"] = False
+    else:
+        room.game_code = ""
+        room.game_code_enabled = False
+        for player in room.players.values():
+            player["game_code_verified"] = True
+
+    if room.game_code_enabled:
+        await send_to_host(room, {
+            "type": "game_code_display",
+            "code": room.game_code,
+            "countdown": GAME_CODE_COUNTDOWN_SECONDS
+        })
+        await broadcast_to_players(room, {
+            "type": "game_code_required",
+            "countdown": GAME_CODE_COUNTDOWN_SECONDS
+        })
+        await asyncio.sleep(GAME_CODE_COUNTDOWN_SECONDS)
+        if room.phase != "lobby":
+            return       # cancelled or reset while the code was showing
+
+    room.paused = False
+    if shuffle:
+        random.shuffle(room.questions)
+    room.phase = "get_ready"
+    room.current_q = 0
+    for vid in room.players:
+        room.players[vid]["score"] = 0
+        room.players[vid]["streak"] = 0
+        room.players[vid]["answers"] = []
+    await broadcast_to_players(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q}, participant_only=True)
+    await send_to_host(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q})
+    await asyncio.sleep(GET_READY_SECONDS)
+    if room.phase == "get_ready" and room.current_q == 0:
+        await send_question(room)
+
+
 async def send_question(room: GameRoom) -> None:
     q = room.questions[room.current_q]
     q_index = room.current_q
@@ -2737,15 +2864,19 @@ async def send_question(room: GameRoom) -> None:
             if not room.paused:
                 elapsed += 0.5
                 room.question_elapsed = elapsed
-        if room.phase == "question" and room.current_q == q_index:
+        async with room.advance_lock:
+            if room.phase != "question" or room.current_q != q_index:
+                return
             mark_unanswered_players(room)
-            await auto_reveal(room)
+            room.phase = "reveal"
+        await auto_reveal(room)
 
     room.question_timer_task = asyncio.create_task(_timer())
 
 
 async def auto_reveal(room: GameRoom) -> None:
-    q = room.questions[room.current_q]
+    q_index = room.current_q
+    q = room.questions[q_index]
     room.phase = "reveal"
     lb = get_leaderboard(room, participant_only=True)
     for vid, player in room.players.items():
@@ -2781,19 +2912,36 @@ async def auto_reveal(room: GameRoom) -> None:
         if room.paused:
             continue
         waited += tick
-    if room.phase == "reveal":
-        await advance_to_next(room)
+    if room.phase == "reveal" and room.current_q == q_index:
+        await advance_to_next(room, from_question=q_index)
 
 
-async def advance_to_next(room: GameRoom) -> None:
-    room.current_q += 1
-    if room.current_q >= room.total_q:
+async def advance_to_next(room: GameRoom, *, from_question: int | None = None) -> None:
+    """Move on to the next question.
+
+    Guarded so that a double click on "Next Question", or a click racing the
+    auto-reveal timer, cannot increment current_q twice and skip a question.
+    `from_question` is the index the caller believed was current; if the room
+    has already moved past it, this call is a duplicate and does nothing.
+    """
+    async with room.advance_lock:
+        if room.phase in ("get_ready", "final"):
+            return                      # an advance is already under way
+        if from_question is not None and room.current_q != from_question:
+            return                      # someone else advanced first
+        room.current_q += 1
+        finished = room.current_q >= room.total_q
+        room.phase = "final" if finished else "get_ready"
+        next_index = room.current_q
+
+    if finished:
         await force_end_game(room)
-    else:
-        room.phase = "get_ready"
-        await broadcast_to_players(room, {"type": "get_ready", "qNum": room.current_q + 1, "totalQ": room.total_q}, participant_only=True)
-        await send_to_host(room, {"type": "get_ready", "qNum": room.current_q + 1, "totalQ": room.total_q})
-        await asyncio.sleep(GET_READY_SECONDS)
+        return
+
+    await broadcast_to_players(room, {"type": "get_ready", "qNum": next_index + 1, "totalQ": room.total_q}, participant_only=True)
+    await send_to_host(room, {"type": "get_ready", "qNum": next_index + 1, "totalQ": room.total_q})
+    await asyncio.sleep(GET_READY_SECONDS)
+    if room.phase == "get_ready" and room.current_q == next_index:
         await send_question(room)
 
 

@@ -72,6 +72,12 @@ let editorInputBound = false;
 let hostCorrectAnswer = -1;
 let hostCurrentOptions = [];
 let hostCurrentQuestion = '';
+// The time limit the server set for the question currently on screen. Used for
+// both the countdown value and the progress-bar percentage — computing the
+// percentage against the TIME_PER_Q constant instead made a 90 second question
+// render a bar 300% wide once limits became configurable.
+let questionTimeLimit = TIME_PER_Q;
+let hostQuestionTimeLimit = TIME_PER_Q;
 let hostTimeLeft = TIME_PER_Q;
 let playerAnswered = false;
 let playerNeedsGameCode = false;
@@ -133,8 +139,20 @@ function connectWS(onOpen) {
     if (wsOnOpen) wsOnOpen();
   };
   ws.onmessage = (evt) => {
-    const msg = JSON.parse(evt.data);
-    handleMessage(msg);
+    // One malformed frame used to throw out of the handler and kill it for the
+    // rest of the session.
+    let msg;
+    try {
+      msg = JSON.parse(evt.data);
+    } catch (err) {
+      console.error('Ignoring malformed message from server:', err);
+      return;
+    }
+    try {
+      handleMessage(msg);
+    } catch (err) {
+      console.error('Error handling message', msg && msg.type, err);
+    }
   };
   ws.onclose = () => {
     ws = null;
@@ -540,7 +558,20 @@ function showPlayerJoinScreen() {
   };
   btn.onclick = joinAsPlayer;
 
-  $('#btn-back-subject').hidden = true;
+  // A student who picked the wrong subject used to be stuck here. Offer the way
+  // back whenever they arrived via subject selection rather than a QR token —
+  // with a token the subject is fixed by the lecturer's link.
+  const backBtn = $('#btn-back-subject');
+  if (backBtn) {
+    const arrivedBySubjectChoice = !sessionToken;
+    backBtn.hidden = !arrivedBySubjectChoice;
+    backBtn.onclick = () => {
+      closeWS({ reconnect: false });
+      myPlayerId = null;
+      selectedSubject = null;
+      initPlayer();
+    };
+  }
 
   checkReady();
   setTimeout(checkReady, 0);
@@ -733,14 +764,16 @@ function handlePlayerMessage(msg) {
         showScreen('screen-lobby-player');
       } else if (msg.phase === 'question' && msg.currentQuestion) {
         if (msg.alreadyAnswered) {
-          showScreen('screen-lobby-player'); // safe fallback — wait for reveal
+          // Reconnected mid-question having already answered. Dumping the
+          // student on the lobby screen ("waiting for the lecturer to start")
+          // reads as though their answer was lost.
+          showAnswerSubmittedScreen(msg.currentQuestion);
         } else {
           const q = msg.currentQuestion;
-          timeLeft = q.remaining || TIME_PER_Q;
           playerShowQuestion(q);
         }
       } else if (msg.phase === 'reveal' || msg.phase === 'get_ready') {
-        showScreen('screen-lobby-player');
+        showAnswerSubmittedScreen(msg.currentQuestion, { waitingForNext: true });
       }
       break;
     }
@@ -842,6 +875,36 @@ function handlePlayerMessage(msg) {
   }
 }
 
+/**
+ * Shown when a student reconnects mid-question having already answered, or
+ * during the reveal/get-ready gap. Makes it clear their answer counted.
+ */
+function showAnswerSubmittedScreen(currentQuestion, { waitingForNext = false } = {}) {
+  clearTimer();
+  showScreen('screen-answer-submitted');
+  const title = $('#answer-submitted-title');
+  const detail = $('#answer-submitted-detail');
+  if (title) {
+    title.textContent = waitingForNext ? 'Next question coming up' : 'Answer submitted';
+  }
+  if (detail) {
+    detail.textContent = waitingForNext
+      ? 'Hold tight — the lecturer is about to move on.'
+      : 'Your answer was received. Waiting for the other students…';
+  }
+  const progress = $('#answer-submitted-progress');
+  if (progress) {
+    if (currentQuestion && currentQuestion.qNum && currentQuestion.totalQ) {
+      progress.textContent = `Question ${currentQuestion.qNum} of ${currentQuestion.totalQ}`;
+      progress.hidden = false;
+    } else {
+      progress.hidden = true;
+    }
+  }
+  const nameEl = $('#answer-submitted-name');
+  if (nameEl) nameEl.textContent = myPlayerName ? `Playing as ${myPlayerName}` : '';
+}
+
 function playerGetReady(qNum, totalQ) {
   showScreen('screen-ready');
   $('#ready-q-num').textContent = `Question ${qNum} of ${totalQ}`;
@@ -875,8 +938,9 @@ function playerShowQuestion(msg) {
     grid.appendChild(btn);
   });
 
+  questionTimeLimit = Number(msg.timeLimit) > 0 ? Number(msg.timeLimit) : TIME_PER_Q;
   const elapsed = msg.serverTimestamp ? (Date.now() / 1000 - msg.serverTimestamp) : 0;
-  timeLeft = Math.max(0, (msg.timeLimit || TIME_PER_Q) - elapsed);
+  timeLeft = Math.max(0, questionTimeLimit - elapsed);
   if (typeof msg.remaining === 'number') {
     timeLeft = Math.max(0, msg.remaining);
   }
@@ -907,12 +971,14 @@ function startPlayerTimer() {
 }
 
 function updatePlayerTimerDisplay() {
-  const pct = (timeLeft / TIME_PER_Q) * 100;
+  const limit = questionTimeLimit > 0 ? questionTimeLimit : TIME_PER_Q;
+  const pct = Math.max(0, Math.min(100, (timeLeft / limit) * 100));
   const bar = $('#timer-bar');
   const text = $('#timer-text');
   bar.style.width = `${pct}%`;
   text.textContent = Math.ceil(timeLeft);
-  if (timeLeft <= 10) {
+  // "Urgent" at the last third for short questions, last 10 s for long ones.
+  if (timeLeft <= Math.min(10, limit / 3)) {
     bar.classList.add('urgent');
     text.classList.add('urgent');
   } else {
@@ -1489,9 +1555,10 @@ function renderHostTestCards(tests) {
     const desc = test.description ? `<p class="test-card-desc">${escapeHtml(test.description)}</p>` : '';
     const owner = test.ownerName ? `<p class="test-card-owner">Owner: ${escapeHtml(test.ownerName)}</p>` : '';
     const updated = `<p class="test-card-updated">Updated ${escapeHtml(formatDateTime(test.updated_at || test.created_at))}</p>`;
-    const secondaryLabel = test.canEdit
-      ? 'Edit Test'
-      : (test.source === 'built-in' ? 'Edit Test' : 'Duplicate Test');
+    // The label must match what the button actually does. A built-in test used
+    // to read "Edit Test" while carrying the duplicate class, so it silently
+    // made a copy instead.
+    const secondaryLabel = test.canEdit ? 'Edit Test' : 'Copy & Edit';
     const secondaryClass = test.canEdit ? 'test-edit-btn' : 'test-duplicate-btn';
     const deleteButton = test.canEdit
       ? '<button class="btn btn-danger test-delete-btn">Delete</button>'
@@ -2525,7 +2592,7 @@ function handleHostMessage(msg) {
       $('#host-total-players').textContent = msg.total;
       break;
     case 'pause_state': {
-      document.querySelectorAll('#btn-pause-game').forEach((pauseBtn) => {
+      document.querySelectorAll('.btn-pause-game').forEach((pauseBtn) => {
         pauseBtn.textContent = msg.paused ? '▶ Resume' : '⏸ Pause';
       });
       if (msg.paused) {
@@ -2537,17 +2604,7 @@ function handleHostMessage(msg) {
       } else {
         // Resume the host timer bar from wherever hostTimeLeft currently is
         if (!hostTimerInterval && hostTimeLeft > 0) {
-          hostTimerInterval = setInterval(() => {
-            hostTimeLeft -= 0.1;
-            if (hostTimeLeft <= 0) {
-              hostTimeLeft = 0;
-              clearInterval(hostTimerInterval);
-              hostTimerInterval = null;
-            }
-            const pct = (hostTimeLeft / TIME_PER_Q) * 100;
-            $('#host-timer-bar').style.width = `${pct}%`;
-            $('#host-timer').textContent = Math.ceil(hostTimeLeft);
-          }, 100);
+          hostTimerInterval = setInterval(tickHostTimer, 100);
         }
       }
       break;
@@ -2646,19 +2703,25 @@ function hostShowQuestion(msg) {
     grid.appendChild(div);
   });
 
-  hostTimeLeft = msg.timeLimit || TIME_PER_Q;
+  hostQuestionTimeLimit = Number(msg.timeLimit) > 0 ? Number(msg.timeLimit) : TIME_PER_Q;
+  hostTimeLeft = hostQuestionTimeLimit;
+  const limitEl = $('#host-q-limit');
+  if (limitEl) limitEl.textContent = `${Math.round(hostQuestionTimeLimit)}s for this question`;
   if (hostTimerInterval) clearInterval(hostTimerInterval);
-  hostTimerInterval = setInterval(() => {
-    hostTimeLeft -= 0.1;
-    if (hostTimeLeft <= 0) {
-      hostTimeLeft = 0;
-      clearInterval(hostTimerInterval);
-      hostTimerInterval = null;
-    }
-    const pct = (hostTimeLeft / TIME_PER_Q) * 100;
-    $('#host-timer-bar').style.width = `${pct}%`;
-    $('#host-timer').textContent = Math.ceil(hostTimeLeft);
-  }, 100);
+  hostTimerInterval = setInterval(tickHostTimer, 100);
+}
+
+function tickHostTimer() {
+  hostTimeLeft -= 0.1;
+  if (hostTimeLeft <= 0) {
+    hostTimeLeft = 0;
+    clearInterval(hostTimerInterval);
+    hostTimerInterval = null;
+  }
+  const limit = hostQuestionTimeLimit > 0 ? hostQuestionTimeLimit : TIME_PER_Q;
+  const pct = Math.max(0, Math.min(100, (hostTimeLeft / limit) * 100));
+  $('#host-timer-bar').style.width = `${pct}%`;
+  $('#host-timer').textContent = Math.ceil(hostTimeLeft);
 }
 
 function hostShowReveal(msg) {
