@@ -15,18 +15,19 @@ import hmac
 import io
 import json
 import os
+import random
 import re
 import secrets
 import string
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,6 +35,13 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+
+import docx_import
+
+# `datetime.UTC` only exists on Python 3.11+. Render pins a Python version per
+# service, so importing it directly risks a boot failure on an older runtime.
+# `timezone.utc` is identical and available everywhere.
+UTC = timezone.utc
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Subject catalogue and built-in legacy question sets
@@ -47,10 +55,20 @@ SUBJECTS = {
 BUILTIN_SUBJECT_CODES = set(SUBJECTS.keys())
 SUBJECT_CODE_PATTERN = re.compile(r"^[A-Z0-9]{3,10}$")
 
-TIME_PER_Q = 30
+TIME_PER_Q = int(os.environ.get("TIME_PER_Q", "30"))
 MAX_POINTS = 1000
 MIN_POINTS = 200
+# Bounds for a configurable question time limit. TIME_PER_Q above is now the
+# fallback default rather than a hard constant.
+MIN_TIME_LIMIT = 5
+MAX_TIME_LIMIT = 300
 REQUEST_TIMEOUT = 20
+
+# Pacing constants. Overridable by environment so the test suite can run a whole
+# game in well under a second instead of waiting out the real classroom timings.
+GET_READY_SECONDS = float(os.environ.get("GET_READY_SECONDS", "3"))
+REVEAL_SECONDS = float(os.environ.get("REVEAL_SECONDS", "5"))
+GAME_CODE_COUNTDOWN_SECONDS = float(os.environ.get("GAME_CODE_COUNTDOWN_SECONDS", "20"))
 REQUIRE_SUPABASE = os.environ.get("REQUIRE_SUPABASE", "").strip().lower() in {"1", "true", "yes", "on"}
 _local_store_env = os.environ.get("LOCAL_STORE_PATH", "").strip()
 LOCAL_STORE_PATH = Path(_local_store_env).expanduser() if _local_store_env else (Path(__file__).resolve().parent / "local_store.json")
@@ -58,9 +76,51 @@ LOCAL_STORE_VERSION = 1
 
 limiter = Limiter(key_func=get_remote_address)
 
+# Draft autosave fires 1.5 s after typing stops, so a lecturer writing a long
+# quiz legitimately produces many writes a minute. A tight limit here would
+# break the very feature Phase 2 fixed, so this is deliberately generous.
+DRAFT_RATE_LIMIT = os.environ.get("DRAFT_RATE_LIMIT", "120/minute")
+
+# Stored game results. The automatic spreadsheet download at the end of a game
+# stays the authoritative record; these rows exist so a Render redeploy does not
+# destroy results that were never downloaded. Off with one variable if the free
+# plan's 500 MB ever feels tight.
+PERSIST_RESULTS = os.environ.get("PERSIST_RESULTS", "true").strip().lower() not in {"0", "false", "no", "off"}
+RESULTS_RETENTION = max(1, int(os.environ.get("RESULTS_RETENTION", "20")))
+
 
 class SupabaseUnavailable(RuntimeError):
     pass
+
+
+# ── PostgREST filter safety ──────────────────────────────────────────────────
+# Values go straight into filter strings such as f"eq.{test_id}". PostgREST
+# treats commas, dots and parentheses as filter syntax, so an unvalidated value
+# can change which rows a query matches. Validate before building any query.
+
+UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+LOCAL_ID_PATTERN = re.compile(r"^local:[0-9a-fA-F-]{36}$")
+
+
+def safe_test_id(test_id: str) -> str:
+    value = (test_id or "").strip()
+    if UUID_PATTERN.match(value) or LOCAL_ID_PATTERN.match(value):
+        return value
+    raise ValueError("Invalid test id.")
+
+
+def safe_subject_code(subject_code: str) -> str:
+    value = (subject_code or "").strip().upper()
+    if SUBJECT_CODE_PATTERN.match(value):
+        return value
+    raise ValueError("Invalid subject code.")
+
+
+def safe_lecturer_id(lecturer_id: str) -> str:
+    value = (lecturer_id or "").strip()
+    if UUID_PATTERN.match(value):
+        return value
+    raise ValueError("Invalid lecturer id.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -70,12 +130,88 @@ SESSION_COOKIE_NAME = "lecturer_session"
 SESSION_MAX_AGE = 60 * 60 * 24 * 14  # 14 days
 
 
+DEV_SESSION_SECRET = "engineering-quiz-dev-secret"
+
+
 def _session_secret() -> str:
     return (
         os.environ.get("APP_SESSION_SECRET", "").strip()
         or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-        or "engineering-quiz-dev-secret"
+        or DEV_SESSION_SECRET
     )
+
+
+def _check_session_secret_configured() -> None:
+    """Refuse to start in production with the built-in development secret.
+
+    Anyone who has read this source could otherwise forge a lecturer session
+    cookie. Locally (no SUPABASE_URL) the fallback is fine and keeps first-run
+    setup frictionless.
+
+    NOTE for the first deploy: set APP_SESSION_SECRET to the *current* value of
+    SUPABASE_SERVICE_ROLE_KEY. That is what existing sessions are already signed
+    with, so nobody gets signed out. Rotate it to a fresh random value later.
+    """
+    if not os.environ.get("SUPABASE_URL", "").strip():
+        return
+    if os.environ.get("APP_SESSION_SECRET", "").strip():
+        return
+    if os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip():
+        # Sessions are signed with the service role key. Works, but the key is
+        # meant to be rotatable without signing every lecturer out.
+        print(
+            "[startup] WARNING: APP_SESSION_SECRET is not set, so lecturer sessions are "
+            "signed with SUPABASE_SERVICE_ROLE_KEY. Set APP_SESSION_SECRET to the current "
+            "value of SUPABASE_SERVICE_ROLE_KEY now (nobody gets signed out), then rotate "
+            "it to a fresh random value at a convenient moment."
+        )
+        return
+    raise RuntimeError(
+        "APP_SESSION_SECRET must be set when SUPABASE_URL is configured. "
+        "Refusing to sign lecturer sessions with the built-in development secret."
+    )
+
+
+# ── Lecturer signup gating ───────────────────────────────────────────────────
+# If neither variable is set, signup stays open exactly as before. This matters:
+# the change must not lock anyone out of a running deployment before the owner
+# has configured it.
+
+def _allowed_email_domains() -> list[str]:
+    raw = os.environ.get("ALLOWED_EMAIL_DOMAINS", "").strip()
+    return [d.strip().lower().lstrip("@") for d in raw.split(",") if d.strip()]
+
+
+def _signup_invite_code() -> str:
+    return os.environ.get("SIGNUP_INVITE_CODE", "").strip()
+
+
+def check_signup_allowed(email: str, invite_code: str) -> None:
+    """Raise PermissionError with a message the lecturer can act on."""
+    domains = _allowed_email_domains()
+    required_code = _signup_invite_code()
+    if not domains and not required_code:
+        return                                  # open signup, as before
+
+    domain = (email or "").rsplit("@", 1)[-1].strip().lower()
+    domain_ok = bool(domains) and any(domain == d or domain.endswith("." + d) for d in domains)
+    code_ok = bool(required_code) and hmac.compare_digest((invite_code or "").strip(), required_code)
+
+    if domain_ok or code_ok:
+        return
+
+    if domains and required_code:
+        listed = ", ".join(domains)
+        raise PermissionError(
+            f"Accounts are limited to {listed} email addresses. Use your work email, "
+            "or enter the invite code your administrator gave you."
+        )
+    if domains:
+        listed = ", ".join(domains)
+        raise PermissionError(
+            f"Accounts are limited to {listed} email addresses. Please sign up with your work email."
+        )
+    raise PermissionError("An invite code is required to create a lecturer account.")
 
 
 def hash_password(password: str) -> str:
@@ -97,11 +233,22 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(candidate, digest)
 
 
+# 260k PBKDF2 rounds take 100-200 ms. Run them on a worker thread: on the event
+# loop they stall every other request, including live games — a class signing in
+# would freeze the quiz everyone else is playing.
+async def hash_password_async(password: str) -> str:
+    return await asyncio.to_thread(hash_password, password)
+
+
+async def verify_password_async(password: str, stored: str) -> bool:
+    return await asyncio.to_thread(verify_password, password, stored)
+
+
 def create_session_token(lecturer_id: str) -> str:
     expires = int(time.time()) + SESSION_MAX_AGE
     payload = f"{lecturer_id}.{expires}"
     signature = hmac.new(_session_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(f"{payload}.{signature.hex()}".encode("utf-8")).decode("utf-8")
+    return base64.urlsafe_b64encode(f"{payload}.{signature.hex()}".encode()).decode("utf-8")
 
 
 def parse_session_token(token: str | None) -> str | None:
@@ -121,11 +268,48 @@ def parse_session_token(token: str | None) -> str | None:
         return None
 
 
+# ── Visitor identity ─────────────────────────────────────────────────────────
+# The visitor id used to come straight off a query parameter, so a student could
+# supply someone else's id and take over their session and score. The server now
+# issues the id inside a signed token and never trusts a bare id.
+
+VISITOR_TOKEN_MAX_AGE = 60 * 60 * 24 * 30      # 30 days
+
+
+def create_visitor_token(visitor_id: str | None = None) -> tuple[str, str]:
+    visitor_id = visitor_id or str(uuid.uuid4())
+    expires = int(time.time()) + VISITOR_TOKEN_MAX_AGE
+    payload = f"{visitor_id}.{expires}"
+    signature = hmac.new(_session_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    token = base64.urlsafe_b64encode(f"{payload}.{signature}".encode()).decode("utf-8")
+    return visitor_id, token
+
+
+def parse_visitor_token(token: str | None) -> str | None:
+    if not token:
+        return None
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode("utf-8")).decode("utf-8")
+        visitor_id, expires_str, signature = decoded.rsplit(".", 2)
+        payload = f"{visitor_id}.{expires_str}"
+        expected = hmac.new(_session_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        if int(expires_str) < int(time.time()):
+            return None
+        return visitor_id or None
+    except Exception:
+        return None
+
+
 class QuestionPayload(BaseModel):
     q: str = Field(min_length=1, max_length=600)
     options: list[str]
     correct: int = Field(ge=0, le=3)
     explanation: str = Field(default="", max_length=2000)
+    # None means "use the test default". Existing saved questions have no such
+    # field at all, so they keep running at exactly TIME_PER_Q with no migration.
+    time_limit: int | None = Field(default=None, ge=MIN_TIME_LIMIT, le=MAX_TIME_LIMIT)
 
     @field_validator("options")
     @classmethod
@@ -159,6 +343,7 @@ class TestPayload(BaseModel):
     chapter: str = Field(default="", max_length=140)
     description: str = Field(default="", max_length=600)
     questions: list[QuestionPayload]
+    default_time_limit: int = Field(default=TIME_PER_Q, ge=MIN_TIME_LIMIT, le=MAX_TIME_LIMIT)
 
     @field_validator("title")
     @classmethod
@@ -211,6 +396,7 @@ class LecturerSignupPayload(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     email: str = Field(min_length=5, max_length=240)
     password: str = Field(min_length=8, max_length=200)
+    inviteCode: str = Field(default="", max_length=200)
 
     @field_validator("name")
     @classmethod
@@ -244,6 +430,7 @@ class DraftQuestionPayload(BaseModel):
     options: list[str] = Field(default_factory=lambda: ["", "", "", ""])
     correct: int = Field(default=0, ge=0, le=3)
     explanation: str = Field(default="", max_length=2000)
+    time_limit: int | None = Field(default=None, ge=MIN_TIME_LIMIT, le=MAX_TIME_LIMIT)
 
     @field_validator("options")
     @classmethod
@@ -270,6 +457,7 @@ class DraftPayload(BaseModel):
     description: str = Field(default="", max_length=600)
     questions: list[DraftQuestionPayload] = Field(default_factory=list)
     editingTestId: str | None = None
+    default_time_limit: int = Field(default=TIME_PER_Q, ge=MIN_TIME_LIMIT, le=MAX_TIME_LIMIT)
 
     @field_validator("title")
     @classmethod
@@ -303,6 +491,7 @@ class SupabaseStore:
         self.lecturers_base = f"{self.base_url}/rest/v1/quiz_lecturers"
         self.drafts_base = f"{self.base_url}/rest/v1/quiz_test_drafts"
         self.subjects_base = f"{self.base_url}/rest/v1/quiz_subjects"
+        self.results_base = f"{self.base_url}/rest/v1/quiz_game_results"
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -315,7 +504,26 @@ class SupabaseStore:
                 detail = resp.text
             raise RuntimeError(f"Supabase request failed: {detail}")
 
+    # Characters PostgREST reads as filter syntax. A value containing these can
+    # change which rows a query matches, so no interpolated value may carry them.
+    _FILTER_METACHARS = set(',()"*')
+    _FILTER_OPERATORS = ("eq.", "ilike.", "like.", "neq.", "gt.", "gte.", "lt.", "lte.", "in.", "is.")
+
+    @classmethod
+    def _check_filter_params(cls, params: dict[str, Any] | None) -> None:
+        for key, value in (params or {}).items():
+            if key in {"select", "order", "limit", "offset"} or not isinstance(value, str):
+                continue
+            if not value.startswith(cls._FILTER_OPERATORS):
+                continue
+            operand = value.split(".", 1)[1]
+            if cls._FILTER_METACHARS & set(operand):
+                raise ValueError(f"Refusing to build a PostgREST filter from an unsafe value for {key!r}.")
+
     async def _request(self, method: str, url: str, *, params=None, body=None, prefer: str | None = None) -> list[dict[str, Any]]:
+        # Single choke point: every filter value passes through here, so this
+        # covers present and future call sites alike.
+        self._check_filter_params(params)
         headers = dict(self._client.headers)
         if prefer:
             headers["Prefer"] = prefer
@@ -408,7 +616,7 @@ class SupabaseStore:
 
     async def list_tests_by_creator(self, lecturer_id: str) -> list[dict[str, Any]]:
         rows = await self._request("GET", self.quiz_tests_base, params={
-            "select": "id,subject_code,title,chapter,description,questions,question_count,created_at,updated_at,created_by,owner_name",
+            "select": "id,subject_code,title,chapter,description,questions,question_count,default_time_limit,created_at,updated_at,created_by,owner_name",
             "created_by": f"eq.{lecturer_id}",
             "order": "subject_code.asc,updated_at.desc",
         })
@@ -417,9 +625,15 @@ class SupabaseStore:
             row.setdefault("question_count", len(row.get("questions") or []))
         return rows
 
+    async def list_all_test_counts(self) -> list[dict[str, Any]]:
+        """Every test's subject and question count, for the subject list."""
+        return await self._request("GET", self.quiz_tests_base, params={
+            "select": "subject_code,question_count",
+        })
+
     async def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
         rows = await self._request("GET", self.quiz_tests_base, params={
-            "select": "id,subject_code,title,chapter,description,question_count,created_at,updated_at,created_by,owner_name",
+            "select": "id,subject_code,title,chapter,description,question_count,default_time_limit,created_at,updated_at,created_by,owner_name",
             "subject_code": f"eq.{subject_code}",
             "order": "updated_at.desc",
         })
@@ -449,6 +663,7 @@ class SupabaseStore:
             "chapter": payload.chapter or None,
             "description": payload.description or None,
             "question_count": len(payload.questions),
+            "default_time_limit": payload.default_time_limit,
             "questions": [q.model_dump() for q in payload.questions],
             "created_by": lecturer["id"],
             "updated_by": lecturer["id"],
@@ -481,10 +696,11 @@ class SupabaseStore:
             "chapter": payload.chapter or None,
             "description": payload.description or None,
             "question_count": len(payload.questions),
+            "default_time_limit": payload.default_time_limit,
             "questions": [q.model_dump() for q in payload.questions],
             "updated_by": lecturer["id"],
             "owner_name": existing.get("owner_name") or lecturer.get("name") or lecturer.get("email") or "Lecturer",
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
         }, prefer="return=representation")
         if not rows:
             raise RuntimeError("Supabase did not return the updated test.")
@@ -493,9 +709,49 @@ class SupabaseStore:
         row["can_edit"] = True
         return row
 
+    async def list_game_results(self, subject_code: str, limit: int = 50) -> list[dict[str, Any]]:
+        return await self._request("GET", self.results_base, params={
+            "select": "id,subject_code,test_id,test_title,session_name,played_at,player_count,question_count",
+            "subject_code": f"eq.{subject_code}",
+            "order": "played_at.desc",
+            "limit": str(limit),
+        })
+
+    async def get_game_result(self, result_id: str) -> dict[str, Any] | None:
+        rows = await self._request("GET", self.results_base, params={
+            "select": "*",
+            "id": f"eq.{result_id}",
+            "limit": "1",
+        })
+        return rows[0] if rows else None
+
+    async def insert_game_result(self, row: dict[str, Any]) -> dict[str, Any]:
+        rows = await self._request("POST", self.results_base, body=row, prefer="return=representation")
+        if not rows:
+            raise RuntimeError("Supabase did not return the stored result.")
+        return rows[0]
+
+    async def prune_game_results(self, subject_code: str, keep: int) -> int:
+        """Delete everything older than the `keep` most recent for this subject."""
+        rows = await self._request("GET", self.results_base, params={
+            "select": "id,played_at",
+            "subject_code": f"eq.{subject_code}",
+            "order": "played_at.desc",
+            "offset": str(keep),
+            "limit": "200",
+        })
+        removed = 0
+        for row in rows or []:
+            try:
+                await self._request("DELETE", self.results_base, params={"id": f"eq.{row['id']}"})
+                removed += 1
+            except Exception:
+                break
+        return removed
+
     async def get_draft(self, subject_code: str, lecturer_id: str) -> dict[str, Any] | None:
         rows = await self._request("GET", self.drafts_base, params={
-            "select": "id,lecturer_id,subject_code,title,chapter,description,questions,question_count,editing_test_id,updated_at",
+            "select": "id,lecturer_id,subject_code,title,chapter,description,questions,question_count,default_time_limit,editing_test_id,updated_at",
             "lecturer_id": f"eq.{lecturer_id}",
             "subject_code": f"eq.{subject_code}",
             "limit": "1",
@@ -511,10 +767,11 @@ class SupabaseStore:
             "chapter": payload.chapter or None,
             "description": payload.description or None,
             "question_count": len(payload.questions),
+            "default_time_limit": payload.default_time_limit,
             "questions": [q.model_dump() for q in payload.questions],
             "editing_test_id": payload.editingTestId,
             "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
         }
         if existing:
             rows = await self._request("PATCH", self.drafts_base, params={
@@ -540,6 +797,8 @@ class HybridTestRepository:
         self.builtin_tests: dict[str, dict[str, dict[str, Any]]] = {}
         self.local_custom_tests: dict[str, dict[str, dict[str, Any]]] = {}
         self.local_drafts: dict[tuple[str, str], dict[str, Any]] = {}
+        self.local_results: dict[str, list[dict[str, Any]]] = {}
+        self.results_error: str | None = None
         self.local_lecturers: dict[str, dict[str, Any]] = {}
         self.local_subjects: dict[str, dict[str, Any]] = {}
         self.local_store_path = LOCAL_STORE_PATH
@@ -548,6 +807,9 @@ class HybridTestRepository:
         self.require_supabase = REQUIRE_SUPABASE
         self.supabase_configured = False
         self.supabase_error: str | None = None
+        # Draft failures are tracked separately: they must never disable the
+        # Supabase connection used for tests, but they must still be visible.
+        self.draft_error: str | None = None
         self._seed_builtin_tests()
         self._load_local_store()
 
@@ -647,6 +909,11 @@ class HybridTestRepository:
         lecturers = data.get("local_lecturers", {})
         if isinstance(lecturers, dict):
             self.local_lecturers = lecturers
+        results = data.get("local_results", {})
+        if isinstance(results, dict):
+            for code, rows in results.items():
+                if isinstance(rows, list):
+                    self.local_results[code] = [r for r in rows if isinstance(r, dict)][:RESULTS_RETENTION]
 
     def _persist_local_store(self) -> None:
         if not self.local_store_enabled:
@@ -660,6 +927,7 @@ class HybridTestRepository:
                 for (lecturer_id, subject_code), row in self.local_drafts.items()
             },
             "local_lecturers": self.local_lecturers,
+            "local_results": self.local_results,
         }
         tmp_path = self.local_store_path.with_suffix(".tmp")
         try:
@@ -739,7 +1007,32 @@ class HybridTestRepository:
             "supabaseConfigured": self.supabase_configured,
             "note": note,
             "supabaseError": self.supabase_error,
+            "asleep": self.supabase_looks_asleep(),
+            "results": self.results_storage_usage(),
         }
+
+    def supabase_looks_asleep(self) -> bool:
+        """Detect a paused Supabase free project.
+
+        Free projects are paused after 7 days of inactivity — which lands in the
+        middle of a semester break — and then return connection failures rather
+        than anything explanatory. Better to say "the database is asleep, resume
+        it in your dashboard" than to show a generic error.
+        """
+        if not self.supabase_configured:
+            return False
+        blob = f"{self.supabase_error or ''} {self.results_error or ''} {self.draft_error or ''}".lower()
+        if not blob.strip():
+            return False
+        return any(
+            marker in blob
+            for marker in (
+                "getaddrinfo", "name or service not known", "nodename nor servname",
+                "connection refused", "connect call failed", "timed out", "timeout",
+                "connecterror", "temporary failure in name resolution",
+                "project is paused", "service unavailable", "502", "503",
+            )
+        )
 
     def _summary(self, row: dict[str, Any], lecturer_id: str | None = None) -> dict[str, Any]:
         created_by = row.get("created_by")
@@ -754,6 +1047,8 @@ class HybridTestRepository:
             "chapter": row.get("chapter") or "",
             "description": row.get("description") or "",
             "questionCount": row.get("question_count") or len(row.get("questions") or []),
+            "defaultTimeLimit": coerce_time_limit(row.get("default_time_limit")) or TIME_PER_Q,
+            "estimatedSeconds": estimate_test_seconds(row),
             "source": source,
             "created_at": row.get("created_at"),
             "updated_at": row.get("updated_at"),
@@ -811,15 +1106,15 @@ class HybridTestRepository:
         self._ensure_supabase_for_write()
         if await self.get_lecturer_by_email(payload.email):
             raise ValueError("An account with that email already exists.")
-        password_hash = hash_password(payload.password)
+        password_hash = await hash_password_async(payload.password)
         def _local_create():
             row = {
                 "id": str(uuid.uuid4()),
                 "name": payload.name,
                 "email": payload.email,
                 "password_hash": password_hash,
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
             }
             self.local_lecturers[payload.email] = row
             self._persist_local_store()
@@ -881,7 +1176,7 @@ class HybridTestRepository:
                 "code": code,
                 "name": name,
                 "created_by": lecturer.get("id"),
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
             }
             self.local_subjects[code] = row
             self._register_subject(code, name)
@@ -892,7 +1187,7 @@ class HybridTestRepository:
                 return await self.remote.create_subject(code, name, lecturer["id"])
             except RuntimeError as exc:
                 if "duplicate" in str(exc).lower():
-                    raise ValueError("Subject code already exists.")
+                    raise ValueError("Subject code already exists.") from exc
                 raise
         row = await self._call_remote(_remote_create() if self.remote else None, _local_create)
         if row:
@@ -958,6 +1253,31 @@ class HybridTestRepository:
                     local_rows.append(row)
         return list(remote_rows or []) + local_rows
 
+    async def get_test_counts(self) -> dict[str, dict[str, int]]:
+        """Test and question counts per subject, in a single Supabase round trip.
+
+        Replaces one list_tests() call per subject on GET /api/subjects.
+        """
+        counts: dict[str, dict[str, int]] = {}
+
+        def _add(subject_code: str, question_count: int) -> None:
+            entry = counts.setdefault(subject_code, {"tests": 0, "questions": 0})
+            entry["tests"] += 1
+            entry["questions"] += question_count
+
+        remote_rows = await self._call_remote(
+            self.remote.list_all_test_counts() if self.remote else None,
+            lambda: []
+        )
+        for row in remote_rows or []:
+            code = (row.get("subject_code") or "").strip().upper()
+            if code:
+                _add(code, int(row.get("question_count") or 0))
+        for code, items in self.local_custom_tests.items():
+            for row in items.values():
+                _add(code, int(row.get("question_count") or len(row.get("questions") or [])))
+        return counts
+
     async def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
         if subject_code not in self.subjects:
             raise KeyError(subject_code)
@@ -1000,9 +1320,10 @@ class HybridTestRepository:
                 "chapter": payload.chapter,
                 "description": payload.description,
                 "question_count": len(payload.questions),
+                "default_time_limit": payload.default_time_limit,
                 "questions": [q.model_dump() for q in payload.questions],
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
                 "source": "local-file" if self.local_store_enabled else "in-memory",
                 "created_by": lecturer["id"],
                 "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
@@ -1034,8 +1355,9 @@ class HybridTestRepository:
                 "chapter": payload.chapter,
                 "description": payload.description,
                 "question_count": len(payload.questions),
+                "default_time_limit": payload.default_time_limit,
                 "questions": [q.model_dump() for q in payload.questions],
-                "updated_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
             })
             self._persist_local_store()
             return row
@@ -1074,18 +1396,159 @@ class HybridTestRepository:
 
         return await self._call_remote(_remote_delete() if self.remote else None, _local_delete)
 
-    async def get_draft(self, subject_code: str, lecturer: dict[str, Any]) -> dict[str, Any] | None:
-        # Do NOT use _call_remote here — a failure on the quiz_test_drafts table must
-        # never disable self.remote (which would break all subsequent test reads/writes).
+    # ── Stored game results ──────────────────────────────────────────────────
+    # Deliberately lightweight. The automatic spreadsheet download at the end of
+    # a game stays the authoritative record; this exists so a Render redeploy
+    # does not destroy results that were never downloaded. Question text is NOT
+    # duplicated — the test id is referenced instead.
+
+    def _result_row(self, stats: dict[str, Any], lecturer_id: str | None) -> dict[str, Any]:
+        players = []
+        for vid, player in (stats.get("players") or {}).items():
+            players.append({
+                "id": vid,
+                "name": player.get("name", ""),
+                "student_number": player.get("student_number", ""),
+                "score": player.get("score", 0),
+                # Only what is needed to rebuild the spreadsheet against the test.
+                "answers": [
+                    {
+                        "q": a.get("q"),
+                        "choice": a.get("choice", -1),
+                        "correct": bool(a.get("correct")),
+                        "points": a.get("points", 0),
+                        "time": round(float(a.get("time") or 0), 2),
+                    }
+                    for a in (player.get("answers") or [])
+                ],
+            })
+        return {
+            "subject_code": stats.get("subject_code"),
+            "test_id": stats.get("test_id"),
+            "test_title": stats.get("test_title") or "",
+            "session_name": stats.get("session_name") or "",
+            "played_at": stats.get("timestamp") or datetime.now(UTC).isoformat(),
+            "player_count": len(players),
+            "question_count": len(stats.get("questions") or []),
+            "players": players,
+            "created_by": lecturer_id,
+        }
+
+    async def store_game_result(self, stats: dict[str, Any], lecturer_id: str | None = None) -> dict[str, Any] | None:
+        if not PERSIST_RESULTS or not stats or not stats.get("players"):
+            return None
+        row = self._result_row(stats, lecturer_id)
+        subject_code = row["subject_code"]
+
+        def _local_store():
+            row_local = dict(row, id=f"result:{uuid.uuid4()}")
+            bucket = self.local_results.setdefault(subject_code, [])
+            bucket.append(row_local)
+            bucket.sort(key=lambda item: str(item.get("played_at") or ""), reverse=True)
+            del bucket[RESULTS_RETENTION:]          # prune after each insert
+            self._persist_local_store()
+            return row_local
+
         if self.remote is not None:
             try:
-                return await self.remote.get_draft(subject_code, lecturer["id"])
-            except Exception:
-                pass  # Fall back to local silently
-        return self.local_drafts.get((lecturer["id"], subject_code))
+                stored = await self.remote.insert_game_result(row)
+                try:
+                    await self.remote.prune_game_results(subject_code, RESULTS_RETENTION)
+                except Exception as exc:
+                    print(f"[results] prune failed for {subject_code}: {exc}")
+                return stored
+            except Exception as exc:
+                # Never let this break the end of a game — the lecturer's
+                # automatic download is the record that matters.
+                self.results_error = str(exc)
+                print(f"[results] Supabase store failed for {subject_code}: {exc}")
+        try:
+            return _local_store()
+        except Exception as exc:
+            self.results_error = str(exc)
+            return None
 
-    async def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> dict[str, Any]:
+    async def list_game_results(self, subject_code: str) -> list[dict[str, Any]]:
+        remote_rows = []
+        if self.remote is not None:
+            try:
+                remote_rows = await self.remote.list_game_results(subject_code, RESULTS_RETENTION)
+            except Exception as exc:
+                self.results_error = str(exc)
+        local_rows = [
+            {k: v for k, v in row.items() if k != "players"}
+            for row in self.local_results.get(subject_code, [])
+        ]
+        combined = list(remote_rows or []) + local_rows
+        combined.sort(key=lambda item: str(item.get("played_at") or ""), reverse=True)
+        return combined[:RESULTS_RETENTION]
+
+    async def get_game_result(self, subject_code: str, result_id: str) -> dict[str, Any] | None:
+        for row in self.local_results.get(subject_code, []):
+            if row.get("id") == result_id:
+                return row
+        if self.remote is not None:
+            try:
+                return await self.remote.get_game_result(result_id)
+            except Exception as exc:
+                self.results_error = str(exc)
+        return None
+
+    def results_storage_usage(self, subject_code: str | None = None) -> dict[str, Any]:
+        """Roughly how much space stored results occupy, so the cost is visible."""
+        buckets = (
+            [self.local_results.get(subject_code, [])] if subject_code
+            else list(self.local_results.values())
+        )
+        sessions = sum(len(bucket) for bucket in buckets)
+        approx_bytes = sum(
+            len(json.dumps(row, ensure_ascii=False).encode("utf-8"))
+            for bucket in buckets for row in bucket
+        )
+        return {
+            "enabled": PERSIST_RESULTS,
+            "retention": RESULTS_RETENTION,
+            "sessions": sessions,
+            "approxBytes": approx_bytes,
+            "approxKb": round(approx_bytes / 1024, 1),
+        }
+
+    def _local_draft_backend(self) -> str:
+        return "local-file" if self.local_store_enabled else "memory"
+
+    async def get_draft(self, subject_code: str, lecturer: dict[str, Any]) -> tuple[dict[str, Any] | None, str, str | None]:
+        """Return (draft, backend_it_came_from, error_text).
+
+        Do NOT use _call_remote here — a failure on the quiz_test_drafts table
+        must never disable self.remote, which would break all subsequent test
+        reads and writes.
+        """
+        error: str | None = None
+        if self.remote is not None:
+            try:
+                row = await self.remote.get_draft(subject_code, lecturer["id"])
+                if row is not None:
+                    return row, "supabase", None
+                # Supabase is reachable and simply has no draft. Still fall through
+                # to the local copy: a draft written while Supabase was down lives
+                # there and would otherwise be invisible.
+            except Exception as exc:
+                error = str(exc)
+                self.draft_error = error
+        local = self.local_drafts.get((lecturer["id"], subject_code))
+        if local is not None:
+            return local, self._local_draft_backend(), error
+        return None, "supabase" if (self.remote is not None and not error) else self._local_draft_backend(), error
+
+    async def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> tuple[dict[str, Any], str, str | None]:
+        """Save a draft and report which backend actually stored it.
+
+        Returns (row, backend, supabase_error). Raises if nothing could store it
+        — a draft the lecturer believes is safe but which was never written is
+        worse than an error message.
+        """
         self._ensure_supabase_for_write()
+
         def _local_save():
             row = {
                 "id": self.local_drafts.get((lecturer["id"], subject_code), {}).get("id", f"draft:{uuid.uuid4()}"),
@@ -1095,22 +1558,39 @@ class HybridTestRepository:
                 "chapter": payload.chapter,
                 "description": payload.description,
                 "question_count": len(payload.questions),
+                "default_time_limit": payload.default_time_limit,
                 "questions": [q.model_dump() for q in payload.questions],
                 "editing_test_id": payload.editingTestId,
-                "updated_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
                 "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
             }
             self.local_drafts[(lecturer["id"], subject_code)] = row
             self._persist_local_store()
             return row
-        # Do NOT use _call_remote here — a failure on the quiz_test_drafts table must
-        # never disable self.remote (which would break all subsequent test reads/writes).
+
+        remote_error: str | None = None
         if self.remote is not None:
             try:
-                return await self.remote.save_draft(subject_code, lecturer, payload)
-            except Exception:
-                pass  # Fall back to local silently; draft failure is non-critical
-        return _local_save()
+                row = await self.remote.save_draft(subject_code, lecturer, payload)
+                self.draft_error = None
+                # Mirror into the local store so a later Supabase outage still has
+                # something to hand back.
+                try:
+                    _local_save()
+                except Exception:
+                    pass
+                return row, "supabase", None
+            except Exception as exc:
+                # Log it. The old code swallowed this entirely, so a draft could
+                # land in an ephemeral file while the UI said "Draft saved".
+                remote_error = str(exc)
+                self.draft_error = remote_error
+                print(f"[drafts] Supabase draft save failed for {subject_code}: {remote_error}")
+
+        row = _local_save()
+        # _persist_local_store() flips local_store_enabled off if the file could
+        # not be written, so read the backend back after saving, not before.
+        return row, self._local_draft_backend(), remote_error
 
     async def clear_draft(self, subject_code: str, lecturer: dict[str, Any]) -> None:
         # Always clear the local draft copy first.
@@ -1131,10 +1611,53 @@ repo = HybridTestRepository(SUBJECTS)
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-room live game state
 # ──────────────────────────────────────────────────────────────────────────────
+def coerce_time_limit(value: Any) -> int | None:
+    """A usable limit within bounds, or None to fall through to the next level."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    if MIN_TIME_LIMIT <= seconds <= MAX_TIME_LIMIT:
+        return seconds
+    return None
+
+
+def estimate_test_seconds(row: dict[str, Any]) -> int:
+    """Rough wall-clock length: each question's limit plus the ready and reveal pauses."""
+    default_limit = coerce_time_limit(row.get("default_time_limit")) or TIME_PER_Q
+    questions = row.get("questions") or []
+    if not questions:
+        count = int(row.get("question_count") or 0)
+        return int(count * (default_limit + GET_READY_SECONDS + REVEAL_SECONDS))
+    total = 0.0
+    for question in questions:
+        limit = default_limit
+        if isinstance(question, dict):
+            limit = coerce_time_limit(question.get("time_limit")) or default_limit
+        total += limit + GET_READY_SECONDS + REVEAL_SECONDS
+    return int(total)
+
+
+MAX_PLAYERS_PER_ROOM = int(os.environ.get("MAX_PLAYERS_PER_ROOM", "300"))
+MAX_WS_MESSAGE_BYTES = int(os.environ.get("MAX_WS_MESSAGE_BYTES", str(64 * 1024)))
+
+
 class GameRoom:
     def __init__(self, subject_code: str):
         self.subject_code = subject_code
-        self.subject_name = SUBJECTS[subject_code]["name"]
+        subject = SUBJECTS.get(subject_code)
+        if subject is None:
+            # A room for a subject that is not in the catalogue used to raise
+            # KeyError and take down whatever was constructing it.
+            self.subject_name = subject_code
+        else:
+            self.subject_name = subject.get("name") or subject_code
+        # Serialises question advance / reveal so a double click on "Next
+        # Question", or a click racing the auto-reveal timer, cannot increment
+        # current_q twice and skip a question.
+        self.advance_lock = asyncio.Lock()
         self.last_game_stats = None
         self.active_test_id = None
         self.active_test_title = ""
@@ -1145,6 +1668,7 @@ class GameRoom:
         self.current_token = ""
         self.game_code = ""
         self.game_code_enabled = False
+        self.default_time_limit = TIME_PER_Q
         self.reset_runtime_state(clear_players=True)
 
     def set_active_test(self, test_data: dict[str, Any] | None) -> None:
@@ -1153,6 +1677,25 @@ class GameRoom:
         self.active_test_chapter = test_data.get("chapter", "") if test_data else ""
         self.questions = list(test_data.get("questions", [])) if test_data else []
         self.total_q = len(self.questions)
+        self.default_time_limit = coerce_time_limit(
+            test_data.get("default_time_limit") if test_data else None
+        ) or TIME_PER_Q
+
+    def time_limit_for(self, index: int | None = None) -> int:
+        """Resolve the limit: question level → test level → TIME_PER_Q.
+
+        Tests saved before this feature have neither, so they keep running at
+        exactly 30 seconds with no migration.
+        """
+        if index is None:
+            index = self.current_q
+        if 0 <= index < len(self.questions):
+            question = self.questions[index]
+            if isinstance(question, dict):
+                per_question = coerce_time_limit(question.get("time_limit"))
+                if per_question:
+                    return per_question
+        return coerce_time_limit(getattr(self, "default_time_limit", None)) or TIME_PER_Q
 
     def reset_runtime_state(self, *, clear_players: bool) -> None:
         self.phase = "lobby"
@@ -1166,8 +1709,11 @@ class GameRoom:
             self.current_token = ""
         self.host_ws = None
         self.host_visitor = None
+        self.host_lecturer_id: str | None = None
         self.answers_this_round = {}
         self.question_timer_task = None
+        self.question_time_limit = TIME_PER_Q
+        self.start_task: asyncio.Task | None = None
         self.paused = False
         self._pending_room_update: asyncio.Task | None = None
 
@@ -1181,7 +1727,7 @@ class GameRoom:
             "test_title": self.active_test_title,
             "test_chapter": self.active_test_chapter,
             "session_name": self.session_name,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now().astimezone().isoformat(),
             "questions": self.questions,
             "players": {}
         }
@@ -1306,10 +1852,28 @@ async def lifespan(app: FastAPI):
             except Exception:
                 pass
 
+_check_session_secret_configured()
+
 app = FastAPI(lifespan=lifespan)
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").strip()
-allow_origins = ["*"] if ALLOWED_ORIGINS == "*" else [origin.strip() for origin in ALLOWED_ORIGINS.split(",") if origin.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=allow_origins, allow_methods=["*"], allow_headers=["*"])
+
+# The app is served same-origin, so it needs no cross-origin access at all.
+# Defaulting to "*" meant any site could call the API from a visitor's browser.
+# "*" is now opt-in; set ALLOWED_ORIGINS explicitly if you ever need it.
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "").strip()
+if ALLOWED_ORIGINS == "*":
+    allow_origins = ["*"]
+elif ALLOWED_ORIGINS:
+    allow_origins = [origin.strip() for origin in ALLOWED_ORIGINS.split(",") if origin.strip()]
+else:
+    render_host = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+    allow_origins = [render_host] if render_host else []
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=bool(allow_origins) and allow_origins != ["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -1330,6 +1894,11 @@ def style_css():
 @app.get("/app.js")
 def app_js():
     return FileResponse(BASE_DIR / "app.js", media_type="application/javascript")
+
+
+@app.get("/draft_utils.js")
+def draft_utils_js():
+    return FileResponse(BASE_DIR / "draft_utils.js", media_type="application/javascript")
 
 
 def public_lecturer_view(row: dict[str, Any]) -> dict[str, Any]:
@@ -1370,6 +1939,24 @@ async def require_lecturer(request: Request) -> dict[str, Any]:
     return lecturer
 
 
+def validation_detail(exc: ValidationError) -> list[dict[str, Any]]:
+    """JSON-safe validation errors.
+
+    Pydantic's `errors()` puts the original exception object in `ctx`, which
+    FastAPI cannot serialise — the response blows up with a TypeError and the
+    lecturer sees a dead request instead of "Each question must have exactly 4
+    options." Keep only the fields the front end actually reads.
+    """
+    detail = []
+    for error in exc.errors():
+        detail.append({
+            "loc": [str(part) for part in error.get("loc", ())],
+            "msg": str(error.get("msg", "Invalid value")),
+            "type": str(error.get("type", "value_error")),
+        })
+    return detail
+
+
 async def current_lecturer_from_websocket(websocket: WebSocket) -> dict[str, Any] | None:
     lecturer_id = parse_session_token(websocket.cookies.get(SESSION_COOKIE_NAME))
     if not lecturer_id:
@@ -1377,14 +1964,54 @@ async def current_lecturer_from_websocket(websocket: WebSocket) -> dict[str, Any
     return await repo.get_lecturer_by_id(lecturer_id)
 
 
+def public_storage_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Storage status without the raw Supabase error text.
+
+    The detail names tables, schema state and sometimes the project URL. Only
+    signed-in lecturers see it.
+    """
+    return {
+        "mode": status.get("mode"),
+        "supabaseConfigured": status.get("supabaseConfigured"),
+        "note": status.get("note"),
+        "healthy": not status.get("supabaseError"),
+        "asleep": status.get("asleep", False),
+    }
+
+
 @app.get("/api/health")
-def health():
-    return {"ok": True, "storage": repo.get_storage_status()}
+async def health(request: Request):
+    status = repo.get_storage_status()
+    lecturer = await current_lecturer_from_request(request)
+    return {"ok": True, "storage": status if lecturer else public_storage_status(status)}
 
 
 @app.get("/api/storage-status")
-def storage_status():
-    return repo.get_storage_status()
+async def storage_status(request: Request):
+    status = repo.get_storage_status()
+    lecturer = await current_lecturer_from_request(request)
+    return status if lecturer else public_storage_status(status)
+
+
+@app.post("/api/visitor-token")
+@limiter.limit("60/minute")
+async def issue_visitor_token(request: Request):
+    """Issue a signed student identity.
+
+    Students never choose their own id: the server mints it, signs it, and only
+    accepts it back inside the signature.
+    """
+    existing = parse_visitor_token((await _read_json_body(request)).get("token"))
+    visitor_id, token = create_visitor_token(existing)
+    return {"visitorId": visitor_id, "token": token}
+
+
+async def _read_json_body(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+        return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
 
 
 @app.get("/api/lecturer/session")
@@ -1398,18 +2025,21 @@ async def lecturer_session(request: Request):
 async def lecturer_signup(payload: dict[str, Any], request: Request):
     try:
         validated = LecturerSignupPayload.model_validate(payload)
+        check_signup_allowed(validated.email, validated.inviteCode)
         lecturer = await repo.create_lecturer(validated)
         response = JSONResponse({"ok": True, "lecturer": public_lecturer_view(lecturer)})
         set_session_cookie(response, lecturer["id"], request)
         return response
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/lecturer/login")
@@ -1422,7 +2052,7 @@ async def lecturer_login(payload: dict[str, Any], request: Request):
             if repo.supabase_unavailable():
                 raise HTTPException(status_code=503, detail="Supabase is unavailable. Please try again once it is restored.")
             raise HTTPException(status_code=401, detail="Incorrect email or password")
-        if not verify_password(validated.password, lecturer.get("password_hash", "")):
+        if not await verify_password_async(validated.password, lecturer.get("password_hash", "")):
             raise HTTPException(status_code=401, detail="Incorrect email or password")
         response = JSONResponse({"ok": True, "lecturer": public_lecturer_view(lecturer)})
         set_session_cookie(response, lecturer["id"], request)
@@ -1430,9 +2060,9 @@ async def lecturer_login(payload: dict[str, Any], request: Request):
     except HTTPException:
         raise
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/lecturer/logout")
@@ -1444,16 +2074,24 @@ def lecturer_logout():
 
 @app.get("/api/subjects")
 async def get_subjects():
+    # Iterate a snapshot: a concurrent DELETE /api/subjects pops from SUBJECTS
+    # while this coroutine is suspended on an await, which used to raise
+    # "RuntimeError: dictionary changed size during iteration".
+    subjects = list(SUBJECTS.items())
+    # One query for every subject's counts instead of one round trip per
+    # subject (the old code called list_tests() inside the loop).
+    counts = await repo.get_test_counts()
     result = []
-    for code, info in SUBJECTS.items():
-        tests = await repo.list_tests(code)
+    for code, info in subjects:
+        if code not in SUBJECTS:
+            continue          # deleted while we were awaiting the counts query
+        stats = counts.get(code, {"tests": 0, "questions": 0})
         builtin_questions = len(info.get("questions", []))
-        total_questions = sum(t.get("questionCount", 0) for t in tests) or builtin_questions
         result.append({
             "code": code,
             "name": info["name"],
-            "questionCount": total_questions,
-            "testCount": len(tests)
+            "questionCount": stats["questions"] or builtin_questions,
+            "testCount": stats["tests"],
         })
     result.sort(key=lambda item: item["name"].lower())
     return result
@@ -1499,13 +2137,13 @@ async def create_subject(payload: dict[str, Any], request: Request):
     except HTTPException:
         raise
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.delete("/api/subjects/{code}")
@@ -1525,15 +2163,15 @@ async def delete_subject(code: str, request: Request):
         rooms.pop(normalized, None)
         return {"ok": True}
     except KeyError:
-        raise HTTPException(status_code=404, detail="Subject not found")
+        raise HTTPException(status_code=404, detail="Subject not found") from None
     except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/tests/{subject_code}")
@@ -1544,13 +2182,17 @@ async def get_tests(subject_code: str, request: Request):
     try:
         return await repo.list_tests(subject_code, lecturer.get("id"))
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/tests/{subject_code}/{test_id}")
 async def get_test_detail(subject_code: str, test_id: str, request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
+    try:
+        test_id = safe_test_id(test_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     lecturer = await require_lecturer(request)
     try:
         row = await repo.get_test(subject_code, test_id, lecturer.get("id"))
@@ -1563,6 +2205,7 @@ async def get_test_detail(subject_code: str, test_id: str, request: Request):
             "chapter": row.get("chapter") or "",
             "description": row.get("description") or "",
             "questions": row.get("questions") or [],
+            "defaultTimeLimit": coerce_time_limit(row.get("default_time_limit")) or TIME_PER_Q,
             "questionCount": row.get("question_count") or len(row.get("questions") or []),
             "source": row.get("source", "supabase"),
             "ownerName": row.get("owner_name") or "System",
@@ -1571,10 +2214,11 @@ async def get_test_detail(subject_code: str, test_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/tests/{subject_code}")
+@limiter.limit("30/minute")
 async def create_test(subject_code: str, payload: dict[str, Any], request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
@@ -1588,19 +2232,24 @@ async def create_test(subject_code: str, payload: dict[str, Any], request: Reque
             pass  # Draft clear is non-critical — never let it mask a successful test save
         return {"ok": True, "test": repo._summary(created, lecturer.get("id"))}
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
     except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.put("/api/tests/{subject_code}/{test_id}")
+@limiter.limit("60/minute")
 async def update_test(subject_code: str, test_id: str, payload: dict[str, Any], request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
+    try:
+        test_id = safe_test_id(test_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     lecturer = await require_lecturer(request)
     try:
         validated = TestPayload.model_validate(payload)
@@ -1611,33 +2260,44 @@ async def update_test(subject_code: str, test_id: str, payload: dict[str, Any], 
             pass  # Draft clear is non-critical — never let it mask a successful test update
         return {"ok": True, "test": repo._summary(updated, lecturer.get("id"))}
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
     except KeyError:
-        raise HTTPException(status_code=404, detail="Test not found")
+        raise HTTPException(status_code=404, detail="Test not found") from None
     except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.delete("/api/tests/{subject_code}/{test_id}")
 async def delete_test(subject_code: str, test_id: str, request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
+    try:
+        test_id = safe_test_id(test_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     lecturer = await require_lecturer(request)
     try:
         await repo.delete_test(subject_code, test_id, lecturer)
         return {"ok": True}
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except KeyError:
-        raise HTTPException(status_code=404, detail="Test not found")
+        raise HTTPException(status_code=404, detail="Test not found") from None
     except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+DRAFT_BACKEND_LABELS = {
+    "supabase": "Supabase",
+    "local-file": "this server's local file — it will be lost if the server redeploys",
+    "memory": "server memory only — it will be lost when the server restarts",
+}
 
 
 @app.get("/api/drafts/{subject_code}")
@@ -1646,30 +2306,83 @@ async def get_test_draft(subject_code: str, request: Request):
         raise HTTPException(status_code=404, detail="Subject not found")
     lecturer = await require_lecturer(request)
     try:
-        draft = await repo.get_draft(subject_code, lecturer)
-        return {"draft": draft}
-    except Exception:
-        # If the draft table doesn't exist yet, return no draft rather than erroring.
-        return {"draft": None}
+        draft, backend, error = await repo.get_draft(subject_code, lecturer)
+    except Exception as exc:
+        # A missing quiz_test_drafts table must not break the editor, but it must
+        # not be invisible either — the client shows this on the draft status line.
+        return {"draft": None, "storedIn": None, "error": str(exc)}
+    return {"draft": draft, "storedIn": backend if draft else None, "error": error}
 
 
 @app.post("/api/drafts/{subject_code}")
+@limiter.limit(DRAFT_RATE_LIMIT)
 async def save_test_draft(subject_code: str, payload: dict[str, Any], request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
     lecturer = await require_lecturer(request)
     try:
         validated = DraftPayload.model_validate(payload)
-        draft = await repo.save_draft(subject_code, lecturer, validated)
-        return {"ok": True, "draft": draft}
-    except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
-    except Exception:
-        # Draft save failure is non-critical. Return a soft ok so autosave
-        # errors never break the editor UI or cascade into test operations.
-        return {"ok": False, "draft": None, "error": "Draft could not be saved to storage (non-critical)."}
+        raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
+    try:
+        draft, backend, remote_error = await repo.save_draft(subject_code, lecturer, validated)
+    except SupabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        # The draft genuinely was not written anywhere. Say so with a real error
+        # status: the old code returned HTTP 200 with {"ok": false} and the
+        # editor happily reported "Draft saved".
+        raise HTTPException(status_code=500, detail=f"Draft could not be saved: {exc}") from exc
+    return {
+        "ok": True,
+        "draft": draft,
+        "storedIn": backend,
+        "storedInLabel": DRAFT_BACKEND_LABELS.get(backend, backend),
+        "degraded": backend != "supabase" and repo.supabase_configured,
+        "error": remote_error,
+    }
+
+
+@app.get("/api/diagnostics")
+async def diagnostics(request: Request):
+    """Probe each storage table so silent breakage is diagnosable.
+
+    Lecturer-authenticated: the probe reports Supabase error text, which is not
+    something anonymous callers should see.
+    """
+    await require_lecturer(request)
+    tables = {
+        "quiz_lecturers": "lecturers_base",
+        "quiz_tests": "quiz_tests_base",
+        "quiz_test_drafts": "drafts_base",
+        "quiz_subjects": "subjects_base",
+    }
+    results: dict[str, Any] = {}
+    remote = repo.remote
+    for table, attr in tables.items():
+        if remote is None:
+            results[table] = {
+                "reachable": False,
+                "error": "Supabase is not configured on this server." if not repo.supabase_configured
+                         else (repo.supabase_error or "Supabase connection is disabled."),
+            }
+            continue
+        try:
+            await remote._request("GET", getattr(remote, attr), params={"select": "*", "limit": "1"})
+            results[table] = {"reachable": True, "error": None}
+        except Exception as exc:
+            results[table] = {"reachable": False, "error": str(exc)}
+    return {
+        "storage": repo.get_storage_status(),
+        "draftError": repo.draft_error,
+        "localStore": {
+            "enabled": repo.local_store_enabled,
+            "path": str(repo.local_store_path),
+            "exists": repo.local_store_path.exists(),
+            "error": repo.local_store_error,
+        },
+        "tables": results,
+    }
 
 
 @app.delete("/api/drafts/{subject_code}")
@@ -1685,22 +2398,109 @@ async def clear_test_draft(subject_code: str, request: Request):
         return {"ok": True}
 
 
+@app.post("/api/import/questions")
+@limiter.limit("20/minute")
+async def import_questions(request: Request, file: UploadFile = File(...)):
+    """Parse a .docx into reviewable questions.
+
+    Returns JSON only. It never writes a test — the lecturer reviews the parsed
+    questions in the editor and saves them as normal.
+    """
+    await require_lecturer(request)
+    filename = (file.filename or "").strip()
+    if not filename.lower().endswith(".docx"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a .docx file. Word's older .doc format and PDFs cannot be read — "
+                   "open the file in Word and use File > Save As > Word Document (.docx).",
+        )
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="That file is empty.")
+    if len(data) > docx_import.MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"That file is larger than {docx_import.MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+        )
+    try:
+        result = await asyncio.to_thread(docx_import.parse_docx, data)
+    except docx_import.DocxImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read that document: {exc}") from exc
+    return result
+
+
+@app.get("/api/import/template")
+async def import_template(request: Request):
+    """Generated at request time, so no binary lives in the repository."""
+    await require_lecturer(request)
+    try:
+        data = await asyncio.to_thread(docx_import.build_template_docx)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not build the template: {exc}") from exc
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": 'attachment; filename="quiz_question_template.docx"'},
+    )
+
+
+@app.get("/api/results/{subject_code}")
+async def list_stored_results(subject_code: str, request: Request):
+    """Stored sessions for a subject, plus what they cost in storage.
+
+    Personal data (names, student numbers, answers) is deliberately excluded
+    from this listing; it is only in the individual result.
+    """
+    await require_lecturer(request)
+    try:
+        subject_code = safe_subject_code(subject_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if subject_code not in SUBJECTS:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    results = await repo.list_game_results(subject_code)
+    return {
+        "results": results,
+        "storage": repo.results_storage_usage(subject_code),
+    }
+
+
+@app.get("/api/results/{subject_code}/{result_id}")
+async def get_stored_result(subject_code: str, result_id: str, request: Request):
+    await require_lecturer(request)
+    try:
+        subject_code = safe_subject_code(subject_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    row = await repo.get_game_result(subject_code, result_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="No stored result with that id.")
+    return row
+
+
 @app.get("/api/export/tests")
 async def export_tests(request: Request):
     lecturer = await require_lecturer(request)
     try:
         tests = await repo.list_tests_by_creator(lecturer["id"])
-        stamp = datetime.utcnow().strftime("%Y%m%d")
+        stamp = datetime.now(UTC).strftime("%Y%m%d")
         filename = f"quiz_backup_{stamp}.json"
         payload = json.dumps(tests, ensure_ascii=False, indent=2)
         headers = {"Content-Disposition": f"attachment; filename={filename}"}
         return Response(content=payload, media_type="application/json", headers=headers)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/stats/{subject_code}")
-def download_stats(subject_code: str):
+async def download_stats(subject_code: str, request: Request):
+    # This workbook contains student names, student numbers and per-question
+    # results. It was downloadable by anyone who knew a subject code.
+    # The host browser is already signed in, so the end-of-game automatic
+    # download still works — it sends the session cookie same-origin.
+    await require_lecturer(request)
     if subject_code not in rooms:
         raise HTTPException(status_code=404, detail="Subject not found")
 
@@ -1713,7 +2513,7 @@ def download_stats(subject_code: str):
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     except ImportError:
-        raise HTTPException(status_code=500, detail="openpyxl not installed")
+        raise HTTPException(status_code=500, detail="openpyxl not installed") from None
 
     wb = Workbook()
     ws1 = wb.active
@@ -1906,6 +2706,11 @@ def get_active_test_meta(room: GameRoom) -> dict[str, Any] | None:
         "title": room.active_test_title,
         "chapter": room.active_test_chapter,
         "questionCount": room.total_q,
+        "defaultTimeLimit": room.default_time_limit,
+        "estimatedSeconds": estimate_test_seconds({
+            "default_time_limit": room.default_time_limit,
+            "questions": room.questions,
+        }),
     }
 
 
@@ -1945,13 +2750,14 @@ def build_joined_payload(room: GameRoom, visitor_id: str) -> dict[str, Any]:
     }
     if room.phase == "question":
         q = room.questions[room.current_q]
-        remaining = max(0, TIME_PER_Q - room.question_elapsed)
+        limit = room.time_limit_for()
+        remaining = max(0, limit - room.question_elapsed)
         joined_payload["currentQuestion"] = {
             "question": q["q"],
             "options": q["options"],
             "qNum": room.current_q + 1,
             "totalQ": room.total_q,
-            "timeLimit": TIME_PER_Q,
+            "timeLimit": limit,
             "remaining": round(remaining, 2)
         }
         joined_payload["alreadyAnswered"] = visitor_id in room.answers_this_round
@@ -2095,19 +2901,26 @@ async def sync_answer_count(room: GameRoom) -> None:
 
 
 async def maybe_finish_question_early(room: GameRoom) -> None:
-    if room.phase != "question":
-        return
-    answered_count = len(room.answers_this_round)
-    total_connected = sum(
-        1
-        for _, player in room.players.items()
-        if player.get("ws") is not None and is_participating_player(room, player)
-    )
-    if answered_count >= total_connected and total_connected > 0:
+    # The lock makes the phase check and the phase change atomic across
+    # concurrent answer handlers and the question timer, so
+    # mark_unanswered_players() can never run twice for one question and append
+    # duplicate answer records.
+    async with room.advance_lock:
+        if room.phase != "question":
+            return
+        answered_count = len(room.answers_this_round)
+        total_connected = sum(
+            1
+            for _, player in room.players.items()
+            if player.get("ws") is not None and is_participating_player(room, player)
+        )
+        if answered_count < total_connected or total_connected <= 0:
+            return
         if room.question_timer_task and not room.question_timer_task.done():
             room.question_timer_task.cancel()
         mark_unanswered_players(room)
-        await auto_reveal(room)
+        room.phase = "reveal"
+    await auto_reveal(room)
 
 
 async def kick_player_from_room(room: GameRoom, player_id: str, *, message: str) -> bool:
@@ -2137,15 +2950,25 @@ async def kick_player_from_room(room: GameRoom, player_id: str, *, message: str)
 
 
 async def cancel_question_timer(room: GameRoom) -> None:
-    if room.question_timer_task and not room.question_timer_task.done():
-        room.question_timer_task.cancel()
+    current = asyncio.current_task()
+    for attr in ("question_timer_task", "start_task"):
+        task = getattr(room, attr, None)
+        setattr(room, attr, None)
+        if task is None or task.done():
+            continue
+        if task is current:
+            # We are running *inside* that task — reached here via
+            # _timer -> auto_reveal -> advance_to_next -> force_end_game.
+            # Cancelling would abort the end-of-game work we are doing, and
+            # awaiting it raises "Task cannot await on itself". Just detach.
+            continue
+        task.cancel()
         try:
-            await room.question_timer_task
+            await task
         except asyncio.CancelledError:
             pass
         except Exception:
             pass
-    room.question_timer_task = None
 
 
 async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
@@ -2199,6 +3022,52 @@ async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
     await push_room_update(room)
 
 
+def build_answer_distribution(room: GameRoom) -> list[int]:
+    """How many students picked each option this round.
+
+    The server already holds every choice in answers_this_round, so this is
+    nearly free — and it is the most useful teaching signal in a live quiz.
+    """
+    question = room.questions[room.current_q] if 0 <= room.current_q < len(room.questions) else None
+    option_count = len(question.get("options", [])) if isinstance(question, dict) else 4
+    counts = [0] * option_count
+    for vid, answer in room.answers_this_round.items():
+        if not is_participating_player(room, room.players.get(vid)):
+            continue
+        choice = answer.get("choice", -1)
+        if isinstance(choice, int) and 0 <= choice < option_count:
+            counts[choice] += 1
+    return counts
+
+
+def build_student_review(room: GameRoom) -> dict[str, list[dict[str, Any]]]:
+    """Per-student list of what they got wrong, with the correct answer."""
+    review: dict[str, list[dict[str, Any]]] = {}
+    for vid, player in room.players.items():
+        if not is_participating_player(room, player):
+            continue
+        entries = []
+        for answer in player.get("answers") or []:
+            index = answer.get("q")
+            if not isinstance(index, int) or not 0 <= index < len(room.questions):
+                continue
+            question = room.questions[index]
+            choice = answer.get("choice", -1)
+            options = question.get("options", [])
+            entries.append({
+                "qNum": index + 1,
+                "question": question.get("q", ""),
+                "options": options,
+                "yourChoice": choice if isinstance(choice, int) else -1,
+                "correct": question.get("correct", 0),
+                "wasCorrect": bool(answer.get("correct")),
+                "points": answer.get("points", 0),
+                "explanation": question.get("explanation", ""),
+            })
+        review[vid] = entries
+    return review
+
+
 async def force_end_game(room: GameRoom) -> None:
     lb = get_leaderboard(room, participant_only=True)
     participant_ids = {
@@ -2214,9 +3083,30 @@ async def force_end_game(room: GameRoom) -> None:
     await cancel_question_timer(room)
     room.phase = "final"
     room.archive_stats()
+    # Store a lightweight copy so a redeploy cannot destroy results that were
+    # never downloaded. Non-fatal by design: the automatic download is the
+    # record that matters, and this must never break the end of a game.
+    if PERSIST_RESULTS and room.last_game_stats:
+        try:
+            await repo.store_game_result(room.last_game_stats, room.host_lecturer_id)
+        except Exception as exc:
+            print(f"[results] could not store results for {room.subject_code}: {exc}")
+    # Per-question answer distribution, so students can see how the class did.
+    review = build_student_review(room)
     await broadcast_to_selected_players(room, {"type": "final", "leaderboard": lb}, participant_ids)
     await broadcast_to_selected_players(room, {"type": "game_ended"}, non_participant_ids)
     await send_to_host(room, {"type": "final", "leaderboard": lb, "hasStats": True})
+    # Each student gets only their own answers, alongside the correct answer and
+    # the explanation.
+    for vid in participant_ids:
+        player = room.players.get(vid)
+        ws = player.get("ws") if player else None
+        if ws is None:
+            continue
+        try:
+            await ws.send_text(json.dumps({"type": "review", "questions": review.get(vid, [])}))
+        except Exception:
+            pass
     room.players = {}
 
 
@@ -2226,18 +3116,28 @@ async def force_end_game(room: GameRoom) -> None:
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    visitor_id = (
-        websocket.headers.get("x-visitor-id")
-        or websocket.query_params.get("visitorId")
-        or str(uuid.uuid4())
-    )
+    # Identity comes from a server-signed token only. A bare visitorId query
+    # parameter is no longer trusted: it let a student claim another student's
+    # id and inherit their score.
+    visitor_id = parse_visitor_token(websocket.query_params.get("vt")) or str(uuid.uuid4())
     role = None
     room = None
 
     try:
         while True:
             raw = await websocket.receive_text()
-            msg = json.loads(raw)
+            # Cheap resource-exhaustion guard: a single socket could otherwise
+            # push arbitrarily large frames at the server.
+            if len(raw) > MAX_WS_MESSAGE_BYTES:
+                await websocket.send_text(json.dumps({"type": "error", "message": "Message too large."}))
+                await websocket.close(code=1009)
+                break
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(msg, dict):
+                continue
             action = msg.get("action")
 
             if action == "host_join":
@@ -2268,6 +3168,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     room.current_token = ""
                 room.host_ws = websocket
                 room.host_visitor = visitor_id
+                room.host_lecturer_id = lecturer.get("id")
 
                 if room.phase == "final" and requested_new_test:
                     await return_room_to_lobby(room, keep_players=True)
@@ -2295,46 +3196,35 @@ async def websocket_endpoint(websocket: WebSocket):
                 if room.total_q == 0:
                     await websocket.send_text(json.dumps({"type": "error", "message": "No questions loaded for this test."}))
                     continue
-                use_code = msg.get("useCode", False)
-                if use_code:
-                    room.game_code = generate_game_code()
-                    room.game_code_enabled = True
-                    for player in room.players.values():
-                        player["game_code_verified"] = False
-                else:
-                    room.game_code = ""
-                    room.game_code_enabled = False
-                    for player in room.players.values():
-                        player["game_code_verified"] = True
-                if room.game_code_enabled:
-                    await send_to_host(room, {
-                        "type": "game_code_display",
-                        "code": room.game_code,
-                        "countdown": 20
-                    })
-                    await broadcast_to_players(room, {
-                        "type": "game_code_required",
-                        "countdown": 20
-                    })
-                    await asyncio.sleep(20)
-                room.paused = False
-                import random
-                if msg.get("shuffle"):
-                    random.shuffle(room.questions)
-                room.phase = "get_ready"
-                room.current_q = 0
-                for vid in room.players:
-                    room.players[vid]["score"] = 0
-                    room.players[vid]["streak"] = 0
-                    room.players[vid]["answers"] = []
-                await broadcast_to_players(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q}, participant_only=True)
-                await send_to_host(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q})
-                await asyncio.sleep(3)
-                await send_question(room)
+                if room.start_task is not None and not room.start_task.done():
+                    continue                       # already starting
+                # Run the countdown in the background. It used to sit inside this
+                # receive loop, so for 20 seconds the host could not pause or
+                # cancel and every queued message stalled behind it.
+                room.start_task = asyncio.create_task(run_game_start(room, shuffle=bool(msg.get("shuffle")), use_code=bool(msg.get("useCode"))))
 
             elif action == "next_question":
                 if role == "host" and room is not None:
-                    await advance_to_next(room)
+                    await advance_to_next(room, from_question=room.current_q)
+
+            elif action == "extend_time":
+                # Give the room longer on the question currently running. The
+                # timer counts against room.question_time_limit, so raising it
+                # extends the live question.
+                if role != "host" or room is None or room.phase != "question":
+                    continue
+                extra = coerce_time_limit(msg.get("seconds")) or 15
+                extra = max(5, min(60, extra))
+                room.question_time_limit = min(MAX_TIME_LIMIT, room.question_time_limit + extra)
+                remaining = max(0.0, room.question_time_limit - room.question_elapsed)
+                payload = {
+                    "type": "time_extended",
+                    "addedSeconds": extra,
+                    "timeLimit": room.question_time_limit,
+                    "remaining": round(remaining, 2),
+                }
+                await send_to_host(room, payload)
+                await broadcast_to_players(room, payload, participant_only=True)
 
             elif action == "host_pause":
                 if role != "host" or room is None:
@@ -2427,6 +3317,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         "message": "The game is already in progress. You cannot join as a new player at this stage."
                     }))
                     continue
+                if not is_known_player and len(room.players) >= MAX_PLAYERS_PER_ROOM:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": f"This session is full ({MAX_PLAYERS_PER_ROOM} students). Ask your lecturer to start another session."
+                    }))
+                    continue
                 if subject_code_from_token and room.current_token != token:
                     room.current_token = token
                 role = "player"
@@ -2510,7 +3406,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
                 if visitor_id in room.answers_this_round:
                     continue
-                choice = msg.get("choice", -1)
+                # Validate the choice. It used to be taken as-is, so a client
+                # could submit a string, a list or an out-of-range index and it
+                # would be stored and later written into the results workbook.
+                raw_choice = msg.get("choice", -1)
+                if isinstance(raw_choice, bool) or not isinstance(raw_choice, int):
+                    # Not "error": the player client treats that as a join
+                    # failure and would throw the student back to the join screen.
+                    await websocket.send_text(json.dumps({"type": "invalid_answer", "message": "That answer was not understood."}))
+                    continue
+                choice = raw_choice
+                if not 0 <= choice < len(room.questions[room.current_q]["options"]):
+                    # Not "error": the player client treats that as a join
+                    # failure and would throw the student back to the join screen.
+                    await websocket.send_text(json.dumps({"type": "invalid_answer", "message": "That answer was not understood."}))
+                    continue
                 answer_time = time.time() - room.question_start_time
                 room.answers_this_round[visitor_id] = {"choice": choice, "time": answer_time}
 
@@ -2518,7 +3428,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 is_correct = choice == q["correct"]
                 points = 0
                 if is_correct:
-                    time_fraction = min(answer_time / TIME_PER_Q, 1.0)
+                    # Against the resolved limit, so a 90 second question still awards
+                    # full marks for a fast answer.
+                    time_fraction = min(answer_time / room.time_limit_for(), 1.0)
                     points = round(MAX_POINTS - (MAX_POINTS - MIN_POINTS) * time_fraction)
                     room.players[visitor_id]["streak"] += 1
                     if room.players[visitor_id]["streak"] >= 3:
@@ -2567,6 +3479,49 @@ async def websocket_endpoint(websocket: WebSocket):
                 await maybe_finish_question_early(room)
 
 
+async def run_game_start(room: GameRoom, *, shuffle: bool, use_code: bool) -> None:
+    """Start sequence, run as a background task so the host socket stays live."""
+    if use_code:
+        room.game_code = generate_game_code()
+        room.game_code_enabled = True
+        for player in room.players.values():
+            player["game_code_verified"] = False
+    else:
+        room.game_code = ""
+        room.game_code_enabled = False
+        for player in room.players.values():
+            player["game_code_verified"] = True
+
+    if room.game_code_enabled:
+        await send_to_host(room, {
+            "type": "game_code_display",
+            "code": room.game_code,
+            "countdown": GAME_CODE_COUNTDOWN_SECONDS
+        })
+        await broadcast_to_players(room, {
+            "type": "game_code_required",
+            "countdown": GAME_CODE_COUNTDOWN_SECONDS
+        })
+        await asyncio.sleep(GAME_CODE_COUNTDOWN_SECONDS)
+        if room.phase != "lobby":
+            return       # cancelled or reset while the code was showing
+
+    room.paused = False
+    if shuffle:
+        random.shuffle(room.questions)
+    room.phase = "get_ready"
+    room.current_q = 0
+    for vid in room.players:
+        room.players[vid]["score"] = 0
+        room.players[vid]["streak"] = 0
+        room.players[vid]["answers"] = []
+    await broadcast_to_players(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q}, participant_only=True)
+    await send_to_host(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q})
+    await asyncio.sleep(GET_READY_SECONDS)
+    if room.phase == "get_ready" and room.current_q == 0:
+        await send_question(room)
+
+
 async def send_question(room: GameRoom) -> None:
     q = room.questions[room.current_q]
     q_index = room.current_q
@@ -2574,14 +3529,16 @@ async def send_question(room: GameRoom) -> None:
     server_ts = time.time()
     room.question_start_time = server_ts
     room.question_elapsed = 0.0
+    room.question_time_limit = room.time_limit_for(q_index)
     room.answers_this_round = {}
+    limit = room.question_time_limit
     await broadcast_to_players(room, {
         "type": "question",
         "qNum": room.current_q + 1,
         "totalQ": room.total_q,
         "question": q["q"],
         "options": q["options"],
-        "timeLimit": TIME_PER_Q,
+        "timeLimit": limit,
         "serverTimestamp": server_ts
     }, participant_only=True)
     await send_to_host(room, {
@@ -2591,7 +3548,7 @@ async def send_question(room: GameRoom) -> None:
         "question": q["q"],
         "options": q["options"],
         "correctAnswer": q["correct"],
-        "timeLimit": TIME_PER_Q,
+        "timeLimit": limit,
         "serverTimestamp": server_ts
     })
     await sync_answer_count(room)
@@ -2599,22 +3556,26 @@ async def send_question(room: GameRoom) -> None:
     async def _timer():
         # Count elapsed time in 0.5s ticks, freezing while room.paused is True
         elapsed = 0.0
-        while elapsed < TIME_PER_Q:
+        while elapsed < room.question_time_limit:
             await asyncio.sleep(0.5)
             if room.phase != "question" or room.current_q != q_index:
                 return  # Question already advanced (e.g. all answered early)
             if not room.paused:
                 elapsed += 0.5
                 room.question_elapsed = elapsed
-        if room.phase == "question" and room.current_q == q_index:
+        async with room.advance_lock:
+            if room.phase != "question" or room.current_q != q_index:
+                return
             mark_unanswered_players(room)
-            await auto_reveal(room)
+            room.phase = "reveal"
+        await auto_reveal(room)
 
     room.question_timer_task = asyncio.create_task(_timer())
 
 
 async def auto_reveal(room: GameRoom) -> None:
-    q = room.questions[room.current_q]
+    q_index = room.current_q
+    q = room.questions[q_index]
     room.phase = "reveal"
     lb = get_leaderboard(room, participant_only=True)
     for vid, player in room.players.items():
@@ -2641,29 +3602,50 @@ async def auto_reveal(room: GameRoom) -> None:
         "correctAnswer": q["correct"],
         "explanation": q["explanation"],
         "leaderboard": lb,
-        "isLast": room.current_q >= room.total_q - 1
+        "isLast": room.current_q >= room.total_q - 1,
+        "revealSeconds": REVEAL_SECONDS,
+        "options": q.get("options", []),
+        "question": q.get("q", ""),
+        "distribution": build_answer_distribution(room),
+        "answered": len(room.answers_this_round),
     })
     waited = 0.0
-    while True:
-        await asyncio.sleep(0.5)
+    tick = min(0.5, max(0.05, REVEAL_SECONDS / 4))
+    while waited < REVEAL_SECONDS:
+        await asyncio.sleep(tick)
         if room.paused:
             continue
-        waited += 0.5
-        if waited >= 5.0:
-            break
-    if room.phase == "reveal":
-        await advance_to_next(room)
+        waited += tick
+    if room.phase == "reveal" and room.current_q == q_index:
+        await advance_to_next(room, from_question=q_index)
 
 
-async def advance_to_next(room: GameRoom) -> None:
-    room.current_q += 1
-    if room.current_q >= room.total_q:
+async def advance_to_next(room: GameRoom, *, from_question: int | None = None) -> None:
+    """Move on to the next question.
+
+    Guarded so that a double click on "Next Question", or a click racing the
+    auto-reveal timer, cannot increment current_q twice and skip a question.
+    `from_question` is the index the caller believed was current; if the room
+    has already moved past it, this call is a duplicate and does nothing.
+    """
+    async with room.advance_lock:
+        if room.phase in ("get_ready", "final"):
+            return                      # an advance is already under way
+        if from_question is not None and room.current_q != from_question:
+            return                      # someone else advanced first
+        room.current_q += 1
+        finished = room.current_q >= room.total_q
+        room.phase = "final" if finished else "get_ready"
+        next_index = room.current_q
+
+    if finished:
         await force_end_game(room)
-    else:
-        room.phase = "get_ready"
-        await broadcast_to_players(room, {"type": "get_ready", "qNum": room.current_q + 1, "totalQ": room.total_q}, participant_only=True)
-        await send_to_host(room, {"type": "get_ready", "qNum": room.current_q + 1, "totalQ": room.total_q})
-        await asyncio.sleep(3)
+        return
+
+    await broadcast_to_players(room, {"type": "get_ready", "qNum": next_index + 1, "totalQ": room.total_q}, participant_only=True)
+    await send_to_host(room, {"type": "get_ready", "qNum": next_index + 1, "totalQ": room.total_q})
+    await asyncio.sleep(GET_READY_SECONDS)
+    if room.phase == "get_ready" and room.current_q == next_index:
         await send_question(room)
 
 

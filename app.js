@@ -7,23 +7,52 @@ const SHAPES = ['◆', '●', '▲', '■'];
 const COLORS = ['color-0', 'color-1', 'color-2', 'color-3'];
 const TIME_PER_Q = 30;
 
-function getOrCreateVisitorId() {
+const WS_PROTOCOL = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const API_BASE = location.origin;
+
+// Student identity is issued and signed by the server. The browser only stores
+// the token; it cannot choose its own id, so it cannot claim someone else's
+// session or score.
+const VISITOR_TOKEN_KEY = 'quiz_visitor_token';
+let visitorToken = '';
+
+function readStoredVisitorToken() {
   try {
-    const key = 'quiz_visitor_id';
-    const existing = localStorage.getItem(key);
-    if (existing) return existing;
-    const created = (crypto && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
-    localStorage.setItem(key, created);
-    return created;
+    return localStorage.getItem(VISITOR_TOKEN_KEY) || '';
   } catch (e) {
-    return `${Date.now()}-${Math.random()}`;
+    return '';
   }
 }
 
-const WS_PROTOCOL = location.protocol === 'https:' ? 'wss:' : 'ws:';
-const VISITOR_ID = getOrCreateVisitorId();
-const WS_URL = `${WS_PROTOCOL}//${location.host}/ws?visitorId=${encodeURIComponent(VISITOR_ID)}`;
-const API_BASE = location.origin;
+async function ensureVisitorToken() {
+  if (visitorToken) return visitorToken;
+  const stored = readStoredVisitorToken();
+  try {
+    const resp = await fetch(`${API_BASE}/api/visitor-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ token: stored })
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      visitorToken = data.token || '';
+      try { localStorage.setItem(VISITOR_TOKEN_KEY, visitorToken); } catch (e) {}
+      return visitorToken;
+    }
+  } catch (e) {
+    console.warn('Could not obtain a visitor token', e);
+  }
+  // Fall back to whatever we had: the server re-issues on the next attempt, and
+  // a connection without one simply gets a fresh anonymous identity.
+  visitorToken = stored;
+  return visitorToken;
+}
+
+function buildWsUrl() {
+  const suffix = visitorToken ? `?vt=${encodeURIComponent(visitorToken)}` : '';
+  return `${WS_PROTOCOL}//${location.host}/ws${suffix}`;
+}
 
 function normalizeSubjectCode(value) {
   return (value || '').trim().toUpperCase();
@@ -72,6 +101,12 @@ let editorInputBound = false;
 let hostCorrectAnswer = -1;
 let hostCurrentOptions = [];
 let hostCurrentQuestion = '';
+// The time limit the server set for the question currently on screen. Used for
+// both the countdown value and the progress-bar percentage — computing the
+// percentage against the TIME_PER_Q constant instead made a 90 second question
+// render a bar 300% wide once limits became configurable.
+let questionTimeLimit = TIME_PER_Q;
+let hostQuestionTimeLimit = TIME_PER_Q;
 let hostTimeLeft = TIME_PER_Q;
 let playerAnswered = false;
 let playerNeedsGameCode = false;
@@ -86,9 +121,32 @@ const DEFAULT_SUBJECT_COLOR = { bg: 'var(--accent-green)', icon: '📚' };
 const BUILTIN_SUBJECT_CODES = new Set(Object.keys(SUBJECT_COLORS));
 
 function showScreen(id) {
+  const leavingEditor = id !== 'screen-host-create-test'
+    && document.querySelector('#screen-host-create-test.active');
   document.querySelectorAll('.screen').forEach((s) => s.classList.remove('active'));
   const el = $(`#${id}`);
   if (el) el.classList.add('active');
+  // Countdown intervals belong to the screen that started them; a screen change
+  // mid-countdown used to leave them running forever.
+  clearScreenIntervals();
+  // A queued autosave must never fire after the lecturer has navigated away and
+  // re-save a stale form over newer state.
+  if (leavingEditor && typeof flushPendingDraftSave === 'function') flushPendingDraftSave();
+}
+
+// Intervals owned by whichever screen is showing, cleared on every change.
+let readyCountdownInterval = null;
+let revealCountdownInterval = null;
+
+function clearScreenIntervals() {
+  if (readyCountdownInterval) {
+    clearInterval(readyCountdownInterval);
+    readyCountdownInterval = null;
+  }
+  if (revealCountdownInterval) {
+    clearInterval(revealCountdownInterval);
+    revealCountdownInterval = null;
+  }
 }
 
 function connectWS(onOpen) {
@@ -104,14 +162,26 @@ function connectWS(onOpen) {
     return;
   }
 
-  ws = new WebSocket(WS_URL);
+  ws = new WebSocket(buildWsUrl());
   ws.onopen = () => {
     startWsPing();
     if (wsOnOpen) wsOnOpen();
   };
   ws.onmessage = (evt) => {
-    const msg = JSON.parse(evt.data);
-    handleMessage(msg);
+    // One malformed frame used to throw out of the handler and kill it for the
+    // rest of the session.
+    let msg;
+    try {
+      msg = JSON.parse(evt.data);
+    } catch (err) {
+      console.error('Ignoring malformed message from server:', err);
+      return;
+    }
+    try {
+      handleMessage(msg);
+    } catch (err) {
+      console.error('Error handling message', msg && msg.type, err);
+    }
   };
   ws.onclose = () => {
     ws = null;
@@ -283,7 +353,7 @@ async function parseApiResponse(resp) {
 }
 
 async function apiGet(path) {
-  const resp = await fetch(`${API_BASE}${path}`);
+  const resp = await fetch(`${API_BASE}${path}`, { credentials: 'same-origin' });
   return await parseApiResponse(resp);
 }
 
@@ -291,6 +361,7 @@ async function apiPost(path, payload = {}) {
   const resp = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
     body: JSON.stringify(payload)
   });
   return await parseApiResponse(resp);
@@ -300,13 +371,14 @@ async function apiPut(path, payload = {}) {
   const resp = await fetch(`${API_BASE}${path}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
     body: JSON.stringify(payload)
   });
   return await parseApiResponse(resp);
 }
 
 async function apiDelete(path) {
-  const resp = await fetch(`${API_BASE}${path}`, { method: 'DELETE' });
+  const resp = await fetch(`${API_BASE}${path}`, { method: 'DELETE', credentials: 'same-origin' });
   return await parseApiResponse(resp);
 }
 
@@ -517,7 +589,20 @@ function showPlayerJoinScreen() {
   };
   btn.onclick = joinAsPlayer;
 
-  $('#btn-back-subject').hidden = true;
+  // A student who picked the wrong subject used to be stuck here. Offer the way
+  // back whenever they arrived via subject selection rather than a QR token —
+  // with a token the subject is fixed by the lecturer's link.
+  const backBtn = $('#btn-back-subject');
+  if (backBtn) {
+    const arrivedBySubjectChoice = !sessionToken;
+    backBtn.hidden = !arrivedBySubjectChoice;
+    backBtn.onclick = () => {
+      closeWS({ reconnect: false });
+      myPlayerId = null;
+      selectedSubject = null;
+      initPlayer();
+    };
+  }
 
   checkReady();
   setTimeout(checkReady, 0);
@@ -710,14 +795,16 @@ function handlePlayerMessage(msg) {
         showScreen('screen-lobby-player');
       } else if (msg.phase === 'question' && msg.currentQuestion) {
         if (msg.alreadyAnswered) {
-          showScreen('screen-lobby-player'); // safe fallback — wait for reveal
+          // Reconnected mid-question having already answered. Dumping the
+          // student on the lobby screen ("waiting for the lecturer to start")
+          // reads as though their answer was lost.
+          showAnswerSubmittedScreen(msg.currentQuestion);
         } else {
           const q = msg.currentQuestion;
-          timeLeft = q.remaining || TIME_PER_Q;
           playerShowQuestion(q);
         }
       } else if (msg.phase === 'reveal' || msg.phase === 'get_ready') {
-        showScreen('screen-lobby-player');
+        showAnswerSubmittedScreen(msg.currentQuestion, { waitingForNext: true });
       }
       break;
     }
@@ -750,6 +837,15 @@ function handlePlayerMessage(msg) {
         break;
       }
       playerShowResult(msg);
+      break;
+    case 'time_extended':
+      // The lecturer gave the room longer on this question.
+      questionTimeLimit = Number(msg.timeLimit) || questionTimeLimit;
+      if (!playerAnswered) {
+        timeLeft = Math.max(timeLeft, Number(msg.remaining) || timeLeft);
+        if (!timerInterval && timeLeft > 0) startPlayerTimerInterval();
+        updatePlayerTimerDisplay();
+      }
       break;
     case 'pause_state':
       if (playerNeedsGameCode) {
@@ -793,6 +889,17 @@ function handlePlayerMessage(msg) {
       }
       playerShowFinal(msg.leaderboard);
       break;
+    case 'review': {
+      // Arrives just after 'final'. Students can look back at what they got
+      // wrong, with the correct answer and the explanation.
+      lastReview = Array.isArray(msg.questions) ? msg.questions : [];
+      const reviewBtn = $('#btn-review-answers');
+      if (reviewBtn) {
+        reviewBtn.hidden = lastReview.length === 0;
+        reviewBtn.onclick = playerShowReview;
+      }
+      break;
+    }
     case 'reset':
       playerNeedsGameCode = false;
       if (typeof msg.playerCount === 'number') $('#lobby-p-count').textContent = msg.playerCount;
@@ -819,15 +926,46 @@ function handlePlayerMessage(msg) {
   }
 }
 
+/**
+ * Shown when a student reconnects mid-question having already answered, or
+ * during the reveal/get-ready gap. Makes it clear their answer counted.
+ */
+function showAnswerSubmittedScreen(currentQuestion, { waitingForNext = false } = {}) {
+  clearTimer();
+  showScreen('screen-answer-submitted');
+  const title = $('#answer-submitted-title');
+  const detail = $('#answer-submitted-detail');
+  if (title) {
+    title.textContent = waitingForNext ? 'Next question coming up' : 'Answer submitted';
+  }
+  if (detail) {
+    detail.textContent = waitingForNext
+      ? 'Hold tight — the lecturer is about to move on.'
+      : 'Your answer was received. Waiting for the other students…';
+  }
+  const progress = $('#answer-submitted-progress');
+  if (progress) {
+    if (currentQuestion && currentQuestion.qNum && currentQuestion.totalQ) {
+      progress.textContent = `Question ${currentQuestion.qNum} of ${currentQuestion.totalQ}`;
+      progress.hidden = false;
+    } else {
+      progress.hidden = true;
+    }
+  }
+  const nameEl = $('#answer-submitted-name');
+  if (nameEl) nameEl.textContent = myPlayerName ? `Playing as ${myPlayerName}` : '';
+}
+
 function playerGetReady(qNum, totalQ) {
   showScreen('screen-ready');
   $('#ready-q-num').textContent = `Question ${qNum} of ${totalQ}`;
   let count = 3;
   $('#ready-count').textContent = count;
-  const iv = setInterval(() => {
+  readyCountdownInterval = setInterval(() => {
     count -= 1;
     if (count <= 0) {
-      clearInterval(iv);
+      clearInterval(readyCountdownInterval);
+      readyCountdownInterval = null;
     } else {
       $('#ready-count').textContent = count;
     }
@@ -851,8 +989,9 @@ function playerShowQuestion(msg) {
     grid.appendChild(btn);
   });
 
+  questionTimeLimit = Number(msg.timeLimit) > 0 ? Number(msg.timeLimit) : TIME_PER_Q;
   const elapsed = msg.serverTimestamp ? (Date.now() / 1000 - msg.serverTimestamp) : 0;
-  timeLeft = Math.max(0, (msg.timeLimit || TIME_PER_Q) - elapsed);
+  timeLeft = Math.max(0, questionTimeLimit - elapsed);
   if (typeof msg.remaining === 'number') {
     timeLeft = Math.max(0, msg.remaining);
   }
@@ -872,6 +1011,11 @@ function playerAnswer(choice, btnEl) {
 function startPlayerTimer() {
   playerAnswered = false;
   updatePlayerTimerDisplay();
+  startPlayerTimerInterval();
+}
+
+function startPlayerTimerInterval() {
+  clearTimer();
   timerInterval = setInterval(() => {
     timeLeft -= 0.1;
     if (timeLeft <= 0) {
@@ -883,12 +1027,14 @@ function startPlayerTimer() {
 }
 
 function updatePlayerTimerDisplay() {
-  const pct = (timeLeft / TIME_PER_Q) * 100;
+  const limit = questionTimeLimit > 0 ? questionTimeLimit : TIME_PER_Q;
+  const pct = Math.max(0, Math.min(100, (timeLeft / limit) * 100));
   const bar = $('#timer-bar');
   const text = $('#timer-text');
   bar.style.width = `${pct}%`;
   text.textContent = Math.ceil(timeLeft);
-  if (timeLeft <= 10) {
+  // "Urgent" at the last third for short questions, last 10 s for long ones.
+  if (timeLeft <= Math.min(10, limit / 3)) {
     bar.classList.add('urgent');
     text.classList.add('urgent');
   } else {
@@ -964,6 +1110,11 @@ function playerShowLeaderboard(lb) {
 
 function playerShowFinal(lb) {
   showScreen('screen-final');
+  const reviewBtn = $('#btn-review-answers');
+  if (reviewBtn) {
+    reviewBtn.hidden = !(Array.isArray(lastReview) && lastReview.length);
+    reviewBtn.onclick = playerShowReview;
+  }
   const myRank = lb.findIndex((p) => p.id === myPlayerId) + 1;
   $('#final-title').textContent = myRank === 1 ? 'You Win! 🏆' : `Game Over — You placed #${myRank}`;
   renderPodium($('#final-podium'), lb);
@@ -1115,10 +1266,12 @@ function bindHostAuthUI() {
     btn.disabled = true;
     btn.textContent = 'Creating Account...';
     try {
+      const inviteInput = $('#signup-invite-input');
       await apiPost('/api/lecturer/signup', {
         name: $('#signup-name-input').value.trim(),
         email: $('#signup-email-input').value.trim(),
-        password
+        password,
+        inviteCode: inviteInput ? inviteInput.value.trim() : ''
       });
       await fetchLecturerSession();
       $('#signup-password-input').value = '';
@@ -1354,6 +1507,20 @@ async function showHostTestLibrary() {
   }
   $('#host-storage-note').textContent = storage.note || '';
 
+  // A paused Supabase free project returns connection failures with nothing
+  // explanatory. Say what it actually is.
+  const sleepEl = $('#host-storage-asleep');
+  if (sleepEl) {
+    sleepEl.hidden = !storage.asleep;
+    sleepEl.textContent = storage.asleep
+      ? 'The question database appears to be asleep. Supabase pauses free projects after 7 days of inactivity — open your Supabase dashboard and press Resume, then reload this page.'
+      : '';
+  }
+
+  renderResultsStorageLine();
+
+  renderDraftResumeCard();   // fire and forget; renders when the draft arrives
+
   try {
     const tests = await loadTests(selectedSubject.code);
     renderHostTestCards(tests);
@@ -1387,6 +1554,87 @@ async function showHostTestLibrary() {
   }
 }
 
+/**
+ * Show how many past sessions are stored and roughly what they cost, so the
+ * storage bill is visible rather than guessed at.
+ */
+async function renderResultsStorageLine() {
+  const el = $('#host-results-storage');
+  if (!el || !selectedSubject) return;
+  el.hidden = true;
+  try {
+    const data = await apiGet(`/api/results/${encodeURIComponent(selectedSubject.code)}`);
+    const storage = data.storage || {};
+    const count = (data.results || []).length;
+    if (!storage.enabled) {
+      el.textContent = 'Storing past sessions is switched off (PERSIST_RESULTS=false). Your end-of-game downloads are the only record.';
+      el.hidden = false;
+      return;
+    }
+    if (!count) {
+      el.textContent = `No past sessions stored yet for this subject. The most recent ${storage.retention} will be kept.`;
+      el.hidden = false;
+      return;
+    }
+    const size = storage.approxKb >= 1024
+      ? `${(storage.approxKb / 1024).toFixed(1)} MB`
+      : `${storage.approxKb} KB`;
+    el.textContent = `${count} past session${count === 1 ? '' : 's'} stored for this subject (about ${size}). The most recent ${storage.retention} are kept; older ones are deleted automatically.`;
+    el.hidden = false;
+  } catch (e) {
+    // Storage reporting is informational only — never block the library on it.
+  }
+}
+
+/**
+ * Show any draft in progress at the top of the test library. Without this a
+ * correctly stored draft is unreachable — nothing in the UI says it exists.
+ */
+async function renderDraftResumeCard() {
+  const container = $('#host-draft-card');
+  if (!container || !selectedSubject) return;
+  container.hidden = true;
+  container.innerHTML = '';
+
+  const { draft, source } = await loadBestDraft(selectedSubject.code);
+  if (!draftHasContent(draft)) return;
+  // The library may have moved on while we were fetching.
+  if (!selectedSubject || !$('#screen-host-tests.active')) return;
+
+  const count = draftQuestions(draft).length;
+  const title = (draft.title || '').trim() || 'Untitled test';
+  const editingId = getDraftEditingId(draft);
+  const kind = editingId ? 'Unsaved changes to a saved test' : 'Draft in progress';
+  const where = source === 'browser' ? ' • recovered from this browser' : '';
+
+  container.innerHTML = `
+    <div class="draft-card-main">
+      <span class="draft-card-badge">${escapeHtml(kind)}</span>
+      <h3 class="draft-card-title">${escapeHtml(title)}</h3>
+      <p class="draft-card-meta">${count} question${count === 1 ? '' : 's'} • last saved ${escapeHtml(formatDateTime(draft.updated_at))}${escapeHtml(where)}</p>
+    </div>
+    <div class="draft-card-actions">
+      <button class="btn btn-primary draft-resume-btn" type="button">Resume</button>
+      <button class="btn btn-secondary draft-discard-btn" type="button">Discard</button>
+    </div>
+  `;
+  container.hidden = false;
+
+  container.querySelector('.draft-resume-btn').addEventListener('click', () => {
+    showCreateTestScreen({
+      mode: editingId ? 'edit' : 'create',
+      testId: editingId || null,
+      resumeDraft: true
+    });
+  });
+  container.querySelector('.draft-discard-btn').addEventListener('click', async () => {
+    if (!confirm(`Discard the draft “${title}”? This cannot be undone.`)) return;
+    await destroyDraftEverywhere(selectedSubject.code);
+    container.hidden = true;
+    container.innerHTML = '';
+  });
+}
+
 function formatDateTime(value) {
   if (!value) return 'Just now';
   const d = new Date(value);
@@ -1414,9 +1662,10 @@ function renderHostTestCards(tests) {
     const desc = test.description ? `<p class="test-card-desc">${escapeHtml(test.description)}</p>` : '';
     const owner = test.ownerName ? `<p class="test-card-owner">Owner: ${escapeHtml(test.ownerName)}</p>` : '';
     const updated = `<p class="test-card-updated">Updated ${escapeHtml(formatDateTime(test.updated_at || test.created_at))}</p>`;
-    const secondaryLabel = test.canEdit
-      ? 'Edit Test'
-      : (test.source === 'built-in' ? 'Edit Test' : 'Duplicate Test');
+    // The label must match what the button actually does. A built-in test used
+    // to read "Edit Test" while carrying the duplicate class, so it silently
+    // made a copy instead.
+    const secondaryLabel = test.canEdit ? 'Edit Test' : 'Copy & Edit';
     const secondaryClass = test.canEdit ? 'test-edit-btn' : 'test-duplicate-btn';
     const deleteButton = test.canEdit
       ? '<button class="btn btn-danger test-delete-btn">Delete</button>'
@@ -1471,7 +1720,7 @@ async function duplicateTestFrom(testSummary) {
   );
   try {
     const detail = await apiGet(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(testSummary.id)}`);
-    await showCreateTestScreen({ mode: 'create' });
+    await showCreateTestScreen({ mode: 'create', intent: 'duplicate' });
     const copyTitle = detail.title ? `${detail.title} (Copy)` : 'Untitled Test (Copy)';
     applyEditorData({
       title: copyTitle,
@@ -1500,27 +1749,163 @@ async function deleteTestFromLibrary(testSummary) {
   }
 }
 
-function getDraftEditingId(draft) {
-  return draft?.editing_test_id || draft?.editingTestId || null;
+// ── Drafts ───────────────────────────────────────────────────────────────────
+// Drafts are keyed (lecturer, subject) — one per subject. Three things can hold
+// a copy: Supabase, the server's local file, and this browser's localStorage.
+// The browser copy is the one that survives a Render redeploy, so it is always
+// written first and always consulted on the way back in.
+
+const DRAFT_LS_PREFIX = 'quiz_draft_';
+
+function draftStorageKey(subjectCode) {
+  return `${DRAFT_LS_PREFIX}${subjectCode}`;
+}
+
+function readLocalDraft(subjectCode) {
+  try {
+    const raw = localStorage.getItem(draftStorageKey(subjectCode));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    // Never hand one lecturer another lecturer's work on a shared machine.
+    if (lecturerSession && parsed.lecturer_id && parsed.lecturer_id !== lecturerSession.id) return null;
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeLocalDraft(subjectCode, payload) {
+  if (!subjectCode) return;
+  try {
+    localStorage.setItem(draftStorageKey(subjectCode), JSON.stringify({
+      ...payload,
+      lecturer_id: lecturerSession ? lecturerSession.id : null,
+      updated_at: new Date().toISOString()
+    }));
+  } catch (e) {
+    // Quota or private browsing — the server copy is still the primary store.
+  }
+}
+
+function clearLocalDraft(subjectCode) {
+  try {
+    localStorage.removeItem(draftStorageKey(subjectCode));
+  } catch (e) {}
+}
+
+// getDraftEditingId, draftTimestamp, draftQuestions, draftHasContent,
+// chooseNewerDraft and decideDraftAction come from draft_utils.js, which
+// index.html loads first. They are pure and unit tested in
+// tests/test_draft_logic.js.
+
+function describeDraft(draft) {
+  const count = draftQuestions(draft).length;
+  const title = (draft?.title || '').trim() || 'Untitled test';
+  const questions = `${count} question${count === 1 ? '' : 's'}`;
+  return `“${title}” — ${questions}, last saved ${formatDateTime(draft?.updated_at)}`;
+}
+
+/**
+ * Fetch the server draft and compare it with the browser copy, returning
+ * whichever is newer. The browser copy wins after a server restart wiped the
+ * ephemeral store, which is exactly the case this is here to survive.
+ */
+async function loadBestDraft(subjectCode) {
+  let serverDraft = null;
+  let storedIn = null;
+  let error = null;
+  try {
+    const resp = await apiGet(`/api/drafts/${encodeURIComponent(subjectCode)}`);
+    serverDraft = resp.draft || null;
+    storedIn = resp.storedIn || null;
+    error = resp.error || null;
+  } catch (e) {
+    error = e.message;
+  }
+  const localDraft = readLocalDraft(subjectCode);
+  const chosen = chooseNewerDraft(serverDraft, localDraft);
+  return {
+    draft: chosen.draft,
+    source: chosen.source,
+    storedIn: chosen.source === 'browser' ? 'browser' : storedIn,
+    error
+  };
+}
+
+/**
+ * A small promise-based chooser. Never destroys anything by itself — the caller
+ * acts on the returned key.
+ */
+function askDraftChoice({ title, message, detail, options }) {
+  const modal = $('#draft-choice-modal');
+  const actions = $('#draft-choice-actions');
+  if (!modal || !actions) return Promise.resolve(options[0]?.key);
+
+  $('#draft-choice-title').textContent = title;
+  $('#draft-choice-message').textContent = message;
+  const detailEl = $('#draft-choice-detail');
+  detailEl.textContent = detail || '';
+  detailEl.hidden = !detail;
+
+  actions.innerHTML = '';
+  modal.hidden = false;
+
+  return new Promise((resolve) => {
+    const finish = (key) => {
+      modal.hidden = true;
+      modal.onclick = null;
+      document.removeEventListener('keydown', onKey);
+      resolve(key);
+    };
+    const onKey = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        finish(options[options.length - 1].key);
+      }
+    };
+    options.forEach((option, index) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `btn ${option.className || (index === 0 ? 'btn-primary' : 'btn-secondary')}`;
+      btn.textContent = option.label;
+      btn.addEventListener('click', () => finish(option.key));
+      actions.appendChild(btn);
+    });
+    modal.onclick = (event) => {
+      if (event.target === modal) finish(options[options.length - 1].key);
+    };
+    document.addEventListener('keydown', onKey);
+    requestAnimationFrame(() => {
+      const first = actions.querySelector('button');
+      if (first) first.focus();
+    });
+  });
 }
 
 function applyEditorData(data = {}) {
   $('#test-title-input').value = data.title || '';
   $('#test-chapter-input').value = data.chapter || '';
   $('#test-description-input').value = data.description || '';
+  // Set the test default before rendering the questions, so each per-question
+  // "Use test default (Ns)" label is right from the start.
+  setTestDefaultTimeLimit(data.defaultTimeLimit || data.default_time_limit || TIME_PER_Q);
   const questions = Array.isArray(data.questions) && data.questions.length
     ? data.questions
     : [{ q: '', options: ['', '', '', ''], correct: 0, explanation: '' }];
   renderQuestionEditors(questions);
+  refreshTimingLabels();
 }
 
-function resetDraftStatus(text = 'No draft changes yet.', isError = false) {
+function resetDraftStatus(text = 'No draft changes yet.', isError = false, isWarning = false) {
   const el = $('#draft-status');
   if (!el) return;
   el.textContent = text;
+  const neutral = !text || text.toLowerCase().includes('unsaved') || text.toLowerCase().includes('no draft');
   el.classList.toggle('error-text', !!isError);
-  el.classList.toggle('success-text', !isError && !!text && !text.toLowerCase().includes('unsaved'));
-  el.classList.toggle('muted-text', !isError && (!text || text.toLowerCase().includes('unsaved') || text.toLowerCase().includes('no draft')));
+  el.classList.toggle('warning-text', !isError && !!isWarning);
+  el.classList.toggle('success-text', !isError && !isWarning && !!text && !neutral);
+  el.classList.toggle('muted-text', !isError && !isWarning && neutral);
 }
 
 function markDraftDirty() {
@@ -1545,6 +1930,13 @@ function bindEditorInputAutosave() {
   });
 }
 
+/** The per-question override, or null to inherit the test default. */
+function readQuestionTimeLimit(card) {
+  const select = card.querySelector('.editor-time-limit');
+  if (!select || !select.value) return null;
+  return clampTimeLimit(select.value);
+}
+
 function collectDraftFormPayload() {
   const title = $('#test-title-input').value.trim();
   const chapter = $('#test-chapter-input').value.trim();
@@ -1555,13 +1947,16 @@ function collectDraftFormPayload() {
     const options = Array.from(card.querySelectorAll('.editor-option')).map((input) => input.value.trim());
     const correct = Number(card.querySelector('.editor-correct').value || 0);
     const explanation = card.querySelector('.editor-explanation').value.trim();
-    return { q, options, correct, explanation };
+    // Timing must survive a draft too — leaving it out here is an easy bug and
+    // there is a test for it.
+    return { q, options, correct, explanation, time_limit: readQuestionTimeLimit(card) };
   });
   return {
     title,
     chapter,
     description,
     questions,
+    default_time_limit: getTestDefaultTimeLimit(),
     editingTestId: editingTestId || null
   };
 }
@@ -1573,28 +1968,73 @@ async function saveDraft({ silent = false } = {}) {
     draftSaveTimer = null;
   }
   const payload = collectDraftFormPayload();
+
+  // Write the browser copy first, before any network call. This is the copy
+  // that survives a server restart, a Supabase outage or a Render redeploy,
+  // and it costs nothing.
+  writeLocalDraft(selectedSubject.code, payload);
+
   try {
     const resp = await apiPost(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`, payload);
+    // The old server returned HTTP 200 with {"ok": false} when the write had
+    // failed, and this function only ever looked at the HTTP status — so a
+    // failed save was reported to the lecturer as a success.
+    if (resp && resp.ok === false) {
+      throw new Error(resp.error || 'The server could not store this draft.');
+    }
     draftDirty = false;
     currentDraftLoaded = resp.draft || payload;
-    const updatedAt = resp.draft?.updated_at || new Date().toISOString();
-    resetDraftStatus(`Draft saved ${formatDateTime(updatedAt)}.`, false);
+    const when = formatDateTime(resp.draft?.updated_at || new Date().toISOString());
+    if (resp.storedIn === 'supabase') {
+      resetDraftStatus(`Draft saved to Supabase ${when}.`, false);
+    } else if (resp.storedIn === 'local-file') {
+      resetDraftStatus(
+        `Draft saved locally ${when} — it will be lost if the server redeploys. A copy is also kept in this browser.`,
+        false,
+        true
+      );
+    } else {
+      resetDraftStatus(
+        `Draft saved to server memory only ${when} — it will be lost when the server restarts. A copy is also kept in this browser.`,
+        false,
+        true
+      );
+    }
     return resp.draft;
   } catch (e) {
-    if (!silent) {
-      resetDraftStatus(e.message || 'Draft save failed.', true);
-    } else {
-      resetDraftStatus('Autosave failed. Use Save Draft before leaving.', true);
-    }
+    const reason = e.message || 'the server did not respond';
+    resetDraftStatus(
+      `Draft NOT saved — ${reason}. A copy is kept in this browser and will be offered when you come back.`,
+      true
+    );
+    if (!silent) console.error('Draft save failed:', e);
     return null;
   }
 }
 
+/** Cancel a queued autosave, flushing it first if there are pending changes. */
+function flushPendingDraftSave() {
+  if (draftSaveTimer) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+  if (!draftDirty || !selectedSubject || !lecturerSession) return;
+  // Always capture the browser copy synchronously; the network save is
+  // best-effort and must not block navigation.
+  writeLocalDraft(selectedSubject.code, collectDraftFormPayload());
+  saveDraft({ silent: true });
+}
+
 async function discardDraft() {
   if (!selectedSubject) return;
-  if (!confirm('Discard the saved draft for this subject?')) return;
+  if (!confirm('Discard the saved draft for this subject? This cannot be undone.')) return;
+  if (draftSaveTimer) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
   try {
     await apiDelete(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`);
+    clearLocalDraft(selectedSubject.code);
     currentDraftLoaded = null;
     draftDirty = false;
     if (editorMode === 'edit' && originalEditingTest) {
@@ -1606,6 +2046,16 @@ async function discardDraft() {
     }
   } catch (e) {
     resetDraftStatus(e.message || 'Could not discard the draft.', true);
+  }
+}
+
+/** Destroy every copy of the draft. Only ever called on an explicit choice. */
+async function destroyDraftEverywhere(subjectCode) {
+  clearLocalDraft(subjectCode);
+  try {
+    await apiDelete(`/api/drafts/${encodeURIComponent(subjectCode)}`);
+  } catch (e) {
+    // Non-fatal: the next autosave overwrites whatever is left behind.
   }
 }
 
@@ -1627,43 +2077,116 @@ async function showCreateTestScreen(options = {}) {
   showInlineStatus('#host-create-status', '', false);
   resetDraftStatus('Loading editor...', false);
 
-  let draft = null;
-  if (editorMode === 'create') {
+  // Always read the draft on the way in — including in create mode. The old
+  // code fired an unconditional DELETE here, which destroyed the draft the
+  // lecturer had saved in a previous session before it was ever read. That,
+  // plus only ever restoring drafts whose editing_test_id matched the test
+  // being edited (never true for a new-test draft), is why "Save Draft" looked
+  // like it did nothing.
+  const { draft, source: draftSource } = await loadBestDraft(selectedSubject.code);
+  const decision = decideDraftAction({
+    mode: editorMode,
+    editingTestId,
+    draft,
+    resumeDraft: !!options.resumeDraft
+  });
+  const draftEditingId = decision.draftEditingId;
+
+  const loadSavedTest = async (testId) => {
     try {
-      await apiDelete(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`);
+      return await apiGet(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(testId)}`);
     } catch (e) {
-      // Ignore draft deletion errors and still start with a blank editor.
+      return null;   // the underlying test may since have been deleted
     }
-  } else {
-    try {
-      const draftResp = await apiGet(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`);
-      draft = draftResp.draft;
-    } catch (e) {
-      draft = null;
-    }
-  }
+  };
+
+  const applyDraft = () => {
+    currentDraftLoaded = draft;
+    editingTestId = draftEditingId || null;
+    editorMode = draftEditingId ? 'edit' : 'create';
+    $('#create-test-title').textContent = editorMode === 'edit' ? 'Edit Test' : 'Create Test';
+    applyEditorData({
+      title: draft.title || '',
+      chapter: draft.chapter || '',
+      description: draft.description || '',
+      questions: draft.questions || []
+    });
+    const where = draftSource === 'browser' ? ' (recovered from this browser)' : '';
+    resetDraftStatus(`Recovered your draft from ${formatDateTime(draft.updated_at)}${where}.`, false);
+  };
+
+  const startBlank = async () => {
+    // The only path that destroys a draft, and only on an explicit choice.
+    await destroyDraftEverywhere(selectedSubject.code);
+    editingTestId = null;
+    editorMode = 'create';
+    originalEditingTest = null;
+    applyEditorData({ title: '', chapter: '', description: '', questions: [] });
+    resetDraftStatus('Previous draft discarded. Drafts save automatically.', false);
+  };
 
   try {
-    if (editorMode === 'edit' && editingTestId) {
+    if (decision.action === 'saved-test') {
       originalEditingTest = await apiGet(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(editingTestId)}`);
-      if (draft && getDraftEditingId(draft) === editingTestId) {
-        currentDraftLoaded = draft;
-        applyEditorData({
-          title: draft.title || '',
-          chapter: draft.chapter || '',
-          description: draft.description || '',
-          questions: draft.questions || []
-        });
-        resetDraftStatus(`Recovered your draft from ${formatDateTime(draft.updated_at)}.`, false);
-      } else {
-        applyEditorData(originalEditingTest);
-        resetDraftStatus('Editing the saved test.', false);
-      }
-    } else {
+      applyEditorData(originalEditingTest);
+      resetDraftStatus('Editing the saved test.', false);
+
+    } else if (decision.action === 'blank') {
       editingTestId = null;
       originalEditingTest = null;
       applyEditorData({ title: '', chapter: '', description: '', questions: [] });
       resetDraftStatus('Start building your test. Drafts save automatically.', false);
+
+    } else if (decision.action === 'resume') {
+      if (draftEditingId) originalEditingTest = await loadSavedTest(draftEditingId);
+      applyDraft();
+
+    } else if (decision.kind === 'edit-vs-draft') {
+      // A draft exists but belongs elsewhere. Warn before the first autosave
+      // silently replaces it.
+      originalEditingTest = await apiGet(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(editingTestId)}`);
+      const choice = await askDraftChoice({
+        title: 'You have an unsaved draft',
+        message: 'This draft is not part of the test you just opened. If you carry on editing this test, your changes will replace the draft the next time they save.',
+        detail: describeDraft(draft),
+        options: [
+          { key: 'draft', label: 'Open my draft instead' },
+          { key: 'test', label: 'Continue editing this test' }
+        ]
+      });
+      if (choice === 'draft') {
+        applyDraft();
+      } else {
+        applyEditorData(originalEditingTest);
+        resetDraftStatus('Editing the saved test. Your previous draft will be replaced when this autosaves.', false, true);
+      }
+
+    } else {
+      // create-vs-draft
+      const belongsElsewhere = !!decision.belongsElsewhere;
+      const choice = await askDraftChoice({
+        title: 'Resume your unsaved draft?',
+        message: belongsElsewhere
+          ? 'You have an unsaved draft of a saved test in this subject.'
+          : 'You have an unsaved draft for this subject.',
+        detail: describeDraft(draft),
+        options: [
+          { key: 'draft', label: belongsElsewhere ? 'Open that draft' : 'Resume draft' },
+          {
+            key: 'blank',
+            label: options.intent === 'duplicate'
+              ? 'Continue with the copy (discards draft)'
+              : 'Start blank (discards draft)',
+            className: 'btn-secondary'
+          }
+        ]
+      });
+      if (choice === 'draft') {
+        if (draftEditingId) originalEditingTest = await loadSavedTest(draftEditingId);
+        applyDraft();
+      } else {
+        await startBlank();
+      }
     }
   } catch (e) {
     showInlineStatus('#host-create-status', e.message, true);
@@ -1672,6 +2195,9 @@ async function showCreateTestScreen(options = {}) {
   }
 
   bindEditorInputAutosave();
+  bindTimingControls();
+  bindImportUI();
+  showInlineStatus('#import-status', '', false);
 
   const addBtn = $('#btn-add-question');
   const addClone = addBtn.cloneNode(true);
@@ -1723,6 +2249,14 @@ async function showCreateTestScreen(options = {}) {
       originalEditingTest = resp.test;
       currentDraftLoaded = null;
       draftDirty = false;
+      // The server clears its own draft on a successful save; clear the browser
+      // mirror too, or it would be offered back as "unsaved work" next time.
+      if (draftSaveTimer) {
+        clearTimeout(draftSaveTimer);
+        draftSaveTimer = null;
+      }
+      clearLocalDraft(selectedSubject.code);
+      resetDraftStatus('Saved. No unsaved draft.', false);
       showInlineStatus('#host-create-status', 'Test saved.', false);
       saveClone.disabled = false;
       saveClone.textContent = 'Save';
@@ -1734,6 +2268,170 @@ async function showCreateTestScreen(options = {}) {
   });
 }
 
+// ── Word import ──────────────────────────────────────────────────────────────
+
+let importUiBound = false;
+
+function bindImportUI() {
+  if (importUiBound) return;
+  importUiBound = true;
+
+  const dropzone = $('#import-dropzone');
+  const input = $('#import-file-input');
+  if (!dropzone || !input) return;
+
+  const choose = () => input.click();
+  dropzone.addEventListener('click', choose);
+  dropzone.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      choose();
+    }
+  });
+
+  ['dragenter', 'dragover'].forEach((evt) => {
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropzone.classList.add('is-dragging');
+    });
+  });
+  ['dragleave', 'drop'].forEach((evt) => {
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('is-dragging');
+    });
+  });
+  dropzone.addEventListener('drop', (e) => {
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file) uploadImportFile(file);
+  });
+
+  input.addEventListener('change', () => {
+    const file = input.files && input.files[0];
+    if (file) uploadImportFile(file);
+    input.value = '';       // allow re-selecting the same file
+  });
+}
+
+async function uploadImportFile(file) {
+  if (!file) return;
+  if (!/\.docx$/i.test(file.name)) {
+    showInlineStatus('#import-status', 'Please choose a .docx file. Word’s older .doc format and PDFs cannot be read.', true);
+    return;
+  }
+  showInlineStatus('#import-status', `Reading ${file.name}…`, false);
+  const form = new FormData();
+  form.append('file', file, file.name);
+  try {
+    const resp = await fetch(`${API_BASE}/api/import/questions`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: form
+    });
+    const data = await parseApiResponse(resp);
+    showInlineStatus('#import-status', '', false);
+    showImportReview(data, file.name);
+  } catch (e) {
+    showInlineStatus('#import-status', e.message || 'Could not read that document.', true);
+  }
+}
+
+function showImportReview(data, filename) {
+  const modal = $('#import-review-modal');
+  const list = $('#import-review-list');
+  const summaryEl = $('#import-review-summary');
+  const warningsEl = $('#import-review-warnings');
+  if (!modal || !list) return;
+
+  const questions = Array.isArray(data.questions) ? data.questions : [];
+  const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+  const meta = data.meta || {};
+
+  const bits = [`${questions.length} question${questions.length === 1 ? '' : 's'} found in ${filename}`];
+  if (meta.skipped) bits.push(`${meta.skipped} skipped`);
+  if (meta.layout) bits.push(`${meta.layout} layout`);
+  summaryEl.textContent = bits.join(' • ');
+
+  if (warnings.length) {
+    warningsEl.hidden = false;
+    warningsEl.innerHTML = `
+      <p class="import-warnings-title">${warnings.length} thing${warnings.length === 1 ? '' : 's'} to check</p>
+      <ul>${warnings.map((w) => `<li>${w.index ? `<strong>Q${w.index}:</strong> ` : ''}${escapeHtml(w.message)}</li>`).join('')}</ul>
+    `;
+  } else {
+    warningsEl.hidden = true;
+    warningsEl.innerHTML = '';
+  }
+
+  list.innerHTML = questions.length
+    ? questions.map((q, i) => {
+      const options = (q.options || []).map((opt, oi) => `
+        <li class="${oi === q.correct ? 'is-correct' : ''}">
+          <span class="import-opt-letter">${'ABCD'[oi] || ''}</span>
+          <span>${escapeHtml(opt)}</span>
+          ${oi === q.correct ? '<span class="import-opt-tick">✓ correct</span>' : ''}
+        </li>`).join('');
+      const time = q.time_limit ? `<span class="import-q-time">${q.time_limit}s</span>` : '';
+      const explanation = q.explanation
+        ? `<p class="import-q-explanation">${escapeHtml(q.explanation)}</p>`
+        : '';
+      return `
+        <div class="import-review-item">
+          <p class="import-q-text"><strong>${i + 1}.</strong> ${escapeHtml(q.q)} ${time}</p>
+          <ul class="import-q-options">${options}</ul>
+          ${explanation}
+        </div>`;
+    }).join('')
+    : '<p class="empty-msg">No questions could be read from that document. Check the format against the template.</p>';
+
+  const appendBtn = $('#btn-import-append');
+  const replaceBtn = $('#btn-import-replace');
+  const cancelBtn = $('#btn-import-cancel');
+  appendBtn.disabled = questions.length === 0;
+  replaceBtn.disabled = questions.length === 0;
+
+  const close = () => {
+    modal.hidden = true;
+    modal.onclick = null;
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      close();
+    }
+  };
+
+  const apply = (mode) => {
+    const existing = mode === 'replace' ? [] : collectDraftFormPayload().questions.filter(hasQuestionContent);
+    renderQuestionEditors(existing.concat(questions));
+    close();
+    showInlineStatus(
+      '#host-create-status',
+      `${questions.length} question${questions.length === 1 ? '' : 's'} imported. Review them, then press Save.`,
+      false
+    );
+    // Mark dirty so the import is autosaved as a draft straight away.
+    markDraftDirty();
+  };
+
+  appendBtn.onclick = () => apply('append');
+  replaceBtn.onclick = () => apply('replace');
+  cancelBtn.onclick = close;
+  modal.onclick = (e) => {
+    if (e.target === modal) close();
+  };
+  document.addEventListener('keydown', onKey);
+  modal.hidden = false;
+}
+
+function hasQuestionContent(q) {
+  if (!q) return false;
+  return !!((q.q || '').trim()
+    || (q.explanation || '').trim()
+    || (q.options || []).some((opt) => (opt || '').trim()));
+}
+
 function renderQuestionEditors(questions) {
   const container = $('#question-editor-list');
   container.innerHTML = '';
@@ -1741,6 +2439,111 @@ function renderQuestionEditors(questions) {
     ? questions
     : [{ q: '', options: ['', '', '', ''], correct: 0, explanation: '' }];
   normalized.forEach((q) => addQuestionEditor(q));
+}
+
+// ── Question timing ──────────────────────────────────────────────────────────
+
+const TIME_PRESETS = [
+  { value: 10, label: '10s — quick recall' },
+  { value: 30, label: '30s — standard' },
+  { value: 60, label: '60s' },
+  { value: 90, label: '90s' },
+  { value: 120, label: '120s — calculation' }
+];
+
+/** The test-level default currently shown in the editor. */
+function getTestDefaultTimeLimit() {
+  const select = $('#test-default-time');
+  if (!select) return TIME_PER_Q;
+  if (select.value === 'custom') {
+    const custom = Number($('#test-default-time-custom').value);
+    return clampTimeLimit(custom);
+  }
+  return clampTimeLimit(Number(select.value));
+}
+
+function clampTimeLimit(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return TIME_PER_Q;
+  return Math.max(5, Math.min(300, Math.round(seconds)));
+}
+
+function setTestDefaultTimeLimit(seconds) {
+  const select = $('#test-default-time');
+  const customWrap = $('#test-default-time-custom-wrap');
+  const custom = $('#test-default-time-custom');
+  if (!select) return;
+  const value = clampTimeLimit(seconds || TIME_PER_Q);
+  const preset = TIME_PRESETS.find((p) => p.value === value);
+  if (preset) {
+    select.value = String(preset.value);
+    if (customWrap) customWrap.hidden = true;
+  } else {
+    select.value = 'custom';
+    if (customWrap) customWrap.hidden = false;
+    if (custom) custom.value = String(value);
+  }
+}
+
+function buildQuestionTimeOptions(selected) {
+  const testDefault = getTestDefaultTimeLimit();
+  const options = [`<option value="">Use test default (${testDefault}s)</option>`];
+  TIME_PRESETS.forEach((preset) => {
+    options.push(`<option value="${preset.value}">${escapeHtml(preset.label)}</option>`);
+  });
+  const value = selected ? clampTimeLimit(selected) : '';
+  if (value && !TIME_PRESETS.some((p) => p.value === value)) {
+    options.push(`<option value="${value}">${value}s</option>`);
+  }
+  return options.join('');
+}
+
+/**
+ * Keep every per-question "Use test default (Ns)" label truthful when the
+ * test-level default changes, and refresh the estimate.
+ */
+function refreshTimingLabels() {
+  const testDefault = getTestDefaultTimeLimit();
+  document.querySelectorAll('.editor-time-limit').forEach((select) => {
+    const inherit = select.querySelector('option[value=""]');
+    if (inherit) inherit.textContent = `Use test default (${testDefault}s)`;
+  });
+  updateEstimatedLength();
+}
+
+function updateEstimatedLength() {
+  const el = $('#estimated-length');
+  if (!el) return;
+  const testDefault = getTestDefaultTimeLimit();
+  const cards = Array.from(document.querySelectorAll('.question-editor-card'));
+  if (!cards.length) {
+    el.textContent = 'Estimated quiz length: —';
+    return;
+  }
+  // Each question costs its own limit plus the 3 s ready countdown and the
+  // 5 s reveal pause.
+  const totalSeconds = cards.reduce((sum, card) => {
+    const select = card.querySelector('.editor-time-limit');
+    const own = select && select.value ? clampTimeLimit(select.value) : testDefault;
+    return sum + own + 3 + 5;
+  }, 0);
+  const minutes = Math.round(totalSeconds / 60);
+  el.textContent = minutes < 1
+    ? `Estimated quiz length: under a minute (${cards.length} question${cards.length === 1 ? '' : 's'})`
+    : `Estimated quiz length: ${minutes} min (${cards.length} question${cards.length === 1 ? '' : 's'})`;
+}
+
+function bindTimingControls() {
+  const select = $('#test-default-time');
+  const custom = $('#test-default-time-custom');
+  const customWrap = $('#test-default-time-custom-wrap');
+  if (!select || select.dataset.bound === '1') return;
+  select.dataset.bound = '1';
+  select.addEventListener('change', () => {
+    if (customWrap) customWrap.hidden = select.value !== 'custom';
+    refreshTimingLabels();
+  });
+  if (custom) custom.addEventListener('input', refreshTimingLabels);
 }
 
 function addQuestionEditor(data = { q: '', options: ['', '', '', ''], correct: 0, explanation: '' }) {
@@ -1782,12 +2585,19 @@ function addQuestionEditor(data = { q: '', options: ['', '', '', ''], correct: 0
           <option value="3">Option D</option>
         </select>
       </div>
+      <div>
+        <label class="input-label">Time for this question</label>
+        <select class="editor-select editor-time-limit">${buildQuestionTimeOptions(data.time_limit)}</select>
+      </div>
       <div class="editor-grow">
         <label class="input-label">Explanation</label>
         <textarea class="editor-textarea editor-explanation" rows="2" placeholder="Short explanation shown after answering..."></textarea>
       </div>
     </div>
   `;
+  const timeSelect = card.querySelector('.editor-time-limit');
+  timeSelect.value = data.time_limit ? String(clampTimeLimit(data.time_limit)) : '';
+  timeSelect.addEventListener('change', updateEstimatedLength);
   card.querySelector('.editor-question').value = data.q || '';
   card.querySelector('.editor-correct').value = String(data.correct || 0);
   const optionInputs = card.querySelectorAll('.editor-option');
@@ -1808,6 +2618,7 @@ function addQuestionEditor(data = { q: '', options: ['', '', '', ''], correct: 0
   });
   container.appendChild(card);
   refreshQuestionEditorLabels();
+  updateEstimatedLength();
 }
 
 function refreshQuestionEditorLabels() {
@@ -1827,9 +2638,9 @@ function collectTestFormPayload() {
     const options = Array.from(card.querySelectorAll('.editor-option')).map((input) => input.value.trim());
     const correct = Number(card.querySelector('.editor-correct').value);
     const explanation = card.querySelector('.editor-explanation').value.trim();
-    return { q, options, correct, explanation };
+    return { q, options, correct, explanation, time_limit: readQuestionTimeLimit(card) };
   });
-  return { title, chapter, description, questions };
+  return { title, chapter, description, questions, default_time_limit: getTestDefaultTimeLimit() };
 }
 
 function updateHostLobbyHeading() {
@@ -2015,6 +2826,21 @@ async function startHostForTest(testSummary) {
     newStart.textContent = 'Starting...';
   });
 
+  const extendBtn = $('#btn-extend-time');
+  if (extendBtn) {
+    const newExtend = extendBtn.cloneNode(true);
+    extendBtn.replaceWith(newExtend);
+    newExtend.addEventListener('click', () => {
+      send({ action: 'extend_time', seconds: 15 });
+      newExtend.disabled = true;
+      newExtend.textContent = '+15s added';
+      setTimeout(() => {
+        newExtend.disabled = false;
+        newExtend.textContent = '+15 seconds';
+      }, 1200);
+    });
+  }
+
   const nextBtn = $('#btn-next-question');
   const newNext = nextBtn.cloneNode(true);
   nextBtn.replaceWith(newNext);
@@ -2068,7 +2894,7 @@ function setupStatsDownload(selector) {
 function downloadStatsNow(subjectCode, buttonEl) {
   const url = `${API_BASE}/api/stats/${subjectCode}`;
   if (buttonEl) buttonEl.textContent = 'Downloading...';
-  fetch(url)
+  fetch(url, { credentials: 'same-origin' })
     .then(async (resp) => {
       if (!resp.ok) {
         const detail = await resp.json().catch(() => ({}));
@@ -2102,7 +2928,7 @@ function downloadTestsBackup(buttonEl) {
   const url = `${API_BASE}/api/export/tests`;
   const originalLabel = buttonEl ? buttonEl.textContent : '';
   if (buttonEl) buttonEl.textContent = 'Preparing backup...';
-  fetch(url)
+  fetch(url, { credentials: 'same-origin' })
     .then(async (resp) => {
       if (!resp.ok) {
         const detail = await resp.json().catch(() => ({}));
@@ -2182,7 +3008,7 @@ function handleHostMessage(msg) {
       $('#host-total-players').textContent = msg.total;
       break;
     case 'pause_state': {
-      document.querySelectorAll('#btn-pause-game').forEach((pauseBtn) => {
+      document.querySelectorAll('.btn-pause-game').forEach((pauseBtn) => {
         pauseBtn.textContent = msg.paused ? '▶ Resume' : '⏸ Pause';
       });
       if (msg.paused) {
@@ -2194,18 +3020,18 @@ function handleHostMessage(msg) {
       } else {
         // Resume the host timer bar from wherever hostTimeLeft currently is
         if (!hostTimerInterval && hostTimeLeft > 0) {
-          hostTimerInterval = setInterval(() => {
-            hostTimeLeft -= 0.1;
-            if (hostTimeLeft <= 0) {
-              hostTimeLeft = 0;
-              clearInterval(hostTimerInterval);
-              hostTimerInterval = null;
-            }
-            const pct = (hostTimeLeft / TIME_PER_Q) * 100;
-            $('#host-timer-bar').style.width = `${pct}%`;
-            $('#host-timer').textContent = Math.ceil(hostTimeLeft);
-          }, 100);
+          hostTimerInterval = setInterval(tickHostTimer, 100);
         }
+      }
+      break;
+    }
+    case 'time_extended': {
+      hostQuestionTimeLimit = Number(msg.timeLimit) || hostQuestionTimeLimit;
+      hostTimeLeft = Number(msg.remaining) || hostTimeLeft;
+      const limitEl = $('#host-q-limit');
+      if (limitEl) limitEl.textContent = `${Math.round(hostQuestionTimeLimit)}s for this question`;
+      if (!hostTimerInterval && hostTimeLeft > 0) {
+        hostTimerInterval = setInterval(tickHostTimer, 100);
       }
       break;
     }
@@ -2303,19 +3129,25 @@ function hostShowQuestion(msg) {
     grid.appendChild(div);
   });
 
-  hostTimeLeft = msg.timeLimit || TIME_PER_Q;
+  hostQuestionTimeLimit = Number(msg.timeLimit) > 0 ? Number(msg.timeLimit) : TIME_PER_Q;
+  hostTimeLeft = hostQuestionTimeLimit;
+  const limitEl = $('#host-q-limit');
+  if (limitEl) limitEl.textContent = `${Math.round(hostQuestionTimeLimit)}s for this question`;
   if (hostTimerInterval) clearInterval(hostTimerInterval);
-  hostTimerInterval = setInterval(() => {
-    hostTimeLeft -= 0.1;
-    if (hostTimeLeft <= 0) {
-      hostTimeLeft = 0;
-      clearInterval(hostTimerInterval);
-      hostTimerInterval = null;
-    }
-    const pct = (hostTimeLeft / TIME_PER_Q) * 100;
-    $('#host-timer-bar').style.width = `${pct}%`;
-    $('#host-timer').textContent = Math.ceil(hostTimeLeft);
-  }, 100);
+  hostTimerInterval = setInterval(tickHostTimer, 100);
+}
+
+function tickHostTimer() {
+  hostTimeLeft -= 0.1;
+  if (hostTimeLeft <= 0) {
+    hostTimeLeft = 0;
+    clearInterval(hostTimerInterval);
+    hostTimerInterval = null;
+  }
+  const limit = hostQuestionTimeLimit > 0 ? hostQuestionTimeLimit : TIME_PER_Q;
+  const pct = Math.max(0, Math.min(100, (hostTimeLeft / limit) * 100));
+  $('#host-timer-bar').style.width = `${pct}%`;
+  $('#host-timer').textContent = Math.ceil(hostTimeLeft);
 }
 
 function hostShowReveal(msg) {
@@ -2341,21 +3173,93 @@ function hostShowReveal(msg) {
     </div>
   `;
   $('#host-reveal-explanation').textContent = msg.explanation;
+  renderAnswerDistribution(msg, correctIdx);
   renderLeaderboardList($('#host-reveal-leaderboard'), msg.leaderboard, null);
 
-  let autoCountdown = 5;
+  let autoCountdown = Math.max(1, Math.round(msg.revealSeconds || 5));
   const countdownEl = $('#host-auto-countdown');
   countdownEl.textContent = `Next question in ${autoCountdown}s...`;
   countdownEl.style.display = 'block';
-  const iv = setInterval(() => {
+  revealCountdownInterval = setInterval(() => {
     autoCountdown -= 1;
     if (autoCountdown <= 0) {
-      clearInterval(iv);
+      clearInterval(revealCountdownInterval);
+      revealCountdownInterval = null;
       countdownEl.textContent = 'Loading next question...';
     } else {
       countdownEl.textContent = `Next question in ${autoCountdown}s...`;
     }
   }, 1000);
+}
+
+/**
+ * How many students picked each option. The single most useful teaching signal
+ * in a live quiz — it shows at a glance which distractor caught the class.
+ */
+function renderAnswerDistribution(msg, correctIdx) {
+  const container = $('#host-answer-distribution');
+  const title = $('#host-distribution-title');
+  if (!container) return;
+  const counts = Array.isArray(msg.distribution) ? msg.distribution : null;
+  const options = Array.isArray(msg.options) && msg.options.length ? msg.options : hostCurrentOptions;
+  if (!counts || !options || !options.length) {
+    container.hidden = true;
+    if (title) title.hidden = true;
+    return;
+  }
+  const total = counts.reduce((sum, n) => sum + n, 0);
+  container.innerHTML = options.map((opt, i) => {
+    const count = counts[i] || 0;
+    const pct = total ? Math.round((count / total) * 100) : 0;
+    const isCorrect = i === correctIdx;
+    return `
+      <div class="dist-row${isCorrect ? ' is-correct' : ''}">
+        <span class="dist-shape ${COLORS[i]}">${SHAPES[i] || ''}</span>
+        <span class="dist-label">${escapeHtml(opt)}</span>
+        <span class="dist-bar-wrap"><span class="dist-bar ${COLORS[i]}" style="width:${pct}%"></span></span>
+        <span class="dist-count">${count}${total ? ` (${pct}%)` : ''}</span>
+      </div>`;
+  }).join('') + (total === 0 ? '<p class="empty-msg">Nobody answered this question.</p>' : '');
+  container.hidden = false;
+  if (title) title.hidden = false;
+}
+
+let lastReview = null;
+
+function playerShowReview() {
+  if (!Array.isArray(lastReview) || !lastReview.length) return;
+  showScreen('screen-review');
+  const wrong = lastReview.filter((entry) => !entry.wasCorrect).length;
+  const summary = $('#review-summary');
+  if (summary) {
+    summary.textContent = wrong === 0
+      ? `You answered all ${lastReview.length} questions correctly.`
+      : `You got ${lastReview.length - wrong} of ${lastReview.length} right. Here is what to look at again.`;
+  }
+  const list = $('#review-list');
+  list.innerHTML = lastReview.map((entry) => {
+    const yours = entry.options[entry.yourChoice];
+    const right = entry.options[entry.correct];
+    const yourLine = entry.wasCorrect
+      ? `<p class="review-your correct">Your answer: ${escapeHtml(yours || '—')} ✓</p>`
+      : `<p class="review-your wrong">Your answer: ${escapeHtml(yours || 'no answer')} ✗</p>`;
+    const rightLine = entry.wasCorrect
+      ? ''
+      : `<p class="review-correct">Correct answer: ${escapeHtml(right || '')}</p>`;
+    const explanation = entry.explanation
+      ? `<p class="review-explanation">${escapeHtml(entry.explanation)}</p>`
+      : '';
+    return `
+      <div class="review-item${entry.wasCorrect ? ' is-correct' : ' is-wrong'}">
+        <p class="review-question"><strong>Q${entry.qNum}.</strong> ${escapeHtml(entry.question)}</p>
+        ${yourLine}
+        ${rightLine}
+        ${explanation}
+      </div>`;
+  }).join('');
+
+  const back = $('#btn-review-back');
+  if (back) back.onclick = () => showScreen('screen-final');
 }
 
 function hostShowFinal(lb) {
@@ -2445,7 +3349,18 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+window.addEventListener('beforeunload', (e) => {
+  const inEditor = !!document.querySelector('#screen-host-create-test.active');
+  if (!inEditor || !draftDirty) return;
+  // Capture the browser copy on the way out — this is the last chance.
+  if (selectedSubject) writeLocalDraft(selectedSubject.code, collectDraftFormPayload());
+  e.preventDefault();
+  e.returnValue = '';
+  return '';
+});
+
 window.addEventListener('DOMContentLoaded', async () => {
+  await ensureVisitorToken();
   bindHostAuthUI();
   window.addEventListener('popstate', (e) => {
     if (myPlayerId) {

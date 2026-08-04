@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -)",
+      "Bash(.venv/Scripts/python.exe -m ruff check . --fix)",
+      "Bash(git init *)",
+      "Bash(git -c user.name=Claude -c user.email=noreply@anthropic.com commit -q -m ' *)"
+    ]
+  }
+}

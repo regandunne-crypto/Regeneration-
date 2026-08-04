@@ -1,0 +1,7 @@
+# Development and test dependencies.
+# Install on top of requirements.txt:
+#   pip install -r requirements.txt -r requirements-dev.txt
+pytest
+pytest-asyncio
+httpx
+ruff

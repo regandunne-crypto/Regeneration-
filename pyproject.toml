@@ -1,0 +1,26 @@
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+exclude = [
+    ".venv", "__pycache__", ".pytest_cache",
+    # Pre-existing one-off scratch scripts, not part of the application.
+    # Left untouched deliberately; excluded so `ruff check .` stays meaningful.
+    "script.py", "script_1.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "DTZ"]
+ignore = [
+    "E501",   # long lines are pervasive in this codebase and not worth a mass reformat
+    "B008",   # FastAPI dependency defaults
+    "UP017",  # `timezone.utc` is used deliberately: `datetime.UTC` needs 3.11+,
+              # and Render pins a Python version per service.
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

@@ -4,10 +4,24 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
+    # Single worker only: live game state lives in process memory.
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     autoDeploy: true
     envVars:
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # Required when SUPABASE_URL is set. On first deploy, set this to the
+      # CURRENT value of SUPABASE_SERVICE_ROLE_KEY so no lecturer is signed out
+      # (that is what existing session cookies are already signed with), then
+      # rotate it to a fresh random value later. See README_RENDER.txt.
+      - key: APP_SESSION_SECRET
+        sync: false
+      # Optional: restrict lecturer signup to your institution's email domains,
+      # e.g. "tut.ac.za". Leave unset and signup stays open as it is today.
+      - key: ALLOWED_EMAIL_DOMAINS
+        sync: false
+      # Optional: a shared code that also permits signup, for guest lecturers.
+      - key: SIGNUP_INVITE_CODE
         sync: false

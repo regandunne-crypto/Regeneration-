@@ -108,6 +108,17 @@
     </div>
   </div>
 
+  <!-- PLAYER: Answer submitted / waiting for the rest of the class -->
+  <div id="screen-answer-submitted" class="screen">
+    <div class="lobby-player-container">
+      <div class="pulse-ring"></div>
+      <h2 class="lobby-player-name" id="answer-submitted-title">Answer submitted</h2>
+      <p class="lobby-player-msg" id="answer-submitted-detail">Your answer was received. Waiting for the other students…</p>
+      <p class="lobby-player-count" id="answer-submitted-progress" hidden></p>
+      <p class="lobby-subject-badge" id="answer-submitted-name"></p>
+    </div>
+  </div>
+
   <!-- PLAYER: Get Ready countdown -->
   <div id="screen-ready" class="screen">
     <div class="ready-container">
@@ -173,6 +184,17 @@
       <h2 class="final-title" id="final-title">Game Over</h2>
       <div class="final-podium" id="final-podium"></div>
       <div class="final-full-list" id="final-full-list"></div>
+      <button id="btn-review-answers" class="btn btn-secondary" type="button" hidden>Review my answers</button>
+    </div>
+  </div>
+
+  <!-- PLAYER: Post-game review -->
+  <div id="screen-review" class="screen">
+    <div class="leaderboard-container">
+      <h2 class="leaderboard-title">Your answers</h2>
+      <p class="review-summary" id="review-summary"></p>
+      <div class="review-list" id="review-list"></div>
+      <button id="btn-review-back" class="btn btn-secondary" type="button">&larr; Back to results</button>
     </div>
   </div>
 
@@ -231,6 +253,9 @@
           <label for="signup-password-confirm-input" class="input-label">Confirm password</label>
           <input type="password" id="signup-password-confirm-input" class="editor-input" placeholder="Repeat your password" autocomplete="new-password">
 
+          <label for="signup-invite-input" class="input-label">Invite code <span class="muted-text">(only if your administrator gave you one)</span></label>
+          <input type="text" id="signup-invite-input" class="editor-input" placeholder="Leave blank if you have a work email" autocomplete="off">
+
           <button id="btn-signup-submit" class="btn btn-primary btn-large" type="submit">Create Account</button>
         </form>
         <button id="btn-signup-back" class="back-link">&larr; Back to sign in</button>
@@ -281,12 +306,15 @@
           <span id="host-storage-badge" class="storage-badge">Storage</span>
           <span id="host-storage-note" class="storage-note"></span>
         </div>
+        <p id="host-storage-asleep" class="storage-asleep" hidden></p>
+        <p id="host-results-storage" class="storage-note results-storage-note" hidden></p>
       </div>
       <div class="host-test-library-actions">
         <button id="btn-create-test" class="btn btn-primary">Create New Test</button>
         <button id="btn-back-host-subjects" class="btn btn-secondary">Change Subject</button>
       </div>
       <p id="host-library-status" class="inline-status" hidden></p>
+      <div id="host-draft-card" class="draft-resume-card" hidden></div>
       <div class="host-test-list" id="host-test-list"></div>
       <button id="btn-backup-tests" class="btn btn-secondary" type="button">&#x2B07; Backup My Tests</button>
     </div>
@@ -309,6 +337,38 @@
 
         <label for="test-description-input" class="input-label">Short description</label>
         <textarea id="test-description-input" class="editor-textarea" rows="3" placeholder="Optional note for lecturers" maxlength="600"></textarea>
+
+        <div class="timing-row">
+          <div>
+            <label for="test-default-time" class="input-label">Default time per question</label>
+            <select id="test-default-time" class="editor-select">
+              <option value="10">10s — quick recall</option>
+              <option value="30" selected>30s — standard</option>
+              <option value="60">60s</option>
+              <option value="90">90s</option>
+              <option value="120">120s — calculation</option>
+              <option value="custom">Custom…</option>
+            </select>
+          </div>
+          <div id="test-default-time-custom-wrap" hidden>
+            <label for="test-default-time-custom" class="input-label">Seconds (5–300)</label>
+            <input type="number" id="test-default-time-custom" class="editor-input" min="5" max="300" step="5" value="30">
+          </div>
+          <p id="estimated-length" class="estimated-length">Estimated quiz length: —</p>
+        </div>
+
+        <div class="import-panel">
+          <div class="import-panel-head">
+            <h2 class="import-panel-title">Import questions from Word</h2>
+            <a id="link-import-template" class="import-template-link" href="/api/import/template" download>&#x2B07; Download question template (.docx)</a>
+          </div>
+          <div id="import-dropzone" class="import-dropzone" tabindex="0" role="button" aria-label="Choose or drop a Word file to import questions">
+            <p class="import-dropzone-main">Drop a <strong>.docx</strong> file here, or click to choose one</p>
+            <p class="import-dropzone-hint">Questions are shown for you to review. Nothing is saved until you press Save.</p>
+            <input type="file" id="import-file-input" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden>
+          </div>
+          <p id="import-status" class="inline-status" hidden></p>
+        </div>
 
         <div class="question-editor-toolbar">
           <h2 class="question-editor-heading">Questions</h2>
@@ -383,6 +443,7 @@
       </div>
       <div class="host-q-header">
         <span class="host-q-num" id="host-q-num">Q1 / 15</span>
+        <span class="host-q-limit" id="host-q-limit"></span>
         <span class="host-timer" id="host-timer">30</span>
       </div>
       <div class="host-q-timer-bar">
@@ -394,7 +455,8 @@
         <span id="host-answered-count">0</span> / <span id="host-total-players">0</span> answered
       </div>
       <div class="host-live-controls" id="host-live-controls">
-        <button id="btn-pause-game" class="btn btn-secondary" onclick="send({action:'host_pause'})">⏸ Pause</button>
+        <button type="button" id="btn-extend-time" class="btn btn-secondary">+15 seconds</button>
+        <button type="button" class="btn btn-secondary btn-pause-game" onclick="send({action:'host_pause'})">⏸ Pause</button>
         <button id="btn-end-game" class="btn btn-secondary">End Game</button>
         <button id="btn-cancel-game" class="btn btn-danger">Cancel to Lobby</button>
       </div>
@@ -412,6 +474,8 @@
           <h3 class="host-reveal-section-title">Correct Answer</h3>
           <div id="host-reveal-answer"></div>
           <p class="host-reveal-explanation" id="host-reveal-explanation"></p>
+          <h3 class="host-reveal-section-title" id="host-distribution-title" hidden>How the class answered</h3>
+          <div class="answer-distribution" id="host-answer-distribution" hidden></div>
         </div>
         <div class="host-reveal-leaderboard-panel">
           <h3 class="host-reveal-section-title">Leaderboard</h3>
@@ -419,7 +483,7 @@
         </div>
       </div>
       <div class="host-reveal-controls" id="host-reveal-controls">
-        <button id="btn-pause-game" class="btn btn-secondary" onclick="send({action:'host_pause'})">⏸ Pause</button>
+        <button type="button" class="btn btn-secondary btn-pause-game" onclick="send({action:'host_pause'})">⏸ Pause</button>
         <button id="btn-end-game-reveal" class="btn btn-secondary">End Game</button>
         <button id="btn-cancel-game-reveal" class="btn btn-danger">Cancel to Lobby</button>
       </div>
@@ -466,6 +530,31 @@
     </div>
   </div>
 
+  <!-- IMPORT REVIEW MODAL -->
+  <div id="import-review-modal" class="modal-overlay" hidden>
+    <div class="modal-card modal-card-wide">
+      <h2 class="modal-title">Review imported questions</h2>
+      <p class="modal-test-label" id="import-review-summary"></p>
+      <div id="import-review-warnings" class="import-warnings" hidden></div>
+      <div id="import-review-list" class="import-review-list"></div>
+      <div class="modal-actions">
+        <button id="btn-import-append" class="btn btn-primary" type="button">Append to current test</button>
+        <button id="btn-import-replace" class="btn btn-secondary" type="button">Replace all questions</button>
+        <button id="btn-import-cancel" class="btn btn-secondary" type="button">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- DRAFT CHOICE MODAL -->
+  <div id="draft-choice-modal" class="modal-overlay" hidden>
+    <div class="modal-card">
+      <h2 class="modal-title" id="draft-choice-title">Unsaved draft found</h2>
+      <p class="modal-test-label" id="draft-choice-message"></p>
+      <p class="draft-choice-detail" id="draft-choice-detail" hidden></p>
+      <div class="modal-actions" id="draft-choice-actions"></div>
+    </div>
+  </div>
+
   <!-- PLAYER: Token validation loading -->
   <div id="screen-token-loading" class="screen">
     <div class="ready-container">
@@ -496,6 +585,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+<script src="./draft_utils.js"></script>
 <script src="./app.js"></script>
 </body>
 </html>
