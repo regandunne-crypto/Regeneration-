@@ -838,6 +838,15 @@ function handlePlayerMessage(msg) {
       }
       playerShowResult(msg);
       break;
+    case 'time_extended':
+      // The lecturer gave the room longer on this question.
+      questionTimeLimit = Number(msg.timeLimit) || questionTimeLimit;
+      if (!playerAnswered) {
+        timeLeft = Math.max(timeLeft, Number(msg.remaining) || timeLeft);
+        if (!timerInterval && timeLeft > 0) startPlayerTimerInterval();
+        updatePlayerTimerDisplay();
+      }
+      break;
     case 'pause_state':
       if (playerNeedsGameCode) {
         ensureGameCodeScreen();
@@ -991,6 +1000,11 @@ function playerAnswer(choice, btnEl) {
 function startPlayerTimer() {
   playerAnswered = false;
   updatePlayerTimerDisplay();
+  startPlayerTimerInterval();
+}
+
+function startPlayerTimerInterval() {
+  clearTimer();
   timerInterval = setInterval(() => {
     timeLeft -= 0.1;
     if (timeLeft <= 0) {
@@ -1813,10 +1827,14 @@ function applyEditorData(data = {}) {
   $('#test-title-input').value = data.title || '';
   $('#test-chapter-input').value = data.chapter || '';
   $('#test-description-input').value = data.description || '';
+  // Set the test default before rendering the questions, so each per-question
+  // "Use test default (Ns)" label is right from the start.
+  setTestDefaultTimeLimit(data.defaultTimeLimit || data.default_time_limit || TIME_PER_Q);
   const questions = Array.isArray(data.questions) && data.questions.length
     ? data.questions
     : [{ q: '', options: ['', '', '', ''], correct: 0, explanation: '' }];
   renderQuestionEditors(questions);
+  refreshTimingLabels();
 }
 
 function resetDraftStatus(text = 'No draft changes yet.', isError = false, isWarning = false) {
@@ -1852,6 +1870,13 @@ function bindEditorInputAutosave() {
   });
 }
 
+/** The per-question override, or null to inherit the test default. */
+function readQuestionTimeLimit(card) {
+  const select = card.querySelector('.editor-time-limit');
+  if (!select || !select.value) return null;
+  return clampTimeLimit(select.value);
+}
+
 function collectDraftFormPayload() {
   const title = $('#test-title-input').value.trim();
   const chapter = $('#test-chapter-input').value.trim();
@@ -1862,13 +1887,16 @@ function collectDraftFormPayload() {
     const options = Array.from(card.querySelectorAll('.editor-option')).map((input) => input.value.trim());
     const correct = Number(card.querySelector('.editor-correct').value || 0);
     const explanation = card.querySelector('.editor-explanation').value.trim();
-    return { q, options, correct, explanation };
+    // Timing must survive a draft too — leaving it out here is an easy bug and
+    // there is a test for it.
+    return { q, options, correct, explanation, time_limit: readQuestionTimeLimit(card) };
   });
   return {
     title,
     chapter,
     description,
     questions,
+    default_time_limit: getTestDefaultTimeLimit(),
     editingTestId: editingTestId || null
   };
 }
@@ -2107,6 +2135,7 @@ async function showCreateTestScreen(options = {}) {
   }
 
   bindEditorInputAutosave();
+  bindTimingControls();
   bindImportUI();
   showInlineStatus('#import-status', '', false);
 
@@ -2352,6 +2381,111 @@ function renderQuestionEditors(questions) {
   normalized.forEach((q) => addQuestionEditor(q));
 }
 
+// ── Question timing ──────────────────────────────────────────────────────────
+
+const TIME_PRESETS = [
+  { value: 10, label: '10s — quick recall' },
+  { value: 30, label: '30s — standard' },
+  { value: 60, label: '60s' },
+  { value: 90, label: '90s' },
+  { value: 120, label: '120s — calculation' }
+];
+
+/** The test-level default currently shown in the editor. */
+function getTestDefaultTimeLimit() {
+  const select = $('#test-default-time');
+  if (!select) return TIME_PER_Q;
+  if (select.value === 'custom') {
+    const custom = Number($('#test-default-time-custom').value);
+    return clampTimeLimit(custom);
+  }
+  return clampTimeLimit(Number(select.value));
+}
+
+function clampTimeLimit(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return TIME_PER_Q;
+  return Math.max(5, Math.min(300, Math.round(seconds)));
+}
+
+function setTestDefaultTimeLimit(seconds) {
+  const select = $('#test-default-time');
+  const customWrap = $('#test-default-time-custom-wrap');
+  const custom = $('#test-default-time-custom');
+  if (!select) return;
+  const value = clampTimeLimit(seconds || TIME_PER_Q);
+  const preset = TIME_PRESETS.find((p) => p.value === value);
+  if (preset) {
+    select.value = String(preset.value);
+    if (customWrap) customWrap.hidden = true;
+  } else {
+    select.value = 'custom';
+    if (customWrap) customWrap.hidden = false;
+    if (custom) custom.value = String(value);
+  }
+}
+
+function buildQuestionTimeOptions(selected) {
+  const testDefault = getTestDefaultTimeLimit();
+  const options = [`<option value="">Use test default (${testDefault}s)</option>`];
+  TIME_PRESETS.forEach((preset) => {
+    options.push(`<option value="${preset.value}">${escapeHtml(preset.label)}</option>`);
+  });
+  const value = selected ? clampTimeLimit(selected) : '';
+  if (value && !TIME_PRESETS.some((p) => p.value === value)) {
+    options.push(`<option value="${value}">${value}s</option>`);
+  }
+  return options.join('');
+}
+
+/**
+ * Keep every per-question "Use test default (Ns)" label truthful when the
+ * test-level default changes, and refresh the estimate.
+ */
+function refreshTimingLabels() {
+  const testDefault = getTestDefaultTimeLimit();
+  document.querySelectorAll('.editor-time-limit').forEach((select) => {
+    const inherit = select.querySelector('option[value=""]');
+    if (inherit) inherit.textContent = `Use test default (${testDefault}s)`;
+  });
+  updateEstimatedLength();
+}
+
+function updateEstimatedLength() {
+  const el = $('#estimated-length');
+  if (!el) return;
+  const testDefault = getTestDefaultTimeLimit();
+  const cards = Array.from(document.querySelectorAll('.question-editor-card'));
+  if (!cards.length) {
+    el.textContent = 'Estimated quiz length: —';
+    return;
+  }
+  // Each question costs its own limit plus the 3 s ready countdown and the
+  // 5 s reveal pause.
+  const totalSeconds = cards.reduce((sum, card) => {
+    const select = card.querySelector('.editor-time-limit');
+    const own = select && select.value ? clampTimeLimit(select.value) : testDefault;
+    return sum + own + 3 + 5;
+  }, 0);
+  const minutes = Math.round(totalSeconds / 60);
+  el.textContent = minutes < 1
+    ? `Estimated quiz length: under a minute (${cards.length} question${cards.length === 1 ? '' : 's'})`
+    : `Estimated quiz length: ${minutes} min (${cards.length} question${cards.length === 1 ? '' : 's'})`;
+}
+
+function bindTimingControls() {
+  const select = $('#test-default-time');
+  const custom = $('#test-default-time-custom');
+  const customWrap = $('#test-default-time-custom-wrap');
+  if (!select || select.dataset.bound === '1') return;
+  select.dataset.bound = '1';
+  select.addEventListener('change', () => {
+    if (customWrap) customWrap.hidden = select.value !== 'custom';
+    refreshTimingLabels();
+  });
+  if (custom) custom.addEventListener('input', refreshTimingLabels);
+}
+
 function addQuestionEditor(data = { q: '', options: ['', '', '', ''], correct: 0, explanation: '' }) {
   const container = $('#question-editor-list');
   const card = document.createElement('div');
@@ -2391,12 +2525,19 @@ function addQuestionEditor(data = { q: '', options: ['', '', '', ''], correct: 0
           <option value="3">Option D</option>
         </select>
       </div>
+      <div>
+        <label class="input-label">Time for this question</label>
+        <select class="editor-select editor-time-limit">${buildQuestionTimeOptions(data.time_limit)}</select>
+      </div>
       <div class="editor-grow">
         <label class="input-label">Explanation</label>
         <textarea class="editor-textarea editor-explanation" rows="2" placeholder="Short explanation shown after answering..."></textarea>
       </div>
     </div>
   `;
+  const timeSelect = card.querySelector('.editor-time-limit');
+  timeSelect.value = data.time_limit ? String(clampTimeLimit(data.time_limit)) : '';
+  timeSelect.addEventListener('change', updateEstimatedLength);
   card.querySelector('.editor-question').value = data.q || '';
   card.querySelector('.editor-correct').value = String(data.correct || 0);
   const optionInputs = card.querySelectorAll('.editor-option');
@@ -2417,6 +2558,7 @@ function addQuestionEditor(data = { q: '', options: ['', '', '', ''], correct: 0
   });
   container.appendChild(card);
   refreshQuestionEditorLabels();
+  updateEstimatedLength();
 }
 
 function refreshQuestionEditorLabels() {
@@ -2436,9 +2578,9 @@ function collectTestFormPayload() {
     const options = Array.from(card.querySelectorAll('.editor-option')).map((input) => input.value.trim());
     const correct = Number(card.querySelector('.editor-correct').value);
     const explanation = card.querySelector('.editor-explanation').value.trim();
-    return { q, options, correct, explanation };
+    return { q, options, correct, explanation, time_limit: readQuestionTimeLimit(card) };
   });
-  return { title, chapter, description, questions };
+  return { title, chapter, description, questions, default_time_limit: getTestDefaultTimeLimit() };
 }
 
 function updateHostLobbyHeading() {
@@ -2624,6 +2766,21 @@ async function startHostForTest(testSummary) {
     newStart.textContent = 'Starting...';
   });
 
+  const extendBtn = $('#btn-extend-time');
+  if (extendBtn) {
+    const newExtend = extendBtn.cloneNode(true);
+    extendBtn.replaceWith(newExtend);
+    newExtend.addEventListener('click', () => {
+      send({ action: 'extend_time', seconds: 15 });
+      newExtend.disabled = true;
+      newExtend.textContent = '+15s added';
+      setTimeout(() => {
+        newExtend.disabled = false;
+        newExtend.textContent = '+15 seconds';
+      }, 1200);
+    });
+  }
+
   const nextBtn = $('#btn-next-question');
   const newNext = nextBtn.cloneNode(true);
   nextBtn.replaceWith(newNext);
@@ -2805,6 +2962,16 @@ function handleHostMessage(msg) {
         if (!hostTimerInterval && hostTimeLeft > 0) {
           hostTimerInterval = setInterval(tickHostTimer, 100);
         }
+      }
+      break;
+    }
+    case 'time_extended': {
+      hostQuestionTimeLimit = Number(msg.timeLimit) || hostQuestionTimeLimit;
+      hostTimeLeft = Number(msg.remaining) || hostTimeLeft;
+      const limitEl = $('#host-q-limit');
+      if (limitEl) limitEl.textContent = `${Math.round(hostQuestionTimeLimit)}s for this question`;
+      if (!hostTimerInterval && hostTimeLeft > 0) {
+        hostTimerInterval = setInterval(tickHostTimer, 100);
       }
       break;
     }

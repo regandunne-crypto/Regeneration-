@@ -36,6 +36,7 @@ create table if not exists public.quiz_tests (
   chapter text,
   description text,
   question_count integer not null default 0,
+  default_time_limit integer not null default 30,
   questions jsonb not null default '[]'::jsonb,
   created_by uuid references public.quiz_lecturers(id) on delete set null,
   updated_by uuid references public.quiz_lecturers(id) on delete set null,
@@ -50,6 +51,9 @@ alter table public.quiz_tests
   add column if not exists chapter text,
   add column if not exists description text,
   add column if not exists question_count integer not null default 0,
+  -- Existing rows get 30, so tests saved before per-test timing keep running
+  -- at exactly 30 seconds. Per-question overrides live inside `questions`.
+  add column if not exists default_time_limit integer not null default 30,
   add column if not exists questions jsonb not null default '[]'::jsonb,
   add column if not exists created_by uuid references public.quiz_lecturers(id) on delete set null,
   add column if not exists updated_by uuid references public.quiz_lecturers(id) on delete set null,
@@ -71,6 +75,7 @@ create table if not exists public.quiz_test_drafts (
   chapter text,
   description text,
   question_count integer not null default 0,
+  default_time_limit integer not null default 30,
   questions jsonb not null default '[]'::jsonb,
   editing_test_id text,
   owner_name text,
@@ -85,6 +90,7 @@ alter table public.quiz_test_drafts
   add column if not exists chapter text,
   add column if not exists description text,
   add column if not exists question_count integer not null default 0,
+  add column if not exists default_time_limit integer not null default 30,
   add column if not exists questions jsonb not null default '[]'::jsonb,
   add column if not exists editing_test_id text,
   add column if not exists owner_name text,

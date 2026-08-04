@@ -2261,6 +2261,36 @@ body::before {
   display: none;
 }
 
+/* ── Question timing ─────────────────────────────────────────────────────── */
+
+.timing-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-4);
+  margin-top: var(--space-3);
+}
+
+.timing-row > div {
+  min-width: 190px;
+}
+
+.timing-row > div[hidden] {
+  display: none;
+}
+
+.estimated-length {
+  margin: 0 0 0.35rem auto;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+
+.host-q-limit {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+}
+
 /* ── Word import ─────────────────────────────────────────────────────────── */
 
 .import-panel {

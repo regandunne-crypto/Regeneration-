@@ -53,6 +53,10 @@ SUBJECT_CODE_PATTERN = re.compile(r"^[A-Z0-9]{3,10}$")
 TIME_PER_Q = int(os.environ.get("TIME_PER_Q", "30"))
 MAX_POINTS = 1000
 MIN_POINTS = 200
+# Bounds for a configurable question time limit. TIME_PER_Q above is now the
+# fallback default rather than a hard constant.
+MIN_TIME_LIMIT = 5
+MAX_TIME_LIMIT = 300
 REQUEST_TIMEOUT = 20
 
 # Pacing constants. Overridable by environment so the test suite can run a whole
@@ -291,6 +295,9 @@ class QuestionPayload(BaseModel):
     options: list[str]
     correct: int = Field(ge=0, le=3)
     explanation: str = Field(default="", max_length=2000)
+    # None means "use the test default". Existing saved questions have no such
+    # field at all, so they keep running at exactly TIME_PER_Q with no migration.
+    time_limit: int | None = Field(default=None, ge=MIN_TIME_LIMIT, le=MAX_TIME_LIMIT)
 
     @field_validator("options")
     @classmethod
@@ -324,6 +331,7 @@ class TestPayload(BaseModel):
     chapter: str = Field(default="", max_length=140)
     description: str = Field(default="", max_length=600)
     questions: list[QuestionPayload]
+    default_time_limit: int = Field(default=TIME_PER_Q, ge=MIN_TIME_LIMIT, le=MAX_TIME_LIMIT)
 
     @field_validator("title")
     @classmethod
@@ -410,6 +418,7 @@ class DraftQuestionPayload(BaseModel):
     options: list[str] = Field(default_factory=lambda: ["", "", "", ""])
     correct: int = Field(default=0, ge=0, le=3)
     explanation: str = Field(default="", max_length=2000)
+    time_limit: int | None = Field(default=None, ge=MIN_TIME_LIMIT, le=MAX_TIME_LIMIT)
 
     @field_validator("options")
     @classmethod
@@ -436,6 +445,7 @@ class DraftPayload(BaseModel):
     description: str = Field(default="", max_length=600)
     questions: list[DraftQuestionPayload] = Field(default_factory=list)
     editingTestId: str | None = None
+    default_time_limit: int = Field(default=TIME_PER_Q, ge=MIN_TIME_LIMIT, le=MAX_TIME_LIMIT)
 
     @field_validator("title")
     @classmethod
@@ -593,7 +603,7 @@ class SupabaseStore:
 
     async def list_tests_by_creator(self, lecturer_id: str) -> list[dict[str, Any]]:
         rows = await self._request("GET", self.quiz_tests_base, params={
-            "select": "id,subject_code,title,chapter,description,questions,question_count,created_at,updated_at,created_by,owner_name",
+            "select": "id,subject_code,title,chapter,description,questions,question_count,default_time_limit,created_at,updated_at,created_by,owner_name",
             "created_by": f"eq.{lecturer_id}",
             "order": "subject_code.asc,updated_at.desc",
         })
@@ -610,7 +620,7 @@ class SupabaseStore:
 
     async def list_tests(self, subject_code: str, lecturer_id: str | None = None) -> list[dict[str, Any]]:
         rows = await self._request("GET", self.quiz_tests_base, params={
-            "select": "id,subject_code,title,chapter,description,question_count,created_at,updated_at,created_by,owner_name",
+            "select": "id,subject_code,title,chapter,description,question_count,default_time_limit,created_at,updated_at,created_by,owner_name",
             "subject_code": f"eq.{subject_code}",
             "order": "updated_at.desc",
         })
@@ -640,6 +650,7 @@ class SupabaseStore:
             "chapter": payload.chapter or None,
             "description": payload.description or None,
             "question_count": len(payload.questions),
+            "default_time_limit": payload.default_time_limit,
             "questions": [q.model_dump() for q in payload.questions],
             "created_by": lecturer["id"],
             "updated_by": lecturer["id"],
@@ -672,6 +683,7 @@ class SupabaseStore:
             "chapter": payload.chapter or None,
             "description": payload.description or None,
             "question_count": len(payload.questions),
+            "default_time_limit": payload.default_time_limit,
             "questions": [q.model_dump() for q in payload.questions],
             "updated_by": lecturer["id"],
             "owner_name": existing.get("owner_name") or lecturer.get("name") or lecturer.get("email") or "Lecturer",
@@ -686,7 +698,7 @@ class SupabaseStore:
 
     async def get_draft(self, subject_code: str, lecturer_id: str) -> dict[str, Any] | None:
         rows = await self._request("GET", self.drafts_base, params={
-            "select": "id,lecturer_id,subject_code,title,chapter,description,questions,question_count,editing_test_id,updated_at",
+            "select": "id,lecturer_id,subject_code,title,chapter,description,questions,question_count,default_time_limit,editing_test_id,updated_at",
             "lecturer_id": f"eq.{lecturer_id}",
             "subject_code": f"eq.{subject_code}",
             "limit": "1",
@@ -702,6 +714,7 @@ class SupabaseStore:
             "chapter": payload.chapter or None,
             "description": payload.description or None,
             "question_count": len(payload.questions),
+            "default_time_limit": payload.default_time_limit,
             "questions": [q.model_dump() for q in payload.questions],
             "editing_test_id": payload.editingTestId,
             "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
@@ -948,6 +961,8 @@ class HybridTestRepository:
             "chapter": row.get("chapter") or "",
             "description": row.get("description") or "",
             "questionCount": row.get("question_count") or len(row.get("questions") or []),
+            "defaultTimeLimit": coerce_time_limit(row.get("default_time_limit")) or TIME_PER_Q,
+            "estimatedSeconds": estimate_test_seconds(row),
             "source": source,
             "created_at": row.get("created_at"),
             "updated_at": row.get("updated_at"),
@@ -1219,6 +1234,7 @@ class HybridTestRepository:
                 "chapter": payload.chapter,
                 "description": payload.description,
                 "question_count": len(payload.questions),
+                "default_time_limit": payload.default_time_limit,
                 "questions": [q.model_dump() for q in payload.questions],
                 "created_at": datetime.now(UTC).isoformat(),
                 "updated_at": datetime.now(UTC).isoformat(),
@@ -1253,6 +1269,7 @@ class HybridTestRepository:
                 "chapter": payload.chapter,
                 "description": payload.description,
                 "question_count": len(payload.questions),
+                "default_time_limit": payload.default_time_limit,
                 "questions": [q.model_dump() for q in payload.questions],
                 "updated_at": datetime.now(UTC).isoformat(),
             })
@@ -1338,6 +1355,7 @@ class HybridTestRepository:
                 "chapter": payload.chapter,
                 "description": payload.description,
                 "question_count": len(payload.questions),
+                "default_time_limit": payload.default_time_limit,
                 "questions": [q.model_dump() for q in payload.questions],
                 "editing_test_id": payload.editingTestId,
                 "updated_at": datetime.now(UTC).isoformat(),
@@ -1390,6 +1408,35 @@ repo = HybridTestRepository(SUBJECTS)
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-room live game state
 # ──────────────────────────────────────────────────────────────────────────────
+def coerce_time_limit(value: Any) -> int | None:
+    """A usable limit within bounds, or None to fall through to the next level."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    if MIN_TIME_LIMIT <= seconds <= MAX_TIME_LIMIT:
+        return seconds
+    return None
+
+
+def estimate_test_seconds(row: dict[str, Any]) -> int:
+    """Rough wall-clock length: each question's limit plus the ready and reveal pauses."""
+    default_limit = coerce_time_limit(row.get("default_time_limit")) or TIME_PER_Q
+    questions = row.get("questions") or []
+    if not questions:
+        count = int(row.get("question_count") or 0)
+        return int(count * (default_limit + GET_READY_SECONDS + REVEAL_SECONDS))
+    total = 0.0
+    for question in questions:
+        limit = default_limit
+        if isinstance(question, dict):
+            limit = coerce_time_limit(question.get("time_limit")) or default_limit
+        total += limit + GET_READY_SECONDS + REVEAL_SECONDS
+    return int(total)
+
+
 MAX_PLAYERS_PER_ROOM = int(os.environ.get("MAX_PLAYERS_PER_ROOM", "300"))
 MAX_WS_MESSAGE_BYTES = int(os.environ.get("MAX_WS_MESSAGE_BYTES", str(64 * 1024)))
 
@@ -1418,6 +1465,7 @@ class GameRoom:
         self.current_token = ""
         self.game_code = ""
         self.game_code_enabled = False
+        self.default_time_limit = TIME_PER_Q
         self.reset_runtime_state(clear_players=True)
 
     def set_active_test(self, test_data: dict[str, Any] | None) -> None:
@@ -1426,6 +1474,25 @@ class GameRoom:
         self.active_test_chapter = test_data.get("chapter", "") if test_data else ""
         self.questions = list(test_data.get("questions", [])) if test_data else []
         self.total_q = len(self.questions)
+        self.default_time_limit = coerce_time_limit(
+            test_data.get("default_time_limit") if test_data else None
+        ) or TIME_PER_Q
+
+    def time_limit_for(self, index: int | None = None) -> int:
+        """Resolve the limit: question level → test level → TIME_PER_Q.
+
+        Tests saved before this feature have neither, so they keep running at
+        exactly 30 seconds with no migration.
+        """
+        if index is None:
+            index = self.current_q
+        if 0 <= index < len(self.questions):
+            question = self.questions[index]
+            if isinstance(question, dict):
+                per_question = coerce_time_limit(question.get("time_limit"))
+                if per_question:
+                    return per_question
+        return coerce_time_limit(getattr(self, "default_time_limit", None)) or TIME_PER_Q
 
     def reset_runtime_state(self, *, clear_players: bool) -> None:
         self.phase = "lobby"
@@ -1441,6 +1508,7 @@ class GameRoom:
         self.host_visitor = None
         self.answers_this_round = {}
         self.question_timer_task = None
+        self.question_time_limit = TIME_PER_Q
         self.start_task: asyncio.Task | None = None
         self.paused = False
         self._pending_room_update: asyncio.Task | None = None
@@ -1932,6 +2000,7 @@ async def get_test_detail(subject_code: str, test_id: str, request: Request):
             "chapter": row.get("chapter") or "",
             "description": row.get("description") or "",
             "questions": row.get("questions") or [],
+            "defaultTimeLimit": coerce_time_limit(row.get("default_time_limit")) or TIME_PER_Q,
             "questionCount": row.get("question_count") or len(row.get("questions") or []),
             "source": row.get("source", "supabase"),
             "ownerName": row.get("owner_name") or "System",
@@ -2398,6 +2467,11 @@ def get_active_test_meta(room: GameRoom) -> dict[str, Any] | None:
         "title": room.active_test_title,
         "chapter": room.active_test_chapter,
         "questionCount": room.total_q,
+        "defaultTimeLimit": room.default_time_limit,
+        "estimatedSeconds": estimate_test_seconds({
+            "default_time_limit": room.default_time_limit,
+            "questions": room.questions,
+        }),
     }
 
 
@@ -2437,13 +2511,14 @@ def build_joined_payload(room: GameRoom, visitor_id: str) -> dict[str, Any]:
     }
     if room.phase == "question":
         q = room.questions[room.current_q]
-        remaining = max(0, TIME_PER_Q - room.question_elapsed)
+        limit = room.time_limit_for()
+        remaining = max(0, limit - room.question_elapsed)
         joined_payload["currentQuestion"] = {
             "question": q["q"],
             "options": q["options"],
             "qNum": room.current_q + 1,
             "totalQ": room.total_q,
-            "timeLimit": TIME_PER_Q,
+            "timeLimit": limit,
             "remaining": round(remaining, 2)
         }
         joined_payload["alreadyAnswered"] = visitor_id in room.answers_this_round
@@ -2825,6 +2900,25 @@ async def websocket_endpoint(websocket: WebSocket):
                 if role == "host" and room is not None:
                     await advance_to_next(room, from_question=room.current_q)
 
+            elif action == "extend_time":
+                # Give the room longer on the question currently running. The
+                # timer counts against room.question_time_limit, so raising it
+                # extends the live question.
+                if role != "host" or room is None or room.phase != "question":
+                    continue
+                extra = coerce_time_limit(msg.get("seconds")) or 15
+                extra = max(5, min(60, extra))
+                room.question_time_limit = min(MAX_TIME_LIMIT, room.question_time_limit + extra)
+                remaining = max(0.0, room.question_time_limit - room.question_elapsed)
+                payload = {
+                    "type": "time_extended",
+                    "addedSeconds": extra,
+                    "timeLimit": room.question_time_limit,
+                    "remaining": round(remaining, 2),
+                }
+                await send_to_host(room, payload)
+                await broadcast_to_players(room, payload, participant_only=True)
+
             elif action == "host_pause":
                 if role != "host" or room is None:
                     continue
@@ -3027,7 +3121,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 is_correct = choice == q["correct"]
                 points = 0
                 if is_correct:
-                    time_fraction = min(answer_time / TIME_PER_Q, 1.0)
+                    # Against the resolved limit, so a 90 second question still awards
+                    # full marks for a fast answer.
+                    time_fraction = min(answer_time / room.time_limit_for(), 1.0)
                     points = round(MAX_POINTS - (MAX_POINTS - MIN_POINTS) * time_fraction)
                     room.players[visitor_id]["streak"] += 1
                     if room.players[visitor_id]["streak"] >= 3:
@@ -3126,14 +3222,16 @@ async def send_question(room: GameRoom) -> None:
     server_ts = time.time()
     room.question_start_time = server_ts
     room.question_elapsed = 0.0
+    room.question_time_limit = room.time_limit_for(q_index)
     room.answers_this_round = {}
+    limit = room.question_time_limit
     await broadcast_to_players(room, {
         "type": "question",
         "qNum": room.current_q + 1,
         "totalQ": room.total_q,
         "question": q["q"],
         "options": q["options"],
-        "timeLimit": TIME_PER_Q,
+        "timeLimit": limit,
         "serverTimestamp": server_ts
     }, participant_only=True)
     await send_to_host(room, {
@@ -3143,7 +3241,7 @@ async def send_question(room: GameRoom) -> None:
         "question": q["q"],
         "options": q["options"],
         "correctAnswer": q["correct"],
-        "timeLimit": TIME_PER_Q,
+        "timeLimit": limit,
         "serverTimestamp": server_ts
     })
     await sync_answer_count(room)
@@ -3151,7 +3249,7 @@ async def send_question(room: GameRoom) -> None:
     async def _timer():
         # Count elapsed time in 0.5s ticks, freezing while room.paused is True
         elapsed = 0.0
-        while elapsed < TIME_PER_Q:
+        while elapsed < room.question_time_limit:
             await asyncio.sleep(0.5)
             if room.phase != "question" or room.current_q != q_index:
                 return  # Question already advanced (e.g. all answered early)
@@ -3197,7 +3295,8 @@ async def auto_reveal(room: GameRoom) -> None:
         "correctAnswer": q["correct"],
         "explanation": q["explanation"],
         "leaderboard": lb,
-        "isLast": room.current_q >= room.total_q - 1
+        "isLast": room.current_q >= room.total_q - 1,
+        "revealSeconds": REVEAL_SECONDS
     })
     waited = 0.0
     tick = min(0.5, max(0.05, REVEAL_SECONDS / 4))
