@@ -76,6 +76,13 @@ limiter = Limiter(key_func=get_remote_address)
 # break the very feature Phase 2 fixed, so this is deliberately generous.
 DRAFT_RATE_LIMIT = os.environ.get("DRAFT_RATE_LIMIT", "120/minute")
 
+# Stored game results. The automatic spreadsheet download at the end of a game
+# stays the authoritative record; these rows exist so a Render redeploy does not
+# destroy results that were never downloaded. Off with one variable if the free
+# plan's 500 MB ever feels tight.
+PERSIST_RESULTS = os.environ.get("PERSIST_RESULTS", "true").strip().lower() not in {"0", "false", "no", "off"}
+RESULTS_RETENTION = max(1, int(os.environ.get("RESULTS_RETENTION", "20")))
+
 
 class SupabaseUnavailable(RuntimeError):
     pass
@@ -479,6 +486,7 @@ class SupabaseStore:
         self.lecturers_base = f"{self.base_url}/rest/v1/quiz_lecturers"
         self.drafts_base = f"{self.base_url}/rest/v1/quiz_test_drafts"
         self.subjects_base = f"{self.base_url}/rest/v1/quiz_subjects"
+        self.results_base = f"{self.base_url}/rest/v1/quiz_game_results"
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -696,6 +704,46 @@ class SupabaseStore:
         row["can_edit"] = True
         return row
 
+    async def list_game_results(self, subject_code: str, limit: int = 50) -> list[dict[str, Any]]:
+        return await self._request("GET", self.results_base, params={
+            "select": "id,subject_code,test_id,test_title,session_name,played_at,player_count,question_count",
+            "subject_code": f"eq.{subject_code}",
+            "order": "played_at.desc",
+            "limit": str(limit),
+        })
+
+    async def get_game_result(self, result_id: str) -> dict[str, Any] | None:
+        rows = await self._request("GET", self.results_base, params={
+            "select": "*",
+            "id": f"eq.{result_id}",
+            "limit": "1",
+        })
+        return rows[0] if rows else None
+
+    async def insert_game_result(self, row: dict[str, Any]) -> dict[str, Any]:
+        rows = await self._request("POST", self.results_base, body=row, prefer="return=representation")
+        if not rows:
+            raise RuntimeError("Supabase did not return the stored result.")
+        return rows[0]
+
+    async def prune_game_results(self, subject_code: str, keep: int) -> int:
+        """Delete everything older than the `keep` most recent for this subject."""
+        rows = await self._request("GET", self.results_base, params={
+            "select": "id,played_at",
+            "subject_code": f"eq.{subject_code}",
+            "order": "played_at.desc",
+            "offset": str(keep),
+            "limit": "200",
+        })
+        removed = 0
+        for row in rows or []:
+            try:
+                await self._request("DELETE", self.results_base, params={"id": f"eq.{row['id']}"})
+                removed += 1
+            except Exception:
+                break
+        return removed
+
     async def get_draft(self, subject_code: str, lecturer_id: str) -> dict[str, Any] | None:
         rows = await self._request("GET", self.drafts_base, params={
             "select": "id,lecturer_id,subject_code,title,chapter,description,questions,question_count,default_time_limit,editing_test_id,updated_at",
@@ -744,6 +792,8 @@ class HybridTestRepository:
         self.builtin_tests: dict[str, dict[str, dict[str, Any]]] = {}
         self.local_custom_tests: dict[str, dict[str, dict[str, Any]]] = {}
         self.local_drafts: dict[tuple[str, str], dict[str, Any]] = {}
+        self.local_results: dict[str, list[dict[str, Any]]] = {}
+        self.results_error: str | None = None
         self.local_lecturers: dict[str, dict[str, Any]] = {}
         self.local_subjects: dict[str, dict[str, Any]] = {}
         self.local_store_path = LOCAL_STORE_PATH
@@ -854,6 +904,11 @@ class HybridTestRepository:
         lecturers = data.get("local_lecturers", {})
         if isinstance(lecturers, dict):
             self.local_lecturers = lecturers
+        results = data.get("local_results", {})
+        if isinstance(results, dict):
+            for code, rows in results.items():
+                if isinstance(rows, list):
+                    self.local_results[code] = [r for r in rows if isinstance(r, dict)][:RESULTS_RETENTION]
 
     def _persist_local_store(self) -> None:
         if not self.local_store_enabled:
@@ -867,6 +922,7 @@ class HybridTestRepository:
                 for (lecturer_id, subject_code), row in self.local_drafts.items()
             },
             "local_lecturers": self.local_lecturers,
+            "local_results": self.local_results,
         }
         tmp_path = self.local_store_path.with_suffix(".tmp")
         try:
@@ -946,7 +1002,32 @@ class HybridTestRepository:
             "supabaseConfigured": self.supabase_configured,
             "note": note,
             "supabaseError": self.supabase_error,
+            "asleep": self.supabase_looks_asleep(),
+            "results": self.results_storage_usage(),
         }
+
+    def supabase_looks_asleep(self) -> bool:
+        """Detect a paused Supabase free project.
+
+        Free projects are paused after 7 days of inactivity — which lands in the
+        middle of a semester break — and then return connection failures rather
+        than anything explanatory. Better to say "the database is asleep, resume
+        it in your dashboard" than to show a generic error.
+        """
+        if not self.supabase_configured:
+            return False
+        blob = f"{self.supabase_error or ''} {self.results_error or ''} {self.draft_error or ''}".lower()
+        if not blob.strip():
+            return False
+        return any(
+            marker in blob
+            for marker in (
+                "getaddrinfo", "name or service not known", "nodename nor servname",
+                "connection refused", "connect call failed", "timed out", "timeout",
+                "connecterror", "temporary failure in name resolution",
+                "project is paused", "service unavailable", "502", "503",
+            )
+        )
 
     def _summary(self, row: dict[str, Any], lecturer_id: str | None = None) -> dict[str, Any]:
         created_by = row.get("created_by")
@@ -1310,6 +1391,123 @@ class HybridTestRepository:
 
         return await self._call_remote(_remote_delete() if self.remote else None, _local_delete)
 
+    # ── Stored game results ──────────────────────────────────────────────────
+    # Deliberately lightweight. The automatic spreadsheet download at the end of
+    # a game stays the authoritative record; this exists so a Render redeploy
+    # does not destroy results that were never downloaded. Question text is NOT
+    # duplicated — the test id is referenced instead.
+
+    def _result_row(self, stats: dict[str, Any], lecturer_id: str | None) -> dict[str, Any]:
+        players = []
+        for vid, player in (stats.get("players") or {}).items():
+            players.append({
+                "id": vid,
+                "name": player.get("name", ""),
+                "student_number": player.get("student_number", ""),
+                "score": player.get("score", 0),
+                # Only what is needed to rebuild the spreadsheet against the test.
+                "answers": [
+                    {
+                        "q": a.get("q"),
+                        "choice": a.get("choice", -1),
+                        "correct": bool(a.get("correct")),
+                        "points": a.get("points", 0),
+                        "time": round(float(a.get("time") or 0), 2),
+                    }
+                    for a in (player.get("answers") or [])
+                ],
+            })
+        return {
+            "subject_code": stats.get("subject_code"),
+            "test_id": stats.get("test_id"),
+            "test_title": stats.get("test_title") or "",
+            "session_name": stats.get("session_name") or "",
+            "played_at": stats.get("timestamp") or datetime.now(UTC).isoformat(),
+            "player_count": len(players),
+            "question_count": len(stats.get("questions") or []),
+            "players": players,
+            "created_by": lecturer_id,
+        }
+
+    async def store_game_result(self, stats: dict[str, Any], lecturer_id: str | None = None) -> dict[str, Any] | None:
+        if not PERSIST_RESULTS or not stats or not stats.get("players"):
+            return None
+        row = self._result_row(stats, lecturer_id)
+        subject_code = row["subject_code"]
+
+        def _local_store():
+            row_local = dict(row, id=f"result:{uuid.uuid4()}")
+            bucket = self.local_results.setdefault(subject_code, [])
+            bucket.append(row_local)
+            bucket.sort(key=lambda item: str(item.get("played_at") or ""), reverse=True)
+            del bucket[RESULTS_RETENTION:]          # prune after each insert
+            self._persist_local_store()
+            return row_local
+
+        if self.remote is not None:
+            try:
+                stored = await self.remote.insert_game_result(row)
+                try:
+                    await self.remote.prune_game_results(subject_code, RESULTS_RETENTION)
+                except Exception as exc:
+                    print(f"[results] prune failed for {subject_code}: {exc}")
+                return stored
+            except Exception as exc:
+                # Never let this break the end of a game — the lecturer's
+                # automatic download is the record that matters.
+                self.results_error = str(exc)
+                print(f"[results] Supabase store failed for {subject_code}: {exc}")
+        try:
+            return _local_store()
+        except Exception as exc:
+            self.results_error = str(exc)
+            return None
+
+    async def list_game_results(self, subject_code: str) -> list[dict[str, Any]]:
+        remote_rows = []
+        if self.remote is not None:
+            try:
+                remote_rows = await self.remote.list_game_results(subject_code, RESULTS_RETENTION)
+            except Exception as exc:
+                self.results_error = str(exc)
+        local_rows = [
+            {k: v for k, v in row.items() if k != "players"}
+            for row in self.local_results.get(subject_code, [])
+        ]
+        combined = list(remote_rows or []) + local_rows
+        combined.sort(key=lambda item: str(item.get("played_at") or ""), reverse=True)
+        return combined[:RESULTS_RETENTION]
+
+    async def get_game_result(self, subject_code: str, result_id: str) -> dict[str, Any] | None:
+        for row in self.local_results.get(subject_code, []):
+            if row.get("id") == result_id:
+                return row
+        if self.remote is not None:
+            try:
+                return await self.remote.get_game_result(result_id)
+            except Exception as exc:
+                self.results_error = str(exc)
+        return None
+
+    def results_storage_usage(self, subject_code: str | None = None) -> dict[str, Any]:
+        """Roughly how much space stored results occupy, so the cost is visible."""
+        buckets = (
+            [self.local_results.get(subject_code, [])] if subject_code
+            else list(self.local_results.values())
+        )
+        sessions = sum(len(bucket) for bucket in buckets)
+        approx_bytes = sum(
+            len(json.dumps(row, ensure_ascii=False).encode("utf-8"))
+            for bucket in buckets for row in bucket
+        )
+        return {
+            "enabled": PERSIST_RESULTS,
+            "retention": RESULTS_RETENTION,
+            "sessions": sessions,
+            "approxBytes": approx_bytes,
+            "approxKb": round(approx_bytes / 1024, 1),
+        }
+
     def _local_draft_backend(self) -> str:
         return "local-file" if self.local_store_enabled else "memory"
 
@@ -1506,6 +1704,7 @@ class GameRoom:
             self.current_token = ""
         self.host_ws = None
         self.host_visitor = None
+        self.host_lecturer_id: str | None = None
         self.answers_this_round = {}
         self.question_timer_task = None
         self.question_time_limit = TIME_PER_Q
@@ -1771,6 +1970,7 @@ def public_storage_status(status: dict[str, Any]) -> dict[str, Any]:
         "supabaseConfigured": status.get("supabaseConfigured"),
         "note": status.get("note"),
         "healthy": not status.get("supabaseError"),
+        "asleep": status.get("asleep", False),
     }
 
 
@@ -2239,6 +2439,40 @@ async def import_template(request: Request):
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": 'attachment; filename="quiz_question_template.docx"'},
     )
+
+
+@app.get("/api/results/{subject_code}")
+async def list_stored_results(subject_code: str, request: Request):
+    """Stored sessions for a subject, plus what they cost in storage.
+
+    Personal data (names, student numbers, answers) is deliberately excluded
+    from this listing; it is only in the individual result.
+    """
+    await require_lecturer(request)
+    try:
+        subject_code = safe_subject_code(subject_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if subject_code not in SUBJECTS:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    results = await repo.list_game_results(subject_code)
+    return {
+        "results": results,
+        "storage": repo.results_storage_usage(subject_code),
+    }
+
+
+@app.get("/api/results/{subject_code}/{result_id}")
+async def get_stored_result(subject_code: str, result_id: str, request: Request):
+    await require_lecturer(request)
+    try:
+        subject_code = safe_subject_code(subject_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    row = await repo.get_game_result(subject_code, result_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="No stored result with that id.")
+    return row
 
 
 @app.get("/api/export/tests")
@@ -2783,6 +3017,52 @@ async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
     await push_room_update(room)
 
 
+def build_answer_distribution(room: GameRoom) -> list[int]:
+    """How many students picked each option this round.
+
+    The server already holds every choice in answers_this_round, so this is
+    nearly free — and it is the most useful teaching signal in a live quiz.
+    """
+    question = room.questions[room.current_q] if 0 <= room.current_q < len(room.questions) else None
+    option_count = len(question.get("options", [])) if isinstance(question, dict) else 4
+    counts = [0] * option_count
+    for vid, answer in room.answers_this_round.items():
+        if not is_participating_player(room, room.players.get(vid)):
+            continue
+        choice = answer.get("choice", -1)
+        if isinstance(choice, int) and 0 <= choice < option_count:
+            counts[choice] += 1
+    return counts
+
+
+def build_student_review(room: GameRoom) -> dict[str, list[dict[str, Any]]]:
+    """Per-student list of what they got wrong, with the correct answer."""
+    review: dict[str, list[dict[str, Any]]] = {}
+    for vid, player in room.players.items():
+        if not is_participating_player(room, player):
+            continue
+        entries = []
+        for answer in player.get("answers") or []:
+            index = answer.get("q")
+            if not isinstance(index, int) or not 0 <= index < len(room.questions):
+                continue
+            question = room.questions[index]
+            choice = answer.get("choice", -1)
+            options = question.get("options", [])
+            entries.append({
+                "qNum": index + 1,
+                "question": question.get("q", ""),
+                "options": options,
+                "yourChoice": choice if isinstance(choice, int) else -1,
+                "correct": question.get("correct", 0),
+                "wasCorrect": bool(answer.get("correct")),
+                "points": answer.get("points", 0),
+                "explanation": question.get("explanation", ""),
+            })
+        review[vid] = entries
+    return review
+
+
 async def force_end_game(room: GameRoom) -> None:
     lb = get_leaderboard(room, participant_only=True)
     participant_ids = {
@@ -2798,9 +3078,30 @@ async def force_end_game(room: GameRoom) -> None:
     await cancel_question_timer(room)
     room.phase = "final"
     room.archive_stats()
+    # Store a lightweight copy so a redeploy cannot destroy results that were
+    # never downloaded. Non-fatal by design: the automatic download is the
+    # record that matters, and this must never break the end of a game.
+    if PERSIST_RESULTS and room.last_game_stats:
+        try:
+            await repo.store_game_result(room.last_game_stats, room.host_lecturer_id)
+        except Exception as exc:
+            print(f"[results] could not store results for {room.subject_code}: {exc}")
+    # Per-question answer distribution, so students can see how the class did.
+    review = build_student_review(room)
     await broadcast_to_selected_players(room, {"type": "final", "leaderboard": lb}, participant_ids)
     await broadcast_to_selected_players(room, {"type": "game_ended"}, non_participant_ids)
     await send_to_host(room, {"type": "final", "leaderboard": lb, "hasStats": True})
+    # Each student gets only their own answers, alongside the correct answer and
+    # the explanation.
+    for vid in participant_ids:
+        player = room.players.get(vid)
+        ws = player.get("ws") if player else None
+        if ws is None:
+            continue
+        try:
+            await ws.send_text(json.dumps({"type": "review", "questions": review.get(vid, [])}))
+        except Exception:
+            pass
     room.players = {}
 
 
@@ -2862,6 +3163,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     room.current_token = ""
                 room.host_ws = websocket
                 room.host_visitor = visitor_id
+                room.host_lecturer_id = lecturer.get("id")
 
                 if room.phase == "final" and requested_new_test:
                     await return_room_to_lobby(room, keep_players=True)
@@ -3296,7 +3598,11 @@ async def auto_reveal(room: GameRoom) -> None:
         "explanation": q["explanation"],
         "leaderboard": lb,
         "isLast": room.current_q >= room.total_q - 1,
-        "revealSeconds": REVEAL_SECONDS
+        "revealSeconds": REVEAL_SECONDS,
+        "options": q.get("options", []),
+        "question": q.get("q", ""),
+        "distribution": build_answer_distribution(room),
+        "answered": len(room.answers_this_round),
     })
     waited = 0.0
     tick = min(0.5, max(0.05, REVEAL_SECONDS / 4))

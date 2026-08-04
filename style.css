@@ -2261,6 +2261,133 @@ body::before {
   display: none;
 }
 
+/* ── Stored results, answer distribution and post-game review ────────────── */
+
+.storage-asleep {
+  margin: var(--space-2, 0.5rem) 0 0;
+  padding: var(--space-3);
+  border-radius: var(--radius-md, 10px);
+  border: 1px solid var(--accent-orange);
+  background: rgba(255, 152, 0, 0.1);
+  color: var(--accent-orange);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.storage-asleep[hidden],
+.results-storage-note[hidden] {
+  display: none;
+}
+
+.results-storage-note {
+  display: block;
+  margin-top: var(--space-2, 0.5rem);
+}
+
+.answer-distribution {
+  margin-top: var(--space-3);
+}
+
+.answer-distribution[hidden] {
+  display: none;
+}
+
+.dist-row {
+  display: grid;
+  grid-template-columns: 1.6rem minmax(60px, 1fr) 2fr auto;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.28rem 0;
+  font-size: var(--text-sm);
+}
+
+.dist-row.is-correct {
+  font-weight: 700;
+}
+
+.dist-shape {
+  text-align: center;
+}
+
+.dist-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dist-bar-wrap {
+  height: 0.75rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.dist-bar {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: currentColor;
+  transition: width 0.4s ease;
+}
+
+.dist-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-muted);
+}
+
+.review-summary {
+  text-align: center;
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-3);
+}
+
+.review-list {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.review-item {
+  padding: var(--space-3);
+  margin-bottom: var(--space-3);
+  border-radius: var(--radius-md, 10px);
+  border-left: 4px solid var(--accent-green);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.review-item.is-wrong {
+  border-left-color: var(--accent-red);
+}
+
+.review-question {
+  margin: 0 0 var(--space-2, 0.5rem);
+  overflow-wrap: anywhere;
+}
+
+.review-your,
+.review-correct,
+.review-explanation {
+  margin: 0.2rem 0;
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.review-your.correct {
+  color: var(--accent-green);
+}
+
+.review-your.wrong {
+  color: var(--accent-red);
+}
+
+.review-correct {
+  color: var(--accent-green);
+  font-weight: 600;
+}
+
+.review-explanation {
+  color: var(--color-text-muted);
+}
+
 /* ── Question timing ─────────────────────────────────────────────────────── */
 
 .timing-row {

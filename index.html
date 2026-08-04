@@ -184,6 +184,17 @@
       <h2 class="final-title" id="final-title">Game Over</h2>
       <div class="final-podium" id="final-podium"></div>
       <div class="final-full-list" id="final-full-list"></div>
+      <button id="btn-review-answers" class="btn btn-secondary" type="button" hidden>Review my answers</button>
+    </div>
+  </div>
+
+  <!-- PLAYER: Post-game review -->
+  <div id="screen-review" class="screen">
+    <div class="leaderboard-container">
+      <h2 class="leaderboard-title">Your answers</h2>
+      <p class="review-summary" id="review-summary"></p>
+      <div class="review-list" id="review-list"></div>
+      <button id="btn-review-back" class="btn btn-secondary" type="button">&larr; Back to results</button>
     </div>
   </div>
 
@@ -295,6 +306,8 @@
           <span id="host-storage-badge" class="storage-badge">Storage</span>
           <span id="host-storage-note" class="storage-note"></span>
         </div>
+        <p id="host-storage-asleep" class="storage-asleep" hidden></p>
+        <p id="host-results-storage" class="storage-note results-storage-note" hidden></p>
       </div>
       <div class="host-test-library-actions">
         <button id="btn-create-test" class="btn btn-primary">Create New Test</button>
@@ -461,6 +474,8 @@
           <h3 class="host-reveal-section-title">Correct Answer</h3>
           <div id="host-reveal-answer"></div>
           <p class="host-reveal-explanation" id="host-reveal-explanation"></p>
+          <h3 class="host-reveal-section-title" id="host-distribution-title" hidden>How the class answered</h3>
+          <div class="answer-distribution" id="host-answer-distribution" hidden></div>
         </div>
         <div class="host-reveal-leaderboard-panel">
           <h3 class="host-reveal-section-title">Leaderboard</h3>

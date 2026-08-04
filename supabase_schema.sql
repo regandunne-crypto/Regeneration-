@@ -103,6 +103,42 @@ create unique index if not exists quiz_test_drafts_lecturer_subject_idx
 create index if not exists quiz_test_drafts_updated_idx
   on public.quiz_test_drafts(updated_at desc);
 
+-- Lightweight record of a finished session. Deliberately does NOT duplicate the
+-- question text: it references the test id instead. The automatic spreadsheet
+-- download at the end of a game remains the authoritative record; this is a
+-- convenience copy so a Render redeploy does not destroy results that were
+-- never downloaded. Pruned automatically — see RESULTS_RETENTION.
+create table if not exists public.quiz_game_results (
+  id uuid primary key default gen_random_uuid(),
+  subject_code text not null,
+  test_id text,
+  test_title text,
+  session_name text,
+  played_at timestamptz not null default now(),
+  player_count integer not null default 0,
+  question_count integer not null default 0,
+  players jsonb not null default '[]'::jsonb,
+  created_by uuid references public.quiz_lecturers(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+
+alter table public.quiz_game_results
+  add column if not exists subject_code text,
+  add column if not exists test_id text,
+  add column if not exists test_title text,
+  add column if not exists session_name text,
+  add column if not exists played_at timestamptz not null default now(),
+  add column if not exists player_count integer not null default 0,
+  add column if not exists question_count integer not null default 0,
+  add column if not exists players jsonb not null default '[]'::jsonb,
+  add column if not exists created_by uuid references public.quiz_lecturers(id) on delete set null,
+  add column if not exists created_at timestamptz not null default now();
+
+create index if not exists quiz_game_results_subject_idx
+  on public.quiz_game_results(subject_code, played_at desc);
+
+alter table public.quiz_game_results enable row level security;
+
 create table if not exists public.quiz_subjects (
   code text primary key,
   name text not null,

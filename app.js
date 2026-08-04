@@ -889,6 +889,17 @@ function handlePlayerMessage(msg) {
       }
       playerShowFinal(msg.leaderboard);
       break;
+    case 'review': {
+      // Arrives just after 'final'. Students can look back at what they got
+      // wrong, with the correct answer and the explanation.
+      lastReview = Array.isArray(msg.questions) ? msg.questions : [];
+      const reviewBtn = $('#btn-review-answers');
+      if (reviewBtn) {
+        reviewBtn.hidden = lastReview.length === 0;
+        reviewBtn.onclick = playerShowReview;
+      }
+      break;
+    }
     case 'reset':
       playerNeedsGameCode = false;
       if (typeof msg.playerCount === 'number') $('#lobby-p-count').textContent = msg.playerCount;
@@ -1099,6 +1110,11 @@ function playerShowLeaderboard(lb) {
 
 function playerShowFinal(lb) {
   showScreen('screen-final');
+  const reviewBtn = $('#btn-review-answers');
+  if (reviewBtn) {
+    reviewBtn.hidden = !(Array.isArray(lastReview) && lastReview.length);
+    reviewBtn.onclick = playerShowReview;
+  }
   const myRank = lb.findIndex((p) => p.id === myPlayerId) + 1;
   $('#final-title').textContent = myRank === 1 ? 'You Win! 🏆' : `Game Over — You placed #${myRank}`;
   renderPodium($('#final-podium'), lb);
@@ -1491,6 +1507,18 @@ async function showHostTestLibrary() {
   }
   $('#host-storage-note').textContent = storage.note || '';
 
+  // A paused Supabase free project returns connection failures with nothing
+  // explanatory. Say what it actually is.
+  const sleepEl = $('#host-storage-asleep');
+  if (sleepEl) {
+    sleepEl.hidden = !storage.asleep;
+    sleepEl.textContent = storage.asleep
+      ? 'The question database appears to be asleep. Supabase pauses free projects after 7 days of inactivity — open your Supabase dashboard and press Resume, then reload this page.'
+      : '';
+  }
+
+  renderResultsStorageLine();
+
   renderDraftResumeCard();   // fire and forget; renders when the draft arrives
 
   try {
@@ -1523,6 +1551,38 @@ async function showHostTestLibrary() {
     const backupClone = backupBtn.cloneNode(true);
     backupBtn.replaceWith(backupClone);
     backupClone.addEventListener('click', () => downloadTestsBackup(backupClone));
+  }
+}
+
+/**
+ * Show how many past sessions are stored and roughly what they cost, so the
+ * storage bill is visible rather than guessed at.
+ */
+async function renderResultsStorageLine() {
+  const el = $('#host-results-storage');
+  if (!el || !selectedSubject) return;
+  el.hidden = true;
+  try {
+    const data = await apiGet(`/api/results/${encodeURIComponent(selectedSubject.code)}`);
+    const storage = data.storage || {};
+    const count = (data.results || []).length;
+    if (!storage.enabled) {
+      el.textContent = 'Storing past sessions is switched off (PERSIST_RESULTS=false). Your end-of-game downloads are the only record.';
+      el.hidden = false;
+      return;
+    }
+    if (!count) {
+      el.textContent = `No past sessions stored yet for this subject. The most recent ${storage.retention} will be kept.`;
+      el.hidden = false;
+      return;
+    }
+    const size = storage.approxKb >= 1024
+      ? `${(storage.approxKb / 1024).toFixed(1)} MB`
+      : `${storage.approxKb} KB`;
+    el.textContent = `${count} past session${count === 1 ? '' : 's'} stored for this subject (about ${size}). The most recent ${storage.retention} are kept; older ones are deleted automatically.`;
+    el.hidden = false;
+  } catch (e) {
+    // Storage reporting is informational only — never block the library on it.
   }
 }
 
@@ -3113,6 +3173,7 @@ function hostShowReveal(msg) {
     </div>
   `;
   $('#host-reveal-explanation').textContent = msg.explanation;
+  renderAnswerDistribution(msg, correctIdx);
   renderLeaderboardList($('#host-reveal-leaderboard'), msg.leaderboard, null);
 
   let autoCountdown = Math.max(1, Math.round(msg.revealSeconds || 5));
@@ -3129,6 +3190,76 @@ function hostShowReveal(msg) {
       countdownEl.textContent = `Next question in ${autoCountdown}s...`;
     }
   }, 1000);
+}
+
+/**
+ * How many students picked each option. The single most useful teaching signal
+ * in a live quiz — it shows at a glance which distractor caught the class.
+ */
+function renderAnswerDistribution(msg, correctIdx) {
+  const container = $('#host-answer-distribution');
+  const title = $('#host-distribution-title');
+  if (!container) return;
+  const counts = Array.isArray(msg.distribution) ? msg.distribution : null;
+  const options = Array.isArray(msg.options) && msg.options.length ? msg.options : hostCurrentOptions;
+  if (!counts || !options || !options.length) {
+    container.hidden = true;
+    if (title) title.hidden = true;
+    return;
+  }
+  const total = counts.reduce((sum, n) => sum + n, 0);
+  container.innerHTML = options.map((opt, i) => {
+    const count = counts[i] || 0;
+    const pct = total ? Math.round((count / total) * 100) : 0;
+    const isCorrect = i === correctIdx;
+    return `
+      <div class="dist-row${isCorrect ? ' is-correct' : ''}">
+        <span class="dist-shape ${COLORS[i]}">${SHAPES[i] || ''}</span>
+        <span class="dist-label">${escapeHtml(opt)}</span>
+        <span class="dist-bar-wrap"><span class="dist-bar ${COLORS[i]}" style="width:${pct}%"></span></span>
+        <span class="dist-count">${count}${total ? ` (${pct}%)` : ''}</span>
+      </div>`;
+  }).join('') + (total === 0 ? '<p class="empty-msg">Nobody answered this question.</p>' : '');
+  container.hidden = false;
+  if (title) title.hidden = false;
+}
+
+let lastReview = null;
+
+function playerShowReview() {
+  if (!Array.isArray(lastReview) || !lastReview.length) return;
+  showScreen('screen-review');
+  const wrong = lastReview.filter((entry) => !entry.wasCorrect).length;
+  const summary = $('#review-summary');
+  if (summary) {
+    summary.textContent = wrong === 0
+      ? `You answered all ${lastReview.length} questions correctly.`
+      : `You got ${lastReview.length - wrong} of ${lastReview.length} right. Here is what to look at again.`;
+  }
+  const list = $('#review-list');
+  list.innerHTML = lastReview.map((entry) => {
+    const yours = entry.options[entry.yourChoice];
+    const right = entry.options[entry.correct];
+    const yourLine = entry.wasCorrect
+      ? `<p class="review-your correct">Your answer: ${escapeHtml(yours || '—')} ✓</p>`
+      : `<p class="review-your wrong">Your answer: ${escapeHtml(yours || 'no answer')} ✗</p>`;
+    const rightLine = entry.wasCorrect
+      ? ''
+      : `<p class="review-correct">Correct answer: ${escapeHtml(right || '')}</p>`;
+    const explanation = entry.explanation
+      ? `<p class="review-explanation">${escapeHtml(entry.explanation)}</p>`
+      : '';
+    return `
+      <div class="review-item${entry.wasCorrect ? ' is-correct' : ' is-wrong'}">
+        <p class="review-question"><strong>Q${entry.qNum}.</strong> ${escapeHtml(entry.question)}</p>
+        ${yourLine}
+        ${rightLine}
+        ${explanation}
+      </div>`;
+  }).join('');
+
+  const back = $('#btn-review-back');
+  if (back) back.onclick = () => showScreen('screen-final');
 }
 
 function hostShowFinal(lb) {
