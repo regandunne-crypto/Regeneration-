@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+exclude = [".venv", "__pycache__", ".pytest_cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "DTZ"]
+ignore = [
+    "E501",   # long lines are pervasive in this codebase and not worth a mass reformat
+    "B008",   # FastAPI dependency defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

@@ -21,7 +21,7 @@ import string
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +51,12 @@ TIME_PER_Q = 30
 MAX_POINTS = 1000
 MIN_POINTS = 200
 REQUEST_TIMEOUT = 20
+
+# Pacing constants. Overridable by environment so the test suite can run a whole
+# game in well under a second instead of waiting out the real classroom timings.
+GET_READY_SECONDS = float(os.environ.get("GET_READY_SECONDS", "3"))
+REVEAL_SECONDS = float(os.environ.get("REVEAL_SECONDS", "5"))
+GAME_CODE_COUNTDOWN_SECONDS = float(os.environ.get("GAME_CODE_COUNTDOWN_SECONDS", "20"))
 REQUIRE_SUPABASE = os.environ.get("REQUIRE_SUPABASE", "").strip().lower() in {"1", "true", "yes", "on"}
 _local_store_env = os.environ.get("LOCAL_STORE_PATH", "").strip()
 LOCAL_STORE_PATH = Path(_local_store_env).expanduser() if _local_store_env else (Path(__file__).resolve().parent / "local_store.json")
@@ -101,7 +107,7 @@ def create_session_token(lecturer_id: str) -> str:
     expires = int(time.time()) + SESSION_MAX_AGE
     payload = f"{lecturer_id}.{expires}"
     signature = hmac.new(_session_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(f"{payload}.{signature.hex()}".encode("utf-8")).decode("utf-8")
+    return base64.urlsafe_b64encode(f"{payload}.{signature.hex()}".encode()).decode("utf-8")
 
 
 def parse_session_token(token: str | None) -> str | None:
@@ -484,7 +490,7 @@ class SupabaseStore:
             "questions": [q.model_dump() for q in payload.questions],
             "updated_by": lecturer["id"],
             "owner_name": existing.get("owner_name") or lecturer.get("name") or lecturer.get("email") or "Lecturer",
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
         }, prefer="return=representation")
         if not rows:
             raise RuntimeError("Supabase did not return the updated test.")
@@ -514,7 +520,7 @@ class SupabaseStore:
             "questions": [q.model_dump() for q in payload.questions],
             "editing_test_id": payload.editingTestId,
             "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
         }
         if existing:
             rows = await self._request("PATCH", self.drafts_base, params={
@@ -818,8 +824,8 @@ class HybridTestRepository:
                 "name": payload.name,
                 "email": payload.email,
                 "password_hash": password_hash,
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
             }
             self.local_lecturers[payload.email] = row
             self._persist_local_store()
@@ -881,7 +887,7 @@ class HybridTestRepository:
                 "code": code,
                 "name": name,
                 "created_by": lecturer.get("id"),
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
             }
             self.local_subjects[code] = row
             self._register_subject(code, name)
@@ -892,7 +898,7 @@ class HybridTestRepository:
                 return await self.remote.create_subject(code, name, lecturer["id"])
             except RuntimeError as exc:
                 if "duplicate" in str(exc).lower():
-                    raise ValueError("Subject code already exists.")
+                    raise ValueError("Subject code already exists.") from exc
                 raise
         row = await self._call_remote(_remote_create() if self.remote else None, _local_create)
         if row:
@@ -1001,8 +1007,8 @@ class HybridTestRepository:
                 "description": payload.description,
                 "question_count": len(payload.questions),
                 "questions": [q.model_dump() for q in payload.questions],
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
                 "source": "local-file" if self.local_store_enabled else "in-memory",
                 "created_by": lecturer["id"],
                 "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
@@ -1035,7 +1041,7 @@ class HybridTestRepository:
                 "description": payload.description,
                 "question_count": len(payload.questions),
                 "questions": [q.model_dump() for q in payload.questions],
-                "updated_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
             })
             self._persist_local_store()
             return row
@@ -1097,7 +1103,7 @@ class HybridTestRepository:
                 "question_count": len(payload.questions),
                 "questions": [q.model_dump() for q in payload.questions],
                 "editing_test_id": payload.editingTestId,
-                "updated_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
                 "owner_name": lecturer.get("name") or lecturer.get("email") or "Lecturer",
             }
             self.local_drafts[(lecturer["id"], subject_code)] = row
@@ -1181,7 +1187,7 @@ class GameRoom:
             "test_title": self.active_test_title,
             "test_chapter": self.active_test_chapter,
             "session_name": self.session_name,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now().astimezone().isoformat(),
             "questions": self.questions,
             "players": {}
         }
@@ -1370,6 +1376,24 @@ async def require_lecturer(request: Request) -> dict[str, Any]:
     return lecturer
 
 
+def validation_detail(exc: ValidationError) -> list[dict[str, Any]]:
+    """JSON-safe validation errors.
+
+    Pydantic's `errors()` puts the original exception object in `ctx`, which
+    FastAPI cannot serialise — the response blows up with a TypeError and the
+    lecturer sees a dead request instead of "Each question must have exactly 4
+    options." Keep only the fields the front end actually reads.
+    """
+    detail = []
+    for error in exc.errors():
+        detail.append({
+            "loc": [str(part) for part in error.get("loc", ())],
+            "msg": str(error.get("msg", "Invalid value")),
+            "type": str(error.get("type", "value_error")),
+        })
+    return detail
+
+
 async def current_lecturer_from_websocket(websocket: WebSocket) -> dict[str, Any] | None:
     lecturer_id = parse_session_token(websocket.cookies.get(SESSION_COOKIE_NAME))
     if not lecturer_id:
@@ -1403,13 +1427,13 @@ async def lecturer_signup(payload: dict[str, Any], request: Request):
         set_session_cookie(response, lecturer["id"], request)
         return response
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/lecturer/login")
@@ -1430,9 +1454,9 @@ async def lecturer_login(payload: dict[str, Any], request: Request):
     except HTTPException:
         raise
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/lecturer/logout")
@@ -1499,13 +1523,13 @@ async def create_subject(payload: dict[str, Any], request: Request):
     except HTTPException:
         raise
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.delete("/api/subjects/{code}")
@@ -1525,15 +1549,15 @@ async def delete_subject(code: str, request: Request):
         rooms.pop(normalized, None)
         return {"ok": True}
     except KeyError:
-        raise HTTPException(status_code=404, detail="Subject not found")
+        raise HTTPException(status_code=404, detail="Subject not found") from None
     except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/tests/{subject_code}")
@@ -1544,7 +1568,7 @@ async def get_tests(subject_code: str, request: Request):
     try:
         return await repo.list_tests(subject_code, lecturer.get("id"))
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/tests/{subject_code}/{test_id}")
@@ -1571,7 +1595,7 @@ async def get_test_detail(subject_code: str, test_id: str, request: Request):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/tests/{subject_code}")
@@ -1588,13 +1612,13 @@ async def create_test(subject_code: str, payload: dict[str, Any], request: Reque
             pass  # Draft clear is non-critical — never let it mask a successful test save
         return {"ok": True, "test": repo._summary(created, lecturer.get("id"))}
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
     except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.put("/api/tests/{subject_code}/{test_id}")
@@ -1611,15 +1635,15 @@ async def update_test(subject_code: str, test_id: str, payload: dict[str, Any], 
             pass  # Draft clear is non-critical — never let it mask a successful test update
         return {"ok": True, "test": repo._summary(updated, lecturer.get("id"))}
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
     except KeyError:
-        raise HTTPException(status_code=404, detail="Test not found")
+        raise HTTPException(status_code=404, detail="Test not found") from None
     except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.delete("/api/tests/{subject_code}/{test_id}")
@@ -1631,13 +1655,13 @@ async def delete_test(subject_code: str, test_id: str, request: Request):
         await repo.delete_test(subject_code, test_id, lecturer)
         return {"ok": True}
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except KeyError:
-        raise HTTPException(status_code=404, detail="Test not found")
+        raise HTTPException(status_code=404, detail="Test not found") from None
     except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/drafts/{subject_code}")
@@ -1663,9 +1687,9 @@ async def save_test_draft(subject_code: str, payload: dict[str, Any], request: R
         draft = await repo.save_draft(subject_code, lecturer, validated)
         return {"ok": True, "draft": draft}
     except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors())
+        raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
     except Exception:
         # Draft save failure is non-critical. Return a soft ok so autosave
         # errors never break the editor UI or cascade into test operations.
@@ -1690,13 +1714,13 @@ async def export_tests(request: Request):
     lecturer = await require_lecturer(request)
     try:
         tests = await repo.list_tests_by_creator(lecturer["id"])
-        stamp = datetime.utcnow().strftime("%Y%m%d")
+        stamp = datetime.now(UTC).strftime("%Y%m%d")
         filename = f"quiz_backup_{stamp}.json"
         payload = json.dumps(tests, ensure_ascii=False, indent=2)
         headers = {"Content-Disposition": f"attachment; filename={filename}"}
         return Response(content=payload, media_type="application/json", headers=headers)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/stats/{subject_code}")
@@ -1713,7 +1737,7 @@ def download_stats(subject_code: str):
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     except ImportError:
-        raise HTTPException(status_code=500, detail="openpyxl not installed")
+        raise HTTPException(status_code=500, detail="openpyxl not installed") from None
 
     wb = Workbook()
     ws1 = wb.active
@@ -2310,13 +2334,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     await send_to_host(room, {
                         "type": "game_code_display",
                         "code": room.game_code,
-                        "countdown": 20
+                        "countdown": GAME_CODE_COUNTDOWN_SECONDS
                     })
                     await broadcast_to_players(room, {
                         "type": "game_code_required",
-                        "countdown": 20
+                        "countdown": GAME_CODE_COUNTDOWN_SECONDS
                     })
-                    await asyncio.sleep(20)
+                    await asyncio.sleep(GAME_CODE_COUNTDOWN_SECONDS)
                 room.paused = False
                 import random
                 if msg.get("shuffle"):
@@ -2329,7 +2353,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     room.players[vid]["answers"] = []
                 await broadcast_to_players(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q}, participant_only=True)
                 await send_to_host(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q})
-                await asyncio.sleep(3)
+                await asyncio.sleep(GET_READY_SECONDS)
                 await send_question(room)
 
             elif action == "next_question":
@@ -2644,13 +2668,12 @@ async def auto_reveal(room: GameRoom) -> None:
         "isLast": room.current_q >= room.total_q - 1
     })
     waited = 0.0
-    while True:
-        await asyncio.sleep(0.5)
+    tick = min(0.5, max(0.05, REVEAL_SECONDS / 4))
+    while waited < REVEAL_SECONDS:
+        await asyncio.sleep(tick)
         if room.paused:
             continue
-        waited += 0.5
-        if waited >= 5.0:
-            break
+        waited += tick
     if room.phase == "reveal":
         await advance_to_next(room)
 
@@ -2663,7 +2686,7 @@ async def advance_to_next(room: GameRoom) -> None:
         room.phase = "get_ready"
         await broadcast_to_players(room, {"type": "get_ready", "qNum": room.current_q + 1, "totalQ": room.total_q}, participant_only=True)
         await send_to_host(room, {"type": "get_ready", "qNum": room.current_q + 1, "totalQ": room.total_q})
-        await asyncio.sleep(3)
+        await asyncio.sleep(GET_READY_SECONDS)
         await send_question(room)
 
 
