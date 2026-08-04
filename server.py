@@ -65,9 +65,44 @@ LOCAL_STORE_VERSION = 1
 
 limiter = Limiter(key_func=get_remote_address)
 
+# Draft autosave fires 1.5 s after typing stops, so a lecturer writing a long
+# quiz legitimately produces many writes a minute. A tight limit here would
+# break the very feature Phase 2 fixed, so this is deliberately generous.
+DRAFT_RATE_LIMIT = os.environ.get("DRAFT_RATE_LIMIT", "120/minute")
+
 
 class SupabaseUnavailable(RuntimeError):
     pass
+
+
+# ── PostgREST filter safety ──────────────────────────────────────────────────
+# Values go straight into filter strings such as f"eq.{test_id}". PostgREST
+# treats commas, dots and parentheses as filter syntax, so an unvalidated value
+# can change which rows a query matches. Validate before building any query.
+
+UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+LOCAL_ID_PATTERN = re.compile(r"^local:[0-9a-fA-F-]{36}$")
+
+
+def safe_test_id(test_id: str) -> str:
+    value = (test_id or "").strip()
+    if UUID_PATTERN.match(value) or LOCAL_ID_PATTERN.match(value):
+        return value
+    raise ValueError("Invalid test id.")
+
+
+def safe_subject_code(subject_code: str) -> str:
+    value = (subject_code or "").strip().upper()
+    if SUBJECT_CODE_PATTERN.match(value):
+        return value
+    raise ValueError("Invalid subject code.")
+
+
+def safe_lecturer_id(lecturer_id: str) -> str:
+    value = (lecturer_id or "").strip()
+    if UUID_PATTERN.match(value):
+        return value
+    raise ValueError("Invalid lecturer id.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -77,12 +112,88 @@ SESSION_COOKIE_NAME = "lecturer_session"
 SESSION_MAX_AGE = 60 * 60 * 24 * 14  # 14 days
 
 
+DEV_SESSION_SECRET = "engineering-quiz-dev-secret"
+
+
 def _session_secret() -> str:
     return (
         os.environ.get("APP_SESSION_SECRET", "").strip()
         or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-        or "engineering-quiz-dev-secret"
+        or DEV_SESSION_SECRET
     )
+
+
+def _check_session_secret_configured() -> None:
+    """Refuse to start in production with the built-in development secret.
+
+    Anyone who has read this source could otherwise forge a lecturer session
+    cookie. Locally (no SUPABASE_URL) the fallback is fine and keeps first-run
+    setup frictionless.
+
+    NOTE for the first deploy: set APP_SESSION_SECRET to the *current* value of
+    SUPABASE_SERVICE_ROLE_KEY. That is what existing sessions are already signed
+    with, so nobody gets signed out. Rotate it to a fresh random value later.
+    """
+    if not os.environ.get("SUPABASE_URL", "").strip():
+        return
+    if os.environ.get("APP_SESSION_SECRET", "").strip():
+        return
+    if os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip():
+        # Sessions are signed with the service role key. Works, but the key is
+        # meant to be rotatable without signing every lecturer out.
+        print(
+            "[startup] WARNING: APP_SESSION_SECRET is not set, so lecturer sessions are "
+            "signed with SUPABASE_SERVICE_ROLE_KEY. Set APP_SESSION_SECRET to the current "
+            "value of SUPABASE_SERVICE_ROLE_KEY now (nobody gets signed out), then rotate "
+            "it to a fresh random value at a convenient moment."
+        )
+        return
+    raise RuntimeError(
+        "APP_SESSION_SECRET must be set when SUPABASE_URL is configured. "
+        "Refusing to sign lecturer sessions with the built-in development secret."
+    )
+
+
+# ── Lecturer signup gating ───────────────────────────────────────────────────
+# If neither variable is set, signup stays open exactly as before. This matters:
+# the change must not lock anyone out of a running deployment before the owner
+# has configured it.
+
+def _allowed_email_domains() -> list[str]:
+    raw = os.environ.get("ALLOWED_EMAIL_DOMAINS", "").strip()
+    return [d.strip().lower().lstrip("@") for d in raw.split(",") if d.strip()]
+
+
+def _signup_invite_code() -> str:
+    return os.environ.get("SIGNUP_INVITE_CODE", "").strip()
+
+
+def check_signup_allowed(email: str, invite_code: str) -> None:
+    """Raise PermissionError with a message the lecturer can act on."""
+    domains = _allowed_email_domains()
+    required_code = _signup_invite_code()
+    if not domains and not required_code:
+        return                                  # open signup, as before
+
+    domain = (email or "").rsplit("@", 1)[-1].strip().lower()
+    domain_ok = bool(domains) and any(domain == d or domain.endswith("." + d) for d in domains)
+    code_ok = bool(required_code) and hmac.compare_digest((invite_code or "").strip(), required_code)
+
+    if domain_ok or code_ok:
+        return
+
+    if domains and required_code:
+        listed = ", ".join(domains)
+        raise PermissionError(
+            f"Accounts are limited to {listed} email addresses. Use your work email, "
+            "or enter the invite code your administrator gave you."
+        )
+    if domains:
+        listed = ", ".join(domains)
+        raise PermissionError(
+            f"Accounts are limited to {listed} email addresses. Please sign up with your work email."
+        )
+    raise PermissionError("An invite code is required to create a lecturer account.")
 
 
 def hash_password(password: str) -> str:
@@ -135,6 +246,40 @@ def parse_session_token(token: str | None) -> str | None:
         if int(expires_str) < int(time.time()):
             return None
         return lecturer_id
+    except Exception:
+        return None
+
+
+# ── Visitor identity ─────────────────────────────────────────────────────────
+# The visitor id used to come straight off a query parameter, so a student could
+# supply someone else's id and take over their session and score. The server now
+# issues the id inside a signed token and never trusts a bare id.
+
+VISITOR_TOKEN_MAX_AGE = 60 * 60 * 24 * 30      # 30 days
+
+
+def create_visitor_token(visitor_id: str | None = None) -> tuple[str, str]:
+    visitor_id = visitor_id or str(uuid.uuid4())
+    expires = int(time.time()) + VISITOR_TOKEN_MAX_AGE
+    payload = f"{visitor_id}.{expires}"
+    signature = hmac.new(_session_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    token = base64.urlsafe_b64encode(f"{payload}.{signature}".encode()).decode("utf-8")
+    return visitor_id, token
+
+
+def parse_visitor_token(token: str | None) -> str | None:
+    if not token:
+        return None
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode("utf-8")).decode("utf-8")
+        visitor_id, expires_str, signature = decoded.rsplit(".", 2)
+        payload = f"{visitor_id}.{expires_str}"
+        expected = hmac.new(_session_secret().encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        if int(expires_str) < int(time.time()):
+            return None
+        return visitor_id or None
     except Exception:
         return None
 
@@ -229,6 +374,7 @@ class LecturerSignupPayload(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     email: str = Field(min_length=5, max_length=240)
     password: str = Field(min_length=8, max_length=200)
+    inviteCode: str = Field(default="", max_length=200)
 
     @field_validator("name")
     @classmethod
@@ -333,7 +479,26 @@ class SupabaseStore:
                 detail = resp.text
             raise RuntimeError(f"Supabase request failed: {detail}")
 
+    # Characters PostgREST reads as filter syntax. A value containing these can
+    # change which rows a query matches, so no interpolated value may carry them.
+    _FILTER_METACHARS = set(',()"*')
+    _FILTER_OPERATORS = ("eq.", "ilike.", "like.", "neq.", "gt.", "gte.", "lt.", "lte.", "in.", "is.")
+
+    @classmethod
+    def _check_filter_params(cls, params: dict[str, Any] | None) -> None:
+        for key, value in (params or {}).items():
+            if key in {"select", "order", "limit", "offset"} or not isinstance(value, str):
+                continue
+            if not value.startswith(cls._FILTER_OPERATORS):
+                continue
+            operand = value.split(".", 1)[1]
+            if cls._FILTER_METACHARS & set(operand):
+                raise ValueError(f"Refusing to build a PostgREST filter from an unsafe value for {key!r}.")
+
     async def _request(self, method: str, url: str, *, params=None, body=None, prefer: str | None = None) -> list[dict[str, Any]]:
+        # Single choke point: every filter value passes through here, so this
+        # covers present and future call sites alike.
+        self._check_filter_params(params)
         headers = dict(self._client.headers)
         if prefer:
             headers["Prefer"] = prefer
@@ -1413,10 +1578,28 @@ async def lifespan(app: FastAPI):
             except Exception:
                 pass
 
+_check_session_secret_configured()
+
 app = FastAPI(lifespan=lifespan)
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*").strip()
-allow_origins = ["*"] if ALLOWED_ORIGINS == "*" else [origin.strip() for origin in ALLOWED_ORIGINS.split(",") if origin.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=allow_origins, allow_methods=["*"], allow_headers=["*"])
+
+# The app is served same-origin, so it needs no cross-origin access at all.
+# Defaulting to "*" meant any site could call the API from a visitor's browser.
+# "*" is now opt-in; set ALLOWED_ORIGINS explicitly if you ever need it.
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "").strip()
+if ALLOWED_ORIGINS == "*":
+    allow_origins = ["*"]
+elif ALLOWED_ORIGINS:
+    allow_origins = [origin.strip() for origin in ALLOWED_ORIGINS.split(",") if origin.strip()]
+else:
+    render_host = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+    allow_origins = [render_host] if render_host else []
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=bool(allow_origins) and allow_origins != ["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -1507,14 +1690,53 @@ async def current_lecturer_from_websocket(websocket: WebSocket) -> dict[str, Any
     return await repo.get_lecturer_by_id(lecturer_id)
 
 
+def public_storage_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Storage status without the raw Supabase error text.
+
+    The detail names tables, schema state and sometimes the project URL. Only
+    signed-in lecturers see it.
+    """
+    return {
+        "mode": status.get("mode"),
+        "supabaseConfigured": status.get("supabaseConfigured"),
+        "note": status.get("note"),
+        "healthy": not status.get("supabaseError"),
+    }
+
+
 @app.get("/api/health")
-def health():
-    return {"ok": True, "storage": repo.get_storage_status()}
+async def health(request: Request):
+    status = repo.get_storage_status()
+    lecturer = await current_lecturer_from_request(request)
+    return {"ok": True, "storage": status if lecturer else public_storage_status(status)}
 
 
 @app.get("/api/storage-status")
-def storage_status():
-    return repo.get_storage_status()
+async def storage_status(request: Request):
+    status = repo.get_storage_status()
+    lecturer = await current_lecturer_from_request(request)
+    return status if lecturer else public_storage_status(status)
+
+
+@app.post("/api/visitor-token")
+@limiter.limit("60/minute")
+async def issue_visitor_token(request: Request):
+    """Issue a signed student identity.
+
+    Students never choose their own id: the server mints it, signs it, and only
+    accepts it back inside the signature.
+    """
+    existing = parse_visitor_token((await _read_json_body(request)).get("token"))
+    visitor_id, token = create_visitor_token(existing)
+    return {"visitorId": visitor_id, "token": token}
+
+
+async def _read_json_body(request: Request) -> dict[str, Any]:
+    try:
+        body = await request.json()
+        return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
 
 
 @app.get("/api/lecturer/session")
@@ -1528,12 +1750,15 @@ async def lecturer_session(request: Request):
 async def lecturer_signup(payload: dict[str, Any], request: Request):
     try:
         validated = LecturerSignupPayload.model_validate(payload)
+        check_signup_allowed(validated.email, validated.inviteCode)
         lecturer = await repo.create_lecturer(validated)
         response = JSONResponse({"ok": True, "lecturer": public_lecturer_view(lecturer)})
         set_session_cookie(response, lecturer["id"], request)
         return response
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except SupabaseUnavailable as exc:
@@ -1689,6 +1914,10 @@ async def get_tests(subject_code: str, request: Request):
 async def get_test_detail(subject_code: str, test_id: str, request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
+    try:
+        test_id = safe_test_id(test_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     lecturer = await require_lecturer(request)
     try:
         row = await repo.get_test(subject_code, test_id, lecturer.get("id"))
@@ -1713,6 +1942,7 @@ async def get_test_detail(subject_code: str, test_id: str, request: Request):
 
 
 @app.post("/api/tests/{subject_code}")
+@limiter.limit("30/minute")
 async def create_test(subject_code: str, payload: dict[str, Any], request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
@@ -1736,9 +1966,14 @@ async def create_test(subject_code: str, payload: dict[str, Any], request: Reque
 
 
 @app.put("/api/tests/{subject_code}/{test_id}")
+@limiter.limit("60/minute")
 async def update_test(subject_code: str, test_id: str, payload: dict[str, Any], request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
+    try:
+        test_id = safe_test_id(test_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     lecturer = await require_lecturer(request)
     try:
         validated = TestPayload.model_validate(payload)
@@ -1764,6 +1999,10 @@ async def update_test(subject_code: str, test_id: str, payload: dict[str, Any], 
 async def delete_test(subject_code: str, test_id: str, request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
+    try:
+        test_id = safe_test_id(test_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     lecturer = await require_lecturer(request)
     try:
         await repo.delete_test(subject_code, test_id, lecturer)
@@ -1800,6 +2039,7 @@ async def get_test_draft(subject_code: str, request: Request):
 
 
 @app.post("/api/drafts/{subject_code}")
+@limiter.limit(DRAFT_RATE_LIMIT)
 async def save_test_draft(subject_code: str, payload: dict[str, Any], request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
@@ -1897,7 +2137,12 @@ async def export_tests(request: Request):
 
 
 @app.get("/api/stats/{subject_code}")
-def download_stats(subject_code: str):
+async def download_stats(subject_code: str, request: Request):
+    # This workbook contains student names, student numbers and per-question
+    # results. It was downloadable by anyone who knew a subject code.
+    # The host browser is already signed in, so the end-of-game automatic
+    # download still works — it sends the session cookie same-origin.
+    await require_lecturer(request)
     if subject_code not in rooms:
         raise HTTPException(status_code=404, detail="Subject not found")
 
@@ -2440,11 +2685,10 @@ async def force_end_game(room: GameRoom) -> None:
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    visitor_id = (
-        websocket.headers.get("x-visitor-id")
-        or websocket.query_params.get("visitorId")
-        or str(uuid.uuid4())
-    )
+    # Identity comes from a server-signed token only. A bare visitorId query
+    # parameter is no longer trusted: it let a student claim another student's
+    # id and inherit their score.
+    visitor_id = parse_visitor_token(websocket.query_params.get("vt")) or str(uuid.uuid4())
     role = None
     room = None
 

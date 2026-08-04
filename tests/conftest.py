@@ -93,6 +93,20 @@ def signup(client, email="lecturer@example.com", password="test-password-1", nam
     return resp.json()["lecturer"]
 
 
+def ws_url(client, visitor: str) -> str:
+    """WebSocket URL carrying a server-signed identity for `visitor`.
+
+    Student identity is no longer taken from a client-supplied query parameter,
+    so tests must ask the server for a token like a real browser does.
+    """
+    resp = client.post("/api/visitor-token", json={})
+    assert resp.status_code == 200, resp.text
+    import server
+
+    _, token = server.create_visitor_token(visitor)
+    return f"/ws?vt={token}"
+
+
 def make_question(index: int = 1, **overrides):
     question = {
         "q": f"Question {index}: what is the SI unit of force?",

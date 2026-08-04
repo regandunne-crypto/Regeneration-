@@ -7,23 +7,52 @@ const SHAPES = ['◆', '●', '▲', '■'];
 const COLORS = ['color-0', 'color-1', 'color-2', 'color-3'];
 const TIME_PER_Q = 30;
 
-function getOrCreateVisitorId() {
+const WS_PROTOCOL = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const API_BASE = location.origin;
+
+// Student identity is issued and signed by the server. The browser only stores
+// the token; it cannot choose its own id, so it cannot claim someone else's
+// session or score.
+const VISITOR_TOKEN_KEY = 'quiz_visitor_token';
+let visitorToken = '';
+
+function readStoredVisitorToken() {
   try {
-    const key = 'quiz_visitor_id';
-    const existing = localStorage.getItem(key);
-    if (existing) return existing;
-    const created = (crypto && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
-    localStorage.setItem(key, created);
-    return created;
+    return localStorage.getItem(VISITOR_TOKEN_KEY) || '';
   } catch (e) {
-    return `${Date.now()}-${Math.random()}`;
+    return '';
   }
 }
 
-const WS_PROTOCOL = location.protocol === 'https:' ? 'wss:' : 'ws:';
-const VISITOR_ID = getOrCreateVisitorId();
-const WS_URL = `${WS_PROTOCOL}//${location.host}/ws?visitorId=${encodeURIComponent(VISITOR_ID)}`;
-const API_BASE = location.origin;
+async function ensureVisitorToken() {
+  if (visitorToken) return visitorToken;
+  const stored = readStoredVisitorToken();
+  try {
+    const resp = await fetch(`${API_BASE}/api/visitor-token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ token: stored })
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      visitorToken = data.token || '';
+      try { localStorage.setItem(VISITOR_TOKEN_KEY, visitorToken); } catch (e) {}
+      return visitorToken;
+    }
+  } catch (e) {
+    console.warn('Could not obtain a visitor token', e);
+  }
+  // Fall back to whatever we had: the server re-issues on the next attempt, and
+  // a connection without one simply gets a fresh anonymous identity.
+  visitorToken = stored;
+  return visitorToken;
+}
+
+function buildWsUrl() {
+  const suffix = visitorToken ? `?vt=${encodeURIComponent(visitorToken)}` : '';
+  return `${WS_PROTOCOL}//${location.host}/ws${suffix}`;
+}
 
 function normalizeSubjectCode(value) {
   return (value || '').trim().toUpperCase();
@@ -133,7 +162,7 @@ function connectWS(onOpen) {
     return;
   }
 
-  ws = new WebSocket(WS_URL);
+  ws = new WebSocket(buildWsUrl());
   ws.onopen = () => {
     startWsPing();
     if (wsOnOpen) wsOnOpen();
@@ -324,7 +353,7 @@ async function parseApiResponse(resp) {
 }
 
 async function apiGet(path) {
-  const resp = await fetch(`${API_BASE}${path}`);
+  const resp = await fetch(`${API_BASE}${path}`, { credentials: 'same-origin' });
   return await parseApiResponse(resp);
 }
 
@@ -332,6 +361,7 @@ async function apiPost(path, payload = {}) {
   const resp = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
     body: JSON.stringify(payload)
   });
   return await parseApiResponse(resp);
@@ -341,13 +371,14 @@ async function apiPut(path, payload = {}) {
   const resp = await fetch(`${API_BASE}${path}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
     body: JSON.stringify(payload)
   });
   return await parseApiResponse(resp);
 }
 
 async function apiDelete(path) {
-  const resp = await fetch(`${API_BASE}${path}`, { method: 'DELETE' });
+  const resp = await fetch(`${API_BASE}${path}`, { method: 'DELETE', credentials: 'same-origin' });
   return await parseApiResponse(resp);
 }
 
@@ -1205,10 +1236,12 @@ function bindHostAuthUI() {
     btn.disabled = true;
     btn.textContent = 'Creating Account...';
     try {
+      const inviteInput = $('#signup-invite-input');
       await apiPost('/api/lecturer/signup', {
         name: $('#signup-name-input').value.trim(),
         email: $('#signup-email-input').value.trim(),
-        password
+        password,
+        inviteCode: inviteInput ? inviteInput.value.trim() : ''
       });
       await fetchLecturerSession();
       $('#signup-password-input').value = '';
@@ -2478,7 +2511,7 @@ function setupStatsDownload(selector) {
 function downloadStatsNow(subjectCode, buttonEl) {
   const url = `${API_BASE}/api/stats/${subjectCode}`;
   if (buttonEl) buttonEl.textContent = 'Downloading...';
-  fetch(url)
+  fetch(url, { credentials: 'same-origin' })
     .then(async (resp) => {
       if (!resp.ok) {
         const detail = await resp.json().catch(() => ({}));
@@ -2512,7 +2545,7 @@ function downloadTestsBackup(buttonEl) {
   const url = `${API_BASE}/api/export/tests`;
   const originalLabel = buttonEl ? buttonEl.textContent : '';
   if (buttonEl) buttonEl.textContent = 'Preparing backup...';
-  fetch(url)
+  fetch(url, { credentials: 'same-origin' })
     .then(async (resp) => {
       if (!resp.ok) {
         const detail = await resp.json().catch(() => ({}));
@@ -2863,6 +2896,7 @@ window.addEventListener('beforeunload', (e) => {
 });
 
 window.addEventListener('DOMContentLoaded', async () => {
+  await ensureVisitorToken();
   bindHostAuthUI();
   window.addEventListener('popstate', (e) => {
     if (myPlayerId) {

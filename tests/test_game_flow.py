@@ -3,7 +3,7 @@
 import io
 
 import pytest
-from conftest import SUBJECT, make_question, make_test_payload, signup
+from conftest import SUBJECT, make_question, make_test_payload, signup, ws_url
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -37,15 +37,15 @@ def test_id(authed):
 
 
 def test_two_player_game_end_to_end(authed, test_id):
-    with authed.websocket_connect("/ws?visitorId=host-1") as host:
+    with authed.websocket_connect(ws_url(authed, "host-1")) as host:
         host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id, "sessionName": "Tutorial 3"})
         joined = wait_for(host, "host_joined")
         assert joined["totalQ"] == 2
         assert joined["hasQuestions"] is True
         assert joined["selectedTest"]["title"] == "Chapter 1 Quiz"
 
-        with authed.websocket_connect("/ws?visitorId=player-a") as pa, \
-             authed.websocket_connect("/ws?visitorId=player-b") as pb:
+        with authed.websocket_connect(ws_url(authed, "player-a")) as pa, \
+             authed.websocket_connect(ws_url(authed, "player-b")) as pb:
             pa.send_json({"action": "player_join", "name": "Ada", "studentNumber": "221000001", "subject": SUBJECT})
             assert wait_for(pa, "joined")["playerId"] == "player-a"
 
@@ -125,23 +125,23 @@ def test_host_join_requires_lecturer_auth(client, server_module):
     signup(client)
     tid = client.post(f"/api/tests/{SUBJECT}", json=make_test_payload()).json()["test"]["id"]
     client.cookies.clear()
-    with client.websocket_connect("/ws?visitorId=anon-host") as ws:
+    with client.websocket_connect(ws_url(client, "anon-host")) as ws:
         ws.send_json({"action": "host_join", "subject": SUBJECT, "testId": tid})
         assert wait_for(ws, "auth_required")
 
 
 def test_player_cannot_join_a_game_in_progress(authed, test_id):
-    with authed.websocket_connect("/ws?visitorId=host-2") as host:
+    with authed.websocket_connect(ws_url(authed, "host-2")) as host:
         host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id})
         wait_for(host, "host_joined")
 
-        with authed.websocket_connect("/ws?visitorId=early-bird") as pa:
+        with authed.websocket_connect(ws_url(authed, "early-bird")) as pa:
             pa.send_json({"action": "player_join", "name": "Ada", "studentNumber": "1", "subject": SUBJECT})
             wait_for(pa, "joined")
             host.send_json({"action": "start_game", "shuffle": False, "useCode": False})
             wait_for(pa, "question")
 
-            with authed.websocket_connect("/ws?visitorId=latecomer") as pc:
+            with authed.websocket_connect(ws_url(authed, "latecomer")) as pc:
                 pc.send_json({"action": "player_join", "name": "Cid", "studentNumber": "3", "subject": SUBJECT})
                 err = wait_for(pc, "error")
                 assert "already in progress" in err["message"]

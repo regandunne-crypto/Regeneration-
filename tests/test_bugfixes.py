@@ -3,7 +3,7 @@
 import asyncio
 
 import pytest
-from conftest import SUBJECT, load_server, make_question, make_test_payload, signup
+from conftest import SUBJECT, load_server, make_question, make_test_payload, signup, ws_url
 from fastapi.testclient import TestClient
 from test_game_flow import wait_for
 
@@ -23,8 +23,8 @@ def make_test(client, count=3):
 
 def test_double_next_question_does_not_skip_a_question(authed):
     test_id = make_test(authed, count=3)
-    with authed.websocket_connect("/ws?visitorId=host-adv") as host, \
-         authed.websocket_connect("/ws?visitorId=p-adv") as player:
+    with authed.websocket_connect(ws_url(authed, "host-adv")) as host, \
+         authed.websocket_connect(ws_url(authed, "p-adv")) as player:
         host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id})
         wait_for(host, "host_joined")
         player.send_json({"action": "player_join", "name": "Ada", "studentNumber": "1", "subject": SUBJECT})
@@ -42,8 +42,8 @@ def test_double_next_question_does_not_skip_a_question(authed):
 
 def test_answering_twice_records_one_answer_only(authed):
     test_id = make_test(authed, count=1)
-    with authed.websocket_connect("/ws?visitorId=host-dup") as host, \
-         authed.websocket_connect("/ws?visitorId=p-dup") as player:
+    with authed.websocket_connect(ws_url(authed, "host-dup")) as host, \
+         authed.websocket_connect(ws_url(authed, "p-dup")) as player:
         host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id})
         wait_for(host, "host_joined")
         player.send_json({"action": "player_join", "name": "Ada", "studentNumber": "1", "subject": SUBJECT})
@@ -69,8 +69,8 @@ def test_host_socket_stays_responsive_during_the_entry_code_countdown(monkeypatc
     with TestClient(module.app) as client:
         signup(client)
         test_id = make_test(client, count=2)
-        with client.websocket_connect("/ws?visitorId=host-block") as host, \
-             client.websocket_connect("/ws?visitorId=p-block") as player:
+        with client.websocket_connect(ws_url(client, "host-block")) as host, \
+             client.websocket_connect(ws_url(client, "p-block")) as player:
             host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id})
             wait_for(host, "host_joined")
             player.send_json({"action": "player_join", "name": "Ada", "studentNumber": "1", "subject": SUBJECT})
@@ -117,8 +117,8 @@ def test_subject_list_counts_tests_and_questions(authed):
 @pytest.mark.parametrize("bad_choice", ["0", 4, -1, 99, None, [0], {"a": 1}, True])
 def test_invalid_answer_choices_are_rejected(authed, bad_choice):
     test_id = make_test(authed, count=1)
-    with authed.websocket_connect("/ws?visitorId=host-val") as host, \
-         authed.websocket_connect("/ws?visitorId=p-val") as player:
+    with authed.websocket_connect(ws_url(authed, "host-val")) as host, \
+         authed.websocket_connect(ws_url(authed, "p-val")) as player:
         host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id})
         wait_for(host, "host_joined")
         player.send_json({"action": "player_join", "name": "Ada", "studentNumber": "1", "subject": SUBJECT})
@@ -138,7 +138,7 @@ def test_invalid_answer_choices_are_rejected(authed, bad_choice):
 # ── 14. Malformed frames ─────────────────────────────────────────────────────
 
 def test_malformed_frame_does_not_kill_the_connection(authed):
-    with authed.websocket_connect("/ws?visitorId=junk") as ws:
+    with authed.websocket_connect(ws_url(authed, "junk")) as ws:
         ws.send_text("this is not json{{{")
         ws.send_text("[1, 2, 3]")          # valid JSON, wrong shape
         ws.send_json({"action": "ping"})
@@ -146,7 +146,7 @@ def test_malformed_frame_does_not_kill_the_connection(authed):
 
 
 def test_oversized_frame_is_refused(authed):
-    with authed.websocket_connect("/ws?visitorId=huge") as ws:
+    with authed.websocket_connect(ws_url(authed, "huge")) as ws:
         ws.send_json({"action": "ping", "padding": "x" * 200_000})
         assert wait_for(ws, "error")["message"] == "Message too large."
 
@@ -164,12 +164,12 @@ def test_room_player_cap_is_enforced(monkeypatch, store_path):
     with TestClient(module.app) as client:
         signup(client)
         test_id = make_test(client, count=1)
-        with client.websocket_connect("/ws?visitorId=host-cap") as host:
+        with client.websocket_connect(ws_url(client, "host-cap")) as host:
             host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id})
             wait_for(host, "host_joined")
-            with client.websocket_connect("/ws?visitorId=cap-a") as a, \
-                 client.websocket_connect("/ws?visitorId=cap-b") as b, \
-                 client.websocket_connect("/ws?visitorId=cap-c") as c:
+            with client.websocket_connect(ws_url(client, "cap-a")) as a, \
+                 client.websocket_connect(ws_url(client, "cap-b")) as b, \
+                 client.websocket_connect(ws_url(client, "cap-c")) as c:
                 a.send_json({"action": "player_join", "name": "A", "studentNumber": "1", "subject": SUBJECT})
                 wait_for(a, "joined")
                 b.send_json({"action": "player_join", "name": "B", "studentNumber": "2", "subject": SUBJECT})
@@ -187,8 +187,8 @@ def test_game_ends_cleanly_when_the_last_question_times_out(monkeypatch, store_p
     with TestClient(module.app) as client:
         signup(client)
         test_id = make_test(client, count=1)
-        with client.websocket_connect("/ws?visitorId=host-to") as host, \
-             client.websocket_connect("/ws?visitorId=p-to") as player:
+        with client.websocket_connect(ws_url(client, "host-to")) as host, \
+             client.websocket_connect(ws_url(client, "p-to")) as player:
             host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id})
             wait_for(host, "host_joined")
             player.send_json({"action": "player_join", "name": "Ada", "studentNumber": "1", "subject": SUBJECT})
