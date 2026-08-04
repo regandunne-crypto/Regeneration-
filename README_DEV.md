@@ -95,7 +95,13 @@ rehearse a quiz quickly.
 | `tests/test_timing.py` | per-question and per-test time limits |
 | `tests/test_import_docx.py` | Word import parsing and the downloadable template |
 | `tests/test_security.py` | auth gates, signup restrictions, identity tokens |
-| `tests/test_results.py` | stored game results and pruning |
+| `tests/test_results.py` | stored game results, pruning, answer distribution, student review |
+| `tests/test_bugfixes.py` | regressions for the Phase 3 fixes |
+| `tests/test_draft_logic.js` | the draft decision logic, run under Node |
+
+The JavaScript tests run under `pytest` via `tests/test_draft_logic.py`, or
+directly with `node --test tests/test_draft_logic.js`. They are skipped (not
+failed) if Node is not installed.
 
 ## 5. Lint
 
@@ -122,9 +128,13 @@ wide and reflowing it would bury real changes in noise.
 | `ALLOWED_ORIGINS` | deployment origin | CORS allowlist. `*` is opt-in only. |
 | `PERSIST_RESULTS` | `true` | Store a lightweight row per finished game. |
 | `RESULTS_RETENTION` | `20` | Keep this many recent sessions per subject; older ones are pruned. |
+| `DRAFT_RATE_LIMIT` | `120/minute` | Draft autosave limit. Keep it generous — autosave fires 1.5 s after typing stops. |
+| `TIME_PER_Q` | `30` | Fallback seconds per question, for tests saved before per-test timing existed. |
 | `GET_READY_SECONDS` | `3` | Countdown before each question. |
 | `REVEAL_SECONDS` | `5` | Pause on the answer reveal before auto-advancing. |
 | `GAME_CODE_COUNTDOWN_SECONDS` | `20` | Entry-code display time before the game starts. |
+| `MAX_PLAYERS_PER_ROOM` | `300` | Per-session student cap. |
+| `MAX_WS_MESSAGE_BYTES` | `65536` | Largest accepted WebSocket frame. |
 | `PORT` | `8000` | Set by Render. |
 
 ## 7. Front end
