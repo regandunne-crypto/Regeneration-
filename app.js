@@ -2107,6 +2107,8 @@ async function showCreateTestScreen(options = {}) {
   }
 
   bindEditorInputAutosave();
+  bindImportUI();
+  showInlineStatus('#import-status', '', false);
 
   const addBtn = $('#btn-add-question');
   const addClone = addBtn.cloneNode(true);
@@ -2175,6 +2177,170 @@ async function showCreateTestScreen(options = {}) {
       saveClone.textContent = 'Save';
     }
   });
+}
+
+// ── Word import ──────────────────────────────────────────────────────────────
+
+let importUiBound = false;
+
+function bindImportUI() {
+  if (importUiBound) return;
+  importUiBound = true;
+
+  const dropzone = $('#import-dropzone');
+  const input = $('#import-file-input');
+  if (!dropzone || !input) return;
+
+  const choose = () => input.click();
+  dropzone.addEventListener('click', choose);
+  dropzone.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      choose();
+    }
+  });
+
+  ['dragenter', 'dragover'].forEach((evt) => {
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropzone.classList.add('is-dragging');
+    });
+  });
+  ['dragleave', 'drop'].forEach((evt) => {
+    dropzone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('is-dragging');
+    });
+  });
+  dropzone.addEventListener('drop', (e) => {
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file) uploadImportFile(file);
+  });
+
+  input.addEventListener('change', () => {
+    const file = input.files && input.files[0];
+    if (file) uploadImportFile(file);
+    input.value = '';       // allow re-selecting the same file
+  });
+}
+
+async function uploadImportFile(file) {
+  if (!file) return;
+  if (!/\.docx$/i.test(file.name)) {
+    showInlineStatus('#import-status', 'Please choose a .docx file. Word’s older .doc format and PDFs cannot be read.', true);
+    return;
+  }
+  showInlineStatus('#import-status', `Reading ${file.name}…`, false);
+  const form = new FormData();
+  form.append('file', file, file.name);
+  try {
+    const resp = await fetch(`${API_BASE}/api/import/questions`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: form
+    });
+    const data = await parseApiResponse(resp);
+    showInlineStatus('#import-status', '', false);
+    showImportReview(data, file.name);
+  } catch (e) {
+    showInlineStatus('#import-status', e.message || 'Could not read that document.', true);
+  }
+}
+
+function showImportReview(data, filename) {
+  const modal = $('#import-review-modal');
+  const list = $('#import-review-list');
+  const summaryEl = $('#import-review-summary');
+  const warningsEl = $('#import-review-warnings');
+  if (!modal || !list) return;
+
+  const questions = Array.isArray(data.questions) ? data.questions : [];
+  const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+  const meta = data.meta || {};
+
+  const bits = [`${questions.length} question${questions.length === 1 ? '' : 's'} found in ${filename}`];
+  if (meta.skipped) bits.push(`${meta.skipped} skipped`);
+  if (meta.layout) bits.push(`${meta.layout} layout`);
+  summaryEl.textContent = bits.join(' • ');
+
+  if (warnings.length) {
+    warningsEl.hidden = false;
+    warningsEl.innerHTML = `
+      <p class="import-warnings-title">${warnings.length} thing${warnings.length === 1 ? '' : 's'} to check</p>
+      <ul>${warnings.map((w) => `<li>${w.index ? `<strong>Q${w.index}:</strong> ` : ''}${escapeHtml(w.message)}</li>`).join('')}</ul>
+    `;
+  } else {
+    warningsEl.hidden = true;
+    warningsEl.innerHTML = '';
+  }
+
+  list.innerHTML = questions.length
+    ? questions.map((q, i) => {
+      const options = (q.options || []).map((opt, oi) => `
+        <li class="${oi === q.correct ? 'is-correct' : ''}">
+          <span class="import-opt-letter">${'ABCD'[oi] || ''}</span>
+          <span>${escapeHtml(opt)}</span>
+          ${oi === q.correct ? '<span class="import-opt-tick">✓ correct</span>' : ''}
+        </li>`).join('');
+      const time = q.time_limit ? `<span class="import-q-time">${q.time_limit}s</span>` : '';
+      const explanation = q.explanation
+        ? `<p class="import-q-explanation">${escapeHtml(q.explanation)}</p>`
+        : '';
+      return `
+        <div class="import-review-item">
+          <p class="import-q-text"><strong>${i + 1}.</strong> ${escapeHtml(q.q)} ${time}</p>
+          <ul class="import-q-options">${options}</ul>
+          ${explanation}
+        </div>`;
+    }).join('')
+    : '<p class="empty-msg">No questions could be read from that document. Check the format against the template.</p>';
+
+  const appendBtn = $('#btn-import-append');
+  const replaceBtn = $('#btn-import-replace');
+  const cancelBtn = $('#btn-import-cancel');
+  appendBtn.disabled = questions.length === 0;
+  replaceBtn.disabled = questions.length === 0;
+
+  const close = () => {
+    modal.hidden = true;
+    modal.onclick = null;
+    document.removeEventListener('keydown', onKey);
+  };
+  const onKey = (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      close();
+    }
+  };
+
+  const apply = (mode) => {
+    const existing = mode === 'replace' ? [] : collectDraftFormPayload().questions.filter(hasQuestionContent);
+    renderQuestionEditors(existing.concat(questions));
+    close();
+    showInlineStatus(
+      '#host-create-status',
+      `${questions.length} question${questions.length === 1 ? '' : 's'} imported. Review them, then press Save.`,
+      false
+    );
+    // Mark dirty so the import is autosaved as a draft straight away.
+    markDraftDirty();
+  };
+
+  appendBtn.onclick = () => apply('append');
+  replaceBtn.onclick = () => apply('replace');
+  cancelBtn.onclick = close;
+  modal.onclick = (e) => {
+    if (e.target === modal) close();
+  };
+  document.addEventListener('keydown', onKey);
+  modal.hidden = false;
+}
+
+function hasQuestionContent(q) {
+  if (!q) return false;
+  return !!((q.q || '').trim()
+    || (q.explanation || '').trim()
+    || (q.options || []).some((opt) => (opt || '').trim()));
 }
 
 function renderQuestionEditors(questions) {

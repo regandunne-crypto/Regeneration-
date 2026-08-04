@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,6 +35,8 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+
+import docx_import
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Subject catalogue and built-in legacy question sets
@@ -2120,6 +2122,54 @@ async def clear_test_draft(subject_code: str, request: Request):
     except Exception:
         # Always return ok — draft clearing is never worth surfacing as an error.
         return {"ok": True}
+
+
+@app.post("/api/import/questions")
+@limiter.limit("20/minute")
+async def import_questions(request: Request, file: UploadFile = File(...)):
+    """Parse a .docx into reviewable questions.
+
+    Returns JSON only. It never writes a test — the lecturer reviews the parsed
+    questions in the editor and saves them as normal.
+    """
+    await require_lecturer(request)
+    filename = (file.filename or "").strip()
+    if not filename.lower().endswith(".docx"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a .docx file. Word's older .doc format and PDFs cannot be read — "
+                   "open the file in Word and use File > Save As > Word Document (.docx).",
+        )
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="That file is empty.")
+    if len(data) > docx_import.MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"That file is larger than {docx_import.MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
+        )
+    try:
+        result = await asyncio.to_thread(docx_import.parse_docx, data)
+    except docx_import.DocxImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read that document: {exc}") from exc
+    return result
+
+
+@app.get("/api/import/template")
+async def import_template(request: Request):
+    """Generated at request time, so no binary lives in the repository."""
+    await require_lecturer(request)
+    try:
+        data = await asyncio.to_thread(docx_import.build_template_docx)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not build the template: {exc}") from exc
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": 'attachment; filename="quiz_question_template.docx"'},
+    )
 
 
 @app.get("/api/export/tests")

@@ -3,3 +3,5 @@ uvicorn[standard]
 openpyxl
 httpx
 slowapi
+python-docx
+python-multipart

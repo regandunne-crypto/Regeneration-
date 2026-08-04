@@ -325,6 +325,19 @@
         <label for="test-description-input" class="input-label">Short description</label>
         <textarea id="test-description-input" class="editor-textarea" rows="3" placeholder="Optional note for lecturers" maxlength="600"></textarea>
 
+        <div class="import-panel">
+          <div class="import-panel-head">
+            <h2 class="import-panel-title">Import questions from Word</h2>
+            <a id="link-import-template" class="import-template-link" href="/api/import/template" download>&#x2B07; Download question template (.docx)</a>
+          </div>
+          <div id="import-dropzone" class="import-dropzone" tabindex="0" role="button" aria-label="Choose or drop a Word file to import questions">
+            <p class="import-dropzone-main">Drop a <strong>.docx</strong> file here, or click to choose one</p>
+            <p class="import-dropzone-hint">Questions are shown for you to review. Nothing is saved until you press Save.</p>
+            <input type="file" id="import-file-input" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden>
+          </div>
+          <p id="import-status" class="inline-status" hidden></p>
+        </div>
+
         <div class="question-editor-toolbar">
           <h2 class="question-editor-heading">Questions</h2>
         </div>
@@ -477,6 +490,21 @@
       <div class="modal-actions">
         <button id="btn-session-confirm" class="btn btn-primary btn-large" type="button">Start Session</button>
         <button id="btn-session-cancel" class="btn btn-secondary" type="button">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- IMPORT REVIEW MODAL -->
+  <div id="import-review-modal" class="modal-overlay" hidden>
+    <div class="modal-card modal-card-wide">
+      <h2 class="modal-title">Review imported questions</h2>
+      <p class="modal-test-label" id="import-review-summary"></p>
+      <div id="import-review-warnings" class="import-warnings" hidden></div>
+      <div id="import-review-list" class="import-review-list"></div>
+      <div class="modal-actions">
+        <button id="btn-import-append" class="btn btn-primary" type="button">Append to current test</button>
+        <button id="btn-import-replace" class="btn btn-secondary" type="button">Replace all questions</button>
+        <button id="btn-import-cancel" class="btn btn-secondary" type="button">Cancel</button>
       </div>
     </div>
   </div>
