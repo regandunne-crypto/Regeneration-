@@ -287,6 +287,7 @@
         <button id="btn-back-host-subjects" class="btn btn-secondary">Change Subject</button>
       </div>
       <p id="host-library-status" class="inline-status" hidden></p>
+      <div id="host-draft-card" class="draft-resume-card" hidden></div>
       <div class="host-test-list" id="host-test-list"></div>
       <button id="btn-backup-tests" class="btn btn-secondary" type="button">&#x2B07; Backup My Tests</button>
     </div>
@@ -466,6 +467,16 @@
     </div>
   </div>
 
+  <!-- DRAFT CHOICE MODAL -->
+  <div id="draft-choice-modal" class="modal-overlay" hidden>
+    <div class="modal-card">
+      <h2 class="modal-title" id="draft-choice-title">Unsaved draft found</h2>
+      <p class="modal-test-label" id="draft-choice-message"></p>
+      <p class="draft-choice-detail" id="draft-choice-detail" hidden></p>
+      <div class="modal-actions" id="draft-choice-actions"></div>
+    </div>
+  </div>
+
   <!-- PLAYER: Token validation loading -->
   <div id="screen-token-loading" class="screen">
     <div class="ready-container">
@@ -496,6 +507,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+<script src="./draft_utils.js"></script>
 <script src="./app.js"></script>
 </body>
 </html>

@@ -2190,6 +2190,77 @@ body::before {
   color: var(--color-text-muted);
 }
 
+.warning-text {
+  color: var(--accent-orange);
+}
+
+/* ── Draft in progress ───────────────────────────────────────────────────── */
+
+.draft-resume-card {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4);
+  margin-bottom: var(--space-4);
+  border-radius: var(--radius-lg, 14px);
+  border: 1px solid var(--accent-orange);
+  background: rgba(255, 152, 0, 0.08);
+}
+
+.draft-resume-card[hidden] {
+  display: none;
+}
+
+.draft-card-main {
+  min-width: 0;
+  flex: 1 1 260px;
+}
+
+.draft-card-badge {
+  display: inline-block;
+  font-size: var(--text-xs, 0.75rem);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent-orange);
+  margin-bottom: var(--space-2);
+}
+
+.draft-card-title {
+  font-size: var(--text-lg, 1.125rem);
+  font-weight: 700;
+  margin: 0 0 var(--space-1, 0.25rem);
+  overflow-wrap: anywhere;
+}
+
+.draft-card-meta {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+  margin: 0;
+}
+
+.draft-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2, 0.5rem);
+}
+
+.draft-choice-detail {
+  margin: var(--space-3) 0 0;
+  padding: var(--space-3);
+  border-radius: var(--radius-md, 10px);
+  background: rgba(255, 255, 255, 0.05);
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.draft-choice-detail[hidden] {
+  display: none;
+}
+
 @media (max-width: 760px) {
   .host-account-bar {
     left: 12px;

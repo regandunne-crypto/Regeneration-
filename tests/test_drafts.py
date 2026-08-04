@@ -101,6 +101,91 @@ def test_drafts_require_auth(client):
     assert client.post(f"/api/drafts/{SUBJECT}", json=draft_payload()).status_code == 401
 
 
+def test_save_reports_which_backend_stored_the_draft(authed):
+    body = authed.post(f"/api/drafts/{SUBJECT}", json=draft_payload()).json()
+    assert body["storedIn"] == "local-file"
+    assert body["degraded"] is False          # no Supabase configured, so not a downgrade
+    assert "lost if the server redeploys" in body["storedInLabel"]
+
+    read = authed.get(f"/api/drafts/{SUBJECT}").json()
+    assert read["storedIn"] == "local-file"
+
+
+def test_a_failed_draft_write_returns_an_error_not_a_soft_ok(authed, server_module):
+    """The old endpoint returned HTTP 200 {"ok": false} and the editor showed
+    "Draft saved <time>" for a draft that was never stored."""
+
+    async def explode(*args, **kwargs):
+        raise RuntimeError("storage backend is on fire")
+
+    server_module.repo.save_draft = explode
+
+    resp = authed.post(f"/api/drafts/{SUBJECT}", json=draft_payload())
+    assert resp.status_code == 500
+    assert "on fire" in resp.json()["detail"]
+    # And crucially: not a success shape the client could mistake for one.
+    assert resp.json().get("ok") is not True
+
+
+def test_supabase_draft_failure_falls_back_to_local_and_says_so(authed, server_module):
+    """Simulate Supabase being unreachable for drafts only.
+
+    The draft must still be stored, the response must name the backend that
+    actually took it, and the Supabase connection used for tests must stay up.
+    """
+
+    class BrokenDrafts:
+        """Supabase is up for everything except the drafts table."""
+
+        drafts_base = "https://example.invalid/rest/v1/quiz_test_drafts"
+
+        async def get_lecturer_by_id(self, *args, **kwargs):
+            return None      # falls through to the local lecturer cache
+
+        async def get_lecturer_by_email(self, *args, **kwargs):
+            return None
+
+        async def get_draft(self, *args, **kwargs):
+            raise RuntimeError("PGRST205 Could not find the table 'quiz_test_drafts'")
+
+        async def save_draft(self, *args, **kwargs):
+            raise RuntimeError("PGRST205 Could not find the table 'quiz_test_drafts'")
+
+        async def clear_draft(self, *args, **kwargs):
+            raise RuntimeError("PGRST205 Could not find the table 'quiz_test_drafts'")
+
+    repo = server_module.repo
+    repo.remote = BrokenDrafts()
+    repo.supabase_configured = True
+
+    body = authed.post(f"/api/drafts/{SUBJECT}", json=draft_payload(title="Fallback")).json()
+    assert body["ok"] is True
+    assert body["storedIn"] == "local-file"
+    assert body["degraded"] is True                  # Supabase was expected to take it
+    assert "quiz_test_drafts" in (body["error"] or "")
+
+    # The draft is genuinely retrievable, not just reported as saved.
+    assert authed.get(f"/api/drafts/{SUBJECT}").json()["draft"]["title"] == "Fallback"
+    # A draft-table failure must not disable Supabase for everything else.
+    assert repo.remote is not None
+
+
+def test_diagnostics_reports_table_reachability(authed, server_module):
+    resp = authed.get("/api/diagnostics")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert set(body["tables"]) == {"quiz_lecturers", "quiz_tests", "quiz_test_drafts", "quiz_subjects"}
+    for table, info in body["tables"].items():
+        assert info["reachable"] is False, table
+        assert "not configured" in info["error"]
+    assert body["localStore"]["enabled"] is True
+    assert body["localStore"]["exists"] is True
+
+
+def test_diagnostics_requires_lecturer_auth(client):
+    assert client.get("/api/diagnostics").status_code == 401
+
+
 def test_drafts_are_per_lecturer(authed, client):
     authed.post(f"/api/drafts/{SUBJECT}", json=draft_payload(title="Mine"))
     authed.cookies.clear()

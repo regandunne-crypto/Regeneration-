@@ -86,9 +86,32 @@ const DEFAULT_SUBJECT_COLOR = { bg: 'var(--accent-green)', icon: '📚' };
 const BUILTIN_SUBJECT_CODES = new Set(Object.keys(SUBJECT_COLORS));
 
 function showScreen(id) {
+  const leavingEditor = id !== 'screen-host-create-test'
+    && document.querySelector('#screen-host-create-test.active');
   document.querySelectorAll('.screen').forEach((s) => s.classList.remove('active'));
   const el = $(`#${id}`);
   if (el) el.classList.add('active');
+  // Countdown intervals belong to the screen that started them; a screen change
+  // mid-countdown used to leave them running forever.
+  clearScreenIntervals();
+  // A queued autosave must never fire after the lecturer has navigated away and
+  // re-save a stale form over newer state.
+  if (leavingEditor && typeof flushPendingDraftSave === 'function') flushPendingDraftSave();
+}
+
+// Intervals owned by whichever screen is showing, cleared on every change.
+let readyCountdownInterval = null;
+let revealCountdownInterval = null;
+
+function clearScreenIntervals() {
+  if (readyCountdownInterval) {
+    clearInterval(readyCountdownInterval);
+    readyCountdownInterval = null;
+  }
+  if (revealCountdownInterval) {
+    clearInterval(revealCountdownInterval);
+    revealCountdownInterval = null;
+  }
 }
 
 function connectWS(onOpen) {
@@ -824,10 +847,11 @@ function playerGetReady(qNum, totalQ) {
   $('#ready-q-num').textContent = `Question ${qNum} of ${totalQ}`;
   let count = 3;
   $('#ready-count').textContent = count;
-  const iv = setInterval(() => {
+  readyCountdownInterval = setInterval(() => {
     count -= 1;
     if (count <= 0) {
-      clearInterval(iv);
+      clearInterval(readyCountdownInterval);
+      readyCountdownInterval = null;
     } else {
       $('#ready-count').textContent = count;
     }
@@ -1354,6 +1378,8 @@ async function showHostTestLibrary() {
   }
   $('#host-storage-note').textContent = storage.note || '';
 
+  renderDraftResumeCard();   // fire and forget; renders when the draft arrives
+
   try {
     const tests = await loadTests(selectedSubject.code);
     renderHostTestCards(tests);
@@ -1385,6 +1411,55 @@ async function showHostTestLibrary() {
     backupBtn.replaceWith(backupClone);
     backupClone.addEventListener('click', () => downloadTestsBackup(backupClone));
   }
+}
+
+/**
+ * Show any draft in progress at the top of the test library. Without this a
+ * correctly stored draft is unreachable — nothing in the UI says it exists.
+ */
+async function renderDraftResumeCard() {
+  const container = $('#host-draft-card');
+  if (!container || !selectedSubject) return;
+  container.hidden = true;
+  container.innerHTML = '';
+
+  const { draft, source } = await loadBestDraft(selectedSubject.code);
+  if (!draftHasContent(draft)) return;
+  // The library may have moved on while we were fetching.
+  if (!selectedSubject || !$('#screen-host-tests.active')) return;
+
+  const count = draftQuestions(draft).length;
+  const title = (draft.title || '').trim() || 'Untitled test';
+  const editingId = getDraftEditingId(draft);
+  const kind = editingId ? 'Unsaved changes to a saved test' : 'Draft in progress';
+  const where = source === 'browser' ? ' • recovered from this browser' : '';
+
+  container.innerHTML = `
+    <div class="draft-card-main">
+      <span class="draft-card-badge">${escapeHtml(kind)}</span>
+      <h3 class="draft-card-title">${escapeHtml(title)}</h3>
+      <p class="draft-card-meta">${count} question${count === 1 ? '' : 's'} • last saved ${escapeHtml(formatDateTime(draft.updated_at))}${escapeHtml(where)}</p>
+    </div>
+    <div class="draft-card-actions">
+      <button class="btn btn-primary draft-resume-btn" type="button">Resume</button>
+      <button class="btn btn-secondary draft-discard-btn" type="button">Discard</button>
+    </div>
+  `;
+  container.hidden = false;
+
+  container.querySelector('.draft-resume-btn').addEventListener('click', () => {
+    showCreateTestScreen({
+      mode: editingId ? 'edit' : 'create',
+      testId: editingId || null,
+      resumeDraft: true
+    });
+  });
+  container.querySelector('.draft-discard-btn').addEventListener('click', async () => {
+    if (!confirm(`Discard the draft “${title}”? This cannot be undone.`)) return;
+    await destroyDraftEverywhere(selectedSubject.code);
+    container.hidden = true;
+    container.innerHTML = '';
+  });
 }
 
 function formatDateTime(value) {
@@ -1471,7 +1546,7 @@ async function duplicateTestFrom(testSummary) {
   );
   try {
     const detail = await apiGet(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(testSummary.id)}`);
-    await showCreateTestScreen({ mode: 'create' });
+    await showCreateTestScreen({ mode: 'create', intent: 'duplicate' });
     const copyTitle = detail.title ? `${detail.title} (Copy)` : 'Untitled Test (Copy)';
     applyEditorData({
       title: copyTitle,
@@ -1500,8 +1575,138 @@ async function deleteTestFromLibrary(testSummary) {
   }
 }
 
-function getDraftEditingId(draft) {
-  return draft?.editing_test_id || draft?.editingTestId || null;
+// ── Drafts ───────────────────────────────────────────────────────────────────
+// Drafts are keyed (lecturer, subject) — one per subject. Three things can hold
+// a copy: Supabase, the server's local file, and this browser's localStorage.
+// The browser copy is the one that survives a Render redeploy, so it is always
+// written first and always consulted on the way back in.
+
+const DRAFT_LS_PREFIX = 'quiz_draft_';
+
+function draftStorageKey(subjectCode) {
+  return `${DRAFT_LS_PREFIX}${subjectCode}`;
+}
+
+function readLocalDraft(subjectCode) {
+  try {
+    const raw = localStorage.getItem(draftStorageKey(subjectCode));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    // Never hand one lecturer another lecturer's work on a shared machine.
+    if (lecturerSession && parsed.lecturer_id && parsed.lecturer_id !== lecturerSession.id) return null;
+    return parsed;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeLocalDraft(subjectCode, payload) {
+  if (!subjectCode) return;
+  try {
+    localStorage.setItem(draftStorageKey(subjectCode), JSON.stringify({
+      ...payload,
+      lecturer_id: lecturerSession ? lecturerSession.id : null,
+      updated_at: new Date().toISOString()
+    }));
+  } catch (e) {
+    // Quota or private browsing — the server copy is still the primary store.
+  }
+}
+
+function clearLocalDraft(subjectCode) {
+  try {
+    localStorage.removeItem(draftStorageKey(subjectCode));
+  } catch (e) {}
+}
+
+// getDraftEditingId, draftTimestamp, draftQuestions, draftHasContent,
+// chooseNewerDraft and decideDraftAction come from draft_utils.js, which
+// index.html loads first. They are pure and unit tested in
+// tests/test_draft_logic.js.
+
+function describeDraft(draft) {
+  const count = draftQuestions(draft).length;
+  const title = (draft?.title || '').trim() || 'Untitled test';
+  const questions = `${count} question${count === 1 ? '' : 's'}`;
+  return `“${title}” — ${questions}, last saved ${formatDateTime(draft?.updated_at)}`;
+}
+
+/**
+ * Fetch the server draft and compare it with the browser copy, returning
+ * whichever is newer. The browser copy wins after a server restart wiped the
+ * ephemeral store, which is exactly the case this is here to survive.
+ */
+async function loadBestDraft(subjectCode) {
+  let serverDraft = null;
+  let storedIn = null;
+  let error = null;
+  try {
+    const resp = await apiGet(`/api/drafts/${encodeURIComponent(subjectCode)}`);
+    serverDraft = resp.draft || null;
+    storedIn = resp.storedIn || null;
+    error = resp.error || null;
+  } catch (e) {
+    error = e.message;
+  }
+  const localDraft = readLocalDraft(subjectCode);
+  const chosen = chooseNewerDraft(serverDraft, localDraft);
+  return {
+    draft: chosen.draft,
+    source: chosen.source,
+    storedIn: chosen.source === 'browser' ? 'browser' : storedIn,
+    error
+  };
+}
+
+/**
+ * A small promise-based chooser. Never destroys anything by itself — the caller
+ * acts on the returned key.
+ */
+function askDraftChoice({ title, message, detail, options }) {
+  const modal = $('#draft-choice-modal');
+  const actions = $('#draft-choice-actions');
+  if (!modal || !actions) return Promise.resolve(options[0]?.key);
+
+  $('#draft-choice-title').textContent = title;
+  $('#draft-choice-message').textContent = message;
+  const detailEl = $('#draft-choice-detail');
+  detailEl.textContent = detail || '';
+  detailEl.hidden = !detail;
+
+  actions.innerHTML = '';
+  modal.hidden = false;
+
+  return new Promise((resolve) => {
+    const finish = (key) => {
+      modal.hidden = true;
+      modal.onclick = null;
+      document.removeEventListener('keydown', onKey);
+      resolve(key);
+    };
+    const onKey = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        finish(options[options.length - 1].key);
+      }
+    };
+    options.forEach((option, index) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `btn ${option.className || (index === 0 ? 'btn-primary' : 'btn-secondary')}`;
+      btn.textContent = option.label;
+      btn.addEventListener('click', () => finish(option.key));
+      actions.appendChild(btn);
+    });
+    modal.onclick = (event) => {
+      if (event.target === modal) finish(options[options.length - 1].key);
+    };
+    document.addEventListener('keydown', onKey);
+    requestAnimationFrame(() => {
+      const first = actions.querySelector('button');
+      if (first) first.focus();
+    });
+  });
 }
 
 function applyEditorData(data = {}) {
@@ -1514,13 +1719,15 @@ function applyEditorData(data = {}) {
   renderQuestionEditors(questions);
 }
 
-function resetDraftStatus(text = 'No draft changes yet.', isError = false) {
+function resetDraftStatus(text = 'No draft changes yet.', isError = false, isWarning = false) {
   const el = $('#draft-status');
   if (!el) return;
   el.textContent = text;
+  const neutral = !text || text.toLowerCase().includes('unsaved') || text.toLowerCase().includes('no draft');
   el.classList.toggle('error-text', !!isError);
-  el.classList.toggle('success-text', !isError && !!text && !text.toLowerCase().includes('unsaved'));
-  el.classList.toggle('muted-text', !isError && (!text || text.toLowerCase().includes('unsaved') || text.toLowerCase().includes('no draft')));
+  el.classList.toggle('warning-text', !isError && !!isWarning);
+  el.classList.toggle('success-text', !isError && !isWarning && !!text && !neutral);
+  el.classList.toggle('muted-text', !isError && !isWarning && neutral);
 }
 
 function markDraftDirty() {
@@ -1573,28 +1780,73 @@ async function saveDraft({ silent = false } = {}) {
     draftSaveTimer = null;
   }
   const payload = collectDraftFormPayload();
+
+  // Write the browser copy first, before any network call. This is the copy
+  // that survives a server restart, a Supabase outage or a Render redeploy,
+  // and it costs nothing.
+  writeLocalDraft(selectedSubject.code, payload);
+
   try {
     const resp = await apiPost(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`, payload);
+    // The old server returned HTTP 200 with {"ok": false} when the write had
+    // failed, and this function only ever looked at the HTTP status — so a
+    // failed save was reported to the lecturer as a success.
+    if (resp && resp.ok === false) {
+      throw new Error(resp.error || 'The server could not store this draft.');
+    }
     draftDirty = false;
     currentDraftLoaded = resp.draft || payload;
-    const updatedAt = resp.draft?.updated_at || new Date().toISOString();
-    resetDraftStatus(`Draft saved ${formatDateTime(updatedAt)}.`, false);
+    const when = formatDateTime(resp.draft?.updated_at || new Date().toISOString());
+    if (resp.storedIn === 'supabase') {
+      resetDraftStatus(`Draft saved to Supabase ${when}.`, false);
+    } else if (resp.storedIn === 'local-file') {
+      resetDraftStatus(
+        `Draft saved locally ${when} — it will be lost if the server redeploys. A copy is also kept in this browser.`,
+        false,
+        true
+      );
+    } else {
+      resetDraftStatus(
+        `Draft saved to server memory only ${when} — it will be lost when the server restarts. A copy is also kept in this browser.`,
+        false,
+        true
+      );
+    }
     return resp.draft;
   } catch (e) {
-    if (!silent) {
-      resetDraftStatus(e.message || 'Draft save failed.', true);
-    } else {
-      resetDraftStatus('Autosave failed. Use Save Draft before leaving.', true);
-    }
+    const reason = e.message || 'the server did not respond';
+    resetDraftStatus(
+      `Draft NOT saved — ${reason}. A copy is kept in this browser and will be offered when you come back.`,
+      true
+    );
+    if (!silent) console.error('Draft save failed:', e);
     return null;
   }
 }
 
+/** Cancel a queued autosave, flushing it first if there are pending changes. */
+function flushPendingDraftSave() {
+  if (draftSaveTimer) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
+  if (!draftDirty || !selectedSubject || !lecturerSession) return;
+  // Always capture the browser copy synchronously; the network save is
+  // best-effort and must not block navigation.
+  writeLocalDraft(selectedSubject.code, collectDraftFormPayload());
+  saveDraft({ silent: true });
+}
+
 async function discardDraft() {
   if (!selectedSubject) return;
-  if (!confirm('Discard the saved draft for this subject?')) return;
+  if (!confirm('Discard the saved draft for this subject? This cannot be undone.')) return;
+  if (draftSaveTimer) {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = null;
+  }
   try {
     await apiDelete(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`);
+    clearLocalDraft(selectedSubject.code);
     currentDraftLoaded = null;
     draftDirty = false;
     if (editorMode === 'edit' && originalEditingTest) {
@@ -1606,6 +1858,16 @@ async function discardDraft() {
     }
   } catch (e) {
     resetDraftStatus(e.message || 'Could not discard the draft.', true);
+  }
+}
+
+/** Destroy every copy of the draft. Only ever called on an explicit choice. */
+async function destroyDraftEverywhere(subjectCode) {
+  clearLocalDraft(subjectCode);
+  try {
+    await apiDelete(`/api/drafts/${encodeURIComponent(subjectCode)}`);
+  } catch (e) {
+    // Non-fatal: the next autosave overwrites whatever is left behind.
   }
 }
 
@@ -1627,43 +1889,116 @@ async function showCreateTestScreen(options = {}) {
   showInlineStatus('#host-create-status', '', false);
   resetDraftStatus('Loading editor...', false);
 
-  let draft = null;
-  if (editorMode === 'create') {
+  // Always read the draft on the way in — including in create mode. The old
+  // code fired an unconditional DELETE here, which destroyed the draft the
+  // lecturer had saved in a previous session before it was ever read. That,
+  // plus only ever restoring drafts whose editing_test_id matched the test
+  // being edited (never true for a new-test draft), is why "Save Draft" looked
+  // like it did nothing.
+  const { draft, source: draftSource } = await loadBestDraft(selectedSubject.code);
+  const decision = decideDraftAction({
+    mode: editorMode,
+    editingTestId,
+    draft,
+    resumeDraft: !!options.resumeDraft
+  });
+  const draftEditingId = decision.draftEditingId;
+
+  const loadSavedTest = async (testId) => {
     try {
-      await apiDelete(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`);
+      return await apiGet(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(testId)}`);
     } catch (e) {
-      // Ignore draft deletion errors and still start with a blank editor.
+      return null;   // the underlying test may since have been deleted
     }
-  } else {
-    try {
-      const draftResp = await apiGet(`/api/drafts/${encodeURIComponent(selectedSubject.code)}`);
-      draft = draftResp.draft;
-    } catch (e) {
-      draft = null;
-    }
-  }
+  };
+
+  const applyDraft = () => {
+    currentDraftLoaded = draft;
+    editingTestId = draftEditingId || null;
+    editorMode = draftEditingId ? 'edit' : 'create';
+    $('#create-test-title').textContent = editorMode === 'edit' ? 'Edit Test' : 'Create Test';
+    applyEditorData({
+      title: draft.title || '',
+      chapter: draft.chapter || '',
+      description: draft.description || '',
+      questions: draft.questions || []
+    });
+    const where = draftSource === 'browser' ? ' (recovered from this browser)' : '';
+    resetDraftStatus(`Recovered your draft from ${formatDateTime(draft.updated_at)}${where}.`, false);
+  };
+
+  const startBlank = async () => {
+    // The only path that destroys a draft, and only on an explicit choice.
+    await destroyDraftEverywhere(selectedSubject.code);
+    editingTestId = null;
+    editorMode = 'create';
+    originalEditingTest = null;
+    applyEditorData({ title: '', chapter: '', description: '', questions: [] });
+    resetDraftStatus('Previous draft discarded. Drafts save automatically.', false);
+  };
 
   try {
-    if (editorMode === 'edit' && editingTestId) {
+    if (decision.action === 'saved-test') {
       originalEditingTest = await apiGet(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(editingTestId)}`);
-      if (draft && getDraftEditingId(draft) === editingTestId) {
-        currentDraftLoaded = draft;
-        applyEditorData({
-          title: draft.title || '',
-          chapter: draft.chapter || '',
-          description: draft.description || '',
-          questions: draft.questions || []
-        });
-        resetDraftStatus(`Recovered your draft from ${formatDateTime(draft.updated_at)}.`, false);
-      } else {
-        applyEditorData(originalEditingTest);
-        resetDraftStatus('Editing the saved test.', false);
-      }
-    } else {
+      applyEditorData(originalEditingTest);
+      resetDraftStatus('Editing the saved test.', false);
+
+    } else if (decision.action === 'blank') {
       editingTestId = null;
       originalEditingTest = null;
       applyEditorData({ title: '', chapter: '', description: '', questions: [] });
       resetDraftStatus('Start building your test. Drafts save automatically.', false);
+
+    } else if (decision.action === 'resume') {
+      if (draftEditingId) originalEditingTest = await loadSavedTest(draftEditingId);
+      applyDraft();
+
+    } else if (decision.kind === 'edit-vs-draft') {
+      // A draft exists but belongs elsewhere. Warn before the first autosave
+      // silently replaces it.
+      originalEditingTest = await apiGet(`/api/tests/${encodeURIComponent(selectedSubject.code)}/${encodeURIComponent(editingTestId)}`);
+      const choice = await askDraftChoice({
+        title: 'You have an unsaved draft',
+        message: 'This draft is not part of the test you just opened. If you carry on editing this test, your changes will replace the draft the next time they save.',
+        detail: describeDraft(draft),
+        options: [
+          { key: 'draft', label: 'Open my draft instead' },
+          { key: 'test', label: 'Continue editing this test' }
+        ]
+      });
+      if (choice === 'draft') {
+        applyDraft();
+      } else {
+        applyEditorData(originalEditingTest);
+        resetDraftStatus('Editing the saved test. Your previous draft will be replaced when this autosaves.', false, true);
+      }
+
+    } else {
+      // create-vs-draft
+      const belongsElsewhere = !!decision.belongsElsewhere;
+      const choice = await askDraftChoice({
+        title: 'Resume your unsaved draft?',
+        message: belongsElsewhere
+          ? 'You have an unsaved draft of a saved test in this subject.'
+          : 'You have an unsaved draft for this subject.',
+        detail: describeDraft(draft),
+        options: [
+          { key: 'draft', label: belongsElsewhere ? 'Open that draft' : 'Resume draft' },
+          {
+            key: 'blank',
+            label: options.intent === 'duplicate'
+              ? 'Continue with the copy (discards draft)'
+              : 'Start blank (discards draft)',
+            className: 'btn-secondary'
+          }
+        ]
+      });
+      if (choice === 'draft') {
+        if (draftEditingId) originalEditingTest = await loadSavedTest(draftEditingId);
+        applyDraft();
+      } else {
+        await startBlank();
+      }
     }
   } catch (e) {
     showInlineStatus('#host-create-status', e.message, true);
@@ -1723,6 +2058,14 @@ async function showCreateTestScreen(options = {}) {
       originalEditingTest = resp.test;
       currentDraftLoaded = null;
       draftDirty = false;
+      // The server clears its own draft on a successful save; clear the browser
+      // mirror too, or it would be offered back as "unsaved work" next time.
+      if (draftSaveTimer) {
+        clearTimeout(draftSaveTimer);
+        draftSaveTimer = null;
+      }
+      clearLocalDraft(selectedSubject.code);
+      resetDraftStatus('Saved. No unsaved draft.', false);
       showInlineStatus('#host-create-status', 'Test saved.', false);
       saveClone.disabled = false;
       saveClone.textContent = 'Save';
@@ -2343,14 +2686,15 @@ function hostShowReveal(msg) {
   $('#host-reveal-explanation').textContent = msg.explanation;
   renderLeaderboardList($('#host-reveal-leaderboard'), msg.leaderboard, null);
 
-  let autoCountdown = 5;
+  let autoCountdown = Math.max(1, Math.round(msg.revealSeconds || 5));
   const countdownEl = $('#host-auto-countdown');
   countdownEl.textContent = `Next question in ${autoCountdown}s...`;
   countdownEl.style.display = 'block';
-  const iv = setInterval(() => {
+  revealCountdownInterval = setInterval(() => {
     autoCountdown -= 1;
     if (autoCountdown <= 0) {
-      clearInterval(iv);
+      clearInterval(revealCountdownInterval);
+      revealCountdownInterval = null;
       countdownEl.textContent = 'Loading next question...';
     } else {
       countdownEl.textContent = `Next question in ${autoCountdown}s...`;
@@ -2444,6 +2788,16 @@ function escapeHtml(text) {
   div.textContent = text;
   return div.innerHTML;
 }
+
+window.addEventListener('beforeunload', (e) => {
+  const inEditor = !!document.querySelector('#screen-host-create-test.active');
+  if (!inEditor || !draftDirty) return;
+  // Capture the browser copy on the way out — this is the last chance.
+  if (selectedSubject) writeLocalDraft(selectedSubject.code, collectDraftFormPayload());
+  e.preventDefault();
+  e.returnValue = '';
+  return '';
+});
 
 window.addEventListener('DOMContentLoaded', async () => {
   bindHostAuthUI();

@@ -554,6 +554,9 @@ class HybridTestRepository:
         self.require_supabase = REQUIRE_SUPABASE
         self.supabase_configured = False
         self.supabase_error: str | None = None
+        # Draft failures are tracked separately: they must never disable the
+        # Supabase connection used for tests, but they must still be visible.
+        self.draft_error: str | None = None
         self._seed_builtin_tests()
         self._load_local_store()
 
@@ -1080,18 +1083,42 @@ class HybridTestRepository:
 
         return await self._call_remote(_remote_delete() if self.remote else None, _local_delete)
 
-    async def get_draft(self, subject_code: str, lecturer: dict[str, Any]) -> dict[str, Any] | None:
-        # Do NOT use _call_remote here — a failure on the quiz_test_drafts table must
-        # never disable self.remote (which would break all subsequent test reads/writes).
+    def _local_draft_backend(self) -> str:
+        return "local-file" if self.local_store_enabled else "memory"
+
+    async def get_draft(self, subject_code: str, lecturer: dict[str, Any]) -> tuple[dict[str, Any] | None, str, str | None]:
+        """Return (draft, backend_it_came_from, error_text).
+
+        Do NOT use _call_remote here — a failure on the quiz_test_drafts table
+        must never disable self.remote, which would break all subsequent test
+        reads and writes.
+        """
+        error: str | None = None
         if self.remote is not None:
             try:
-                return await self.remote.get_draft(subject_code, lecturer["id"])
-            except Exception:
-                pass  # Fall back to local silently
-        return self.local_drafts.get((lecturer["id"], subject_code))
+                row = await self.remote.get_draft(subject_code, lecturer["id"])
+                if row is not None:
+                    return row, "supabase", None
+                # Supabase is reachable and simply has no draft. Still fall through
+                # to the local copy: a draft written while Supabase was down lives
+                # there and would otherwise be invisible.
+            except Exception as exc:
+                error = str(exc)
+                self.draft_error = error
+        local = self.local_drafts.get((lecturer["id"], subject_code))
+        if local is not None:
+            return local, self._local_draft_backend(), error
+        return None, "supabase" if (self.remote is not None and not error) else self._local_draft_backend(), error
 
-    async def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> dict[str, Any]:
+    async def save_draft(self, subject_code: str, lecturer: dict[str, Any], payload: DraftPayload) -> tuple[dict[str, Any], str, str | None]:
+        """Save a draft and report which backend actually stored it.
+
+        Returns (row, backend, supabase_error). Raises if nothing could store it
+        — a draft the lecturer believes is safe but which was never written is
+        worse than an error message.
+        """
         self._ensure_supabase_for_write()
+
         def _local_save():
             row = {
                 "id": self.local_drafts.get((lecturer["id"], subject_code), {}).get("id", f"draft:{uuid.uuid4()}"),
@@ -1109,14 +1136,30 @@ class HybridTestRepository:
             self.local_drafts[(lecturer["id"], subject_code)] = row
             self._persist_local_store()
             return row
-        # Do NOT use _call_remote here — a failure on the quiz_test_drafts table must
-        # never disable self.remote (which would break all subsequent test reads/writes).
+
+        remote_error: str | None = None
         if self.remote is not None:
             try:
-                return await self.remote.save_draft(subject_code, lecturer, payload)
-            except Exception:
-                pass  # Fall back to local silently; draft failure is non-critical
-        return _local_save()
+                row = await self.remote.save_draft(subject_code, lecturer, payload)
+                self.draft_error = None
+                # Mirror into the local store so a later Supabase outage still has
+                # something to hand back.
+                try:
+                    _local_save()
+                except Exception:
+                    pass
+                return row, "supabase", None
+            except Exception as exc:
+                # Log it. The old code swallowed this entirely, so a draft could
+                # land in an ephemeral file while the UI said "Draft saved".
+                remote_error = str(exc)
+                self.draft_error = remote_error
+                print(f"[drafts] Supabase draft save failed for {subject_code}: {remote_error}")
+
+        row = _local_save()
+        # _persist_local_store() flips local_store_enabled off if the file could
+        # not be written, so read the backend back after saving, not before.
+        return row, self._local_draft_backend(), remote_error
 
     async def clear_draft(self, subject_code: str, lecturer: dict[str, Any]) -> None:
         # Always clear the local draft copy first.
@@ -1336,6 +1379,11 @@ def style_css():
 @app.get("/app.js")
 def app_js():
     return FileResponse(BASE_DIR / "app.js", media_type="application/javascript")
+
+
+@app.get("/draft_utils.js")
+def draft_utils_js():
+    return FileResponse(BASE_DIR / "draft_utils.js", media_type="application/javascript")
 
 
 def public_lecturer_view(row: dict[str, Any]) -> dict[str, Any]:
@@ -1664,17 +1712,25 @@ async def delete_test(subject_code: str, test_id: str, request: Request):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+DRAFT_BACKEND_LABELS = {
+    "supabase": "Supabase",
+    "local-file": "this server's local file — it will be lost if the server redeploys",
+    "memory": "server memory only — it will be lost when the server restarts",
+}
+
+
 @app.get("/api/drafts/{subject_code}")
 async def get_test_draft(subject_code: str, request: Request):
     if subject_code not in SUBJECTS:
         raise HTTPException(status_code=404, detail="Subject not found")
     lecturer = await require_lecturer(request)
     try:
-        draft = await repo.get_draft(subject_code, lecturer)
-        return {"draft": draft}
-    except Exception:
-        # If the draft table doesn't exist yet, return no draft rather than erroring.
-        return {"draft": None}
+        draft, backend, error = await repo.get_draft(subject_code, lecturer)
+    except Exception as exc:
+        # A missing quiz_test_drafts table must not break the editor, but it must
+        # not be invisible either — the client shows this on the draft status line.
+        return {"draft": None, "storedIn": None, "error": str(exc)}
+    return {"draft": draft, "storedIn": backend if draft else None, "error": error}
 
 
 @app.post("/api/drafts/{subject_code}")
@@ -1684,16 +1740,67 @@ async def save_test_draft(subject_code: str, payload: dict[str, Any], request: R
     lecturer = await require_lecturer(request)
     try:
         validated = DraftPayload.model_validate(payload)
-        draft = await repo.save_draft(subject_code, lecturer, validated)
-        return {"ok": True, "draft": draft}
-    except SupabaseUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=validation_detail(exc)) from exc
-    except Exception:
-        # Draft save failure is non-critical. Return a soft ok so autosave
-        # errors never break the editor UI or cascade into test operations.
-        return {"ok": False, "draft": None, "error": "Draft could not be saved to storage (non-critical)."}
+    try:
+        draft, backend, remote_error = await repo.save_draft(subject_code, lecturer, validated)
+    except SupabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        # The draft genuinely was not written anywhere. Say so with a real error
+        # status: the old code returned HTTP 200 with {"ok": false} and the
+        # editor happily reported "Draft saved".
+        raise HTTPException(status_code=500, detail=f"Draft could not be saved: {exc}") from exc
+    return {
+        "ok": True,
+        "draft": draft,
+        "storedIn": backend,
+        "storedInLabel": DRAFT_BACKEND_LABELS.get(backend, backend),
+        "degraded": backend != "supabase" and repo.supabase_configured,
+        "error": remote_error,
+    }
+
+
+@app.get("/api/diagnostics")
+async def diagnostics(request: Request):
+    """Probe each storage table so silent breakage is diagnosable.
+
+    Lecturer-authenticated: the probe reports Supabase error text, which is not
+    something anonymous callers should see.
+    """
+    await require_lecturer(request)
+    tables = {
+        "quiz_lecturers": "lecturers_base",
+        "quiz_tests": "quiz_tests_base",
+        "quiz_test_drafts": "drafts_base",
+        "quiz_subjects": "subjects_base",
+    }
+    results: dict[str, Any] = {}
+    remote = repo.remote
+    for table, attr in tables.items():
+        if remote is None:
+            results[table] = {
+                "reachable": False,
+                "error": "Supabase is not configured on this server." if not repo.supabase_configured
+                         else (repo.supabase_error or "Supabase connection is disabled."),
+            }
+            continue
+        try:
+            await remote._request("GET", getattr(remote, attr), params={"select": "*", "limit": "1"})
+            results[table] = {"reachable": True, "error": None}
+        except Exception as exc:
+            results[table] = {"reachable": False, "error": str(exc)}
+    return {
+        "storage": repo.get_storage_status(),
+        "draftError": repo.draft_error,
+        "localStore": {
+            "enabled": repo.local_store_enabled,
+            "path": str(repo.local_store_path),
+            "exists": repo.local_store_path.exists(),
+            "error": repo.local_store_error,
+        },
+        "tables": results,
+    }
 
 
 @app.delete("/api/drafts/{subject_code}")
