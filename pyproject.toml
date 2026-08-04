@@ -1,7 +1,12 @@
 [tool.ruff]
 line-length = 140
 target-version = "py311"
-exclude = [".venv", "__pycache__", ".pytest_cache"]
+exclude = [
+    ".venv", "__pycache__", ".pytest_cache",
+    # Pre-existing one-off scratch scripts, not part of the application.
+    # Left untouched deliberately; excluded so `ruff check .` stays meaningful.
+    "script.py", "script_1.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "UP", "DTZ"]
