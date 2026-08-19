@@ -3158,8 +3158,35 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 role = "host"
                 room = rooms[subject_code]
+
+                # A room belongs to a subject, not to a test, and lives in
+                # process memory — so it keeps whatever phase the previous
+                # session left it in. When a game finishes the room sits in
+                # "final" indefinitely, and every student scanning the QR code
+                # is told "the game is already in progress" while the host sees
+                # a perfectly normal-looking lobby.
+                #
+                # This used to reset only when a *different test* was chosen, so
+                # picking up the same test as the previous session — very common
+                # when another lecturer re-runs a colleague's quiz — left the
+                # room stuck and locked the whole class out.
                 requested_new_test = bool(test_id and test_id != room.active_test_id)
-                if room.phase == "lobby" or (room.phase == "final" and requested_new_test):
+                different_lecturer = bool(room.host_lecturer_id and room.host_lecturer_id != lecturer.get("id"))
+                explicit_new_session = bool(msg.get("newSession"))
+
+                # A finished game is not "in progress": anything that looks like
+                # a fresh start clears it.
+                needs_reset = room.phase == "final" and (
+                    requested_new_test or different_lecturer or explicit_new_session
+                )
+                # A room abandoned mid-game (host closed the laptop, or a paused
+                # question that never resumed) is only cleared on a deliberate
+                # new session, never on a plain reconnect — that would wipe a
+                # live game out from under the class.
+                if room.phase not in ("lobby", "final") and explicit_new_session:
+                    needs_reset = True
+
+                if room.phase == "lobby" or needs_reset:
                     room.set_active_test(test_data)
                 room.session_name = msg.get("sessionName", "").strip()[:80] or room.active_test_title
                 if host_token and lookup_session_token(host_token) == subject_code:
@@ -3170,8 +3197,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 room.host_visitor = visitor_id
                 room.host_lecturer_id = lecturer.get("id")
 
-                if room.phase == "final" and requested_new_test:
-                    await return_room_to_lobby(room, keep_players=True)
+                if needs_reset:
+                    # Players from the previous session are long gone; starting
+                    # a new session should not inherit their records.
+                    await return_room_to_lobby(room, keep_players=False)
                     continue
 
                 await websocket.send_text(json.dumps({

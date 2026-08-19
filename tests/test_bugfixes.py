@@ -224,3 +224,109 @@ async def _time_one(module):
     start = loop.time()
     await module.hash_password_async("a-password")
     return loop.time() - start
+
+
+# ── Stuck room: "the game is already in progress" when it is not ─────────────
+# Reported in production: a lecturer picked up a colleague's finished quiz and
+# every student scanning the QR code was refused, while the host saw a normal
+# lobby. The room is per subject and in memory, so it stayed in "final".
+
+def play_to_completion(client, test_id, visitor_prefix, token=""):
+    """Run a one-question game to the end, leaving the room in 'final'."""
+    with client.websocket_connect(ws_url(client, f"{visitor_prefix}-host")) as host, \
+         client.websocket_connect(ws_url(client, f"{visitor_prefix}-p")) as player:
+        host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id, "newSession": True})
+        joined = wait_for(host, "host_joined")
+        player.send_json({
+            "action": "player_join", "name": "Ada", "studentNumber": "1",
+            "subject": SUBJECT, "token": joined.get("sessionToken") or token,
+        })
+        wait_for(player, "joined")
+        host.send_json({"action": "start_game", "shuffle": False, "useCode": False})
+        wait_for(player, "question")
+        player.send_json({"action": "answer", "choice": 0})
+        wait_for(player, "answer_result")
+        wait_for(host, "final")
+
+
+def join_as_student(client, visitor, token=""):
+    """Return the first message a scanning student gets."""
+    with client.websocket_connect(ws_url(client, visitor)) as ws:
+        ws.send_json({
+            "action": "player_join", "name": "Student", "studentNumber": "99",
+            "subject": SUBJECT, "token": token,
+        })
+        return ws.receive_json()
+
+
+def test_another_lecturer_reusing_a_finished_quiz_does_not_lock_students_out(authed, server_module):
+    """The reported bug, end to end."""
+    test_id = make_test(authed, count=1)
+    play_to_completion(authed, test_id, "first")
+    assert server_module.rooms[SUBJECT].phase == "final"
+
+    # A different lecturer signs in and hosts the SAME test.
+    authed.cookies.clear()
+    signup(authed, email="colleague@example.com", name="Second Lecturer")
+    with authed.websocket_connect(ws_url(authed, "second-host")) as host:
+        host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id})
+        joined = wait_for(host, "host_joined")
+        assert joined["phase"] == "lobby", "the room must be returned to the lobby"
+        token = joined.get("sessionToken") or ""
+
+        # A student scans the QR code and gets in.
+        reply = join_as_student(authed, "scanning-student", token)
+        assert reply["type"] == "joined", f"student was refused: {reply}"
+
+
+def test_same_lecturer_rerunning_the_same_quiz_is_not_blocked(authed, server_module):
+    test_id = make_test(authed, count=1)
+    play_to_completion(authed, test_id, "again")
+    assert server_module.rooms[SUBJECT].phase == "final"
+
+    # "Use This Test" on the same quiz sends newSession.
+    with authed.websocket_connect(ws_url(authed, "same-host")) as host:
+        host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id, "newSession": True})
+        joined = wait_for(host, "host_joined")
+        assert joined["phase"] == "lobby"
+        reply = join_as_student(authed, "student-2", joined.get("sessionToken") or "")
+        assert reply["type"] == "joined", f"student was refused: {reply}"
+
+
+def test_a_host_reconnect_does_not_wipe_the_final_leaderboard(authed, server_module):
+    """A dropped socket reconnecting is not a new session and must not reset."""
+    test_id = make_test(authed, count=1)
+    play_to_completion(authed, test_id, "recon")
+
+    with authed.websocket_connect(ws_url(authed, "recon-host")) as host:
+        # No newSession flag: this is what the auto-reconnect sends.
+        host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id})
+        assert wait_for(host, "host_joined")["phase"] == "final"
+    assert server_module.rooms[SUBJECT].phase == "final"
+
+
+def test_an_abandoned_mid_game_room_is_cleared_by_a_new_session(authed, server_module):
+    """Host closed the laptop mid-question; the room must not stay locked."""
+    test_id = make_test(authed, count=3)
+    with authed.websocket_connect(ws_url(authed, "aband-host")) as host, \
+         authed.websocket_connect(ws_url(authed, "aband-p")) as player:
+        host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id, "newSession": True})
+        joined = wait_for(host, "host_joined")
+        player.send_json({
+            "action": "player_join", "name": "Ada", "studentNumber": "1",
+            "subject": SUBJECT, "token": joined.get("sessionToken") or "",
+        })
+        wait_for(player, "joined")
+        host.send_json({"action": "start_game", "shuffle": False, "useCode": False})
+        wait_for(player, "question")
+        host.send_json({"action": "host_pause"})      # paused, then abandoned
+        wait_for(host, "pause_state")
+
+    assert server_module.rooms[SUBJECT].phase not in ("lobby", "final")
+
+    with authed.websocket_connect(ws_url(authed, "rescue-host")) as host:
+        host.send_json({"action": "host_join", "subject": SUBJECT, "testId": test_id, "newSession": True})
+        joined = wait_for(host, "host_joined")
+        assert joined["phase"] == "lobby"
+        reply = join_as_student(authed, "student-3", joined.get("sessionToken") or "")
+        assert reply["type"] == "joined", f"student was refused: {reply}"

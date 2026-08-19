@@ -2782,14 +2782,20 @@ async function startHostForTest(testSummary) {
     console.warn('Could not generate session token, falling back to subject URL', e);
   }
 
+  // Tell the server this is a deliberate new session, not a dropped socket
+  // reconnecting. A reconnect must never reset a live game, but a new session
+  // must clear a room still sitting in the previous game's finished state.
+  let firstHostJoin = true;
   connectWS(() => {
     send({
       action: 'host_join',
       subject: hostSubjectCode,
       testId: selectedTest.id,
       sessionName: sessionName || '',
-      token: sessionToken || ''
+      token: sessionToken || '',
+      newSession: firstHostJoin
     });
+    firstHostJoin = false;
   });
 
   renderHostJoinQRCode(buildPlayerJoinURL(hostSubjectCode, sessionToken));
