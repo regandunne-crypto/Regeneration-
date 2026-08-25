@@ -24,27 +24,35 @@ function readStoredVisitorToken() {
   }
 }
 
-async function ensureVisitorToken() {
+async function ensureVisitorToken({ attempts = 3 } = {}) {
   if (visitorToken) return visitorToken;
   const stored = readStoredVisitorToken();
-  try {
-    const resp = await fetch(`${API_BASE}/api/visitor-token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify({ token: stored })
-    });
-    if (resp.ok) {
-      const data = await resp.json();
-      visitorToken = data.token || '';
-      try { localStorage.setItem(VISITOR_TOKEN_KEY, visitorToken); } catch (e) {}
-      return visitorToken;
+  // Without a token the server hands out a fresh anonymous id on every
+  // connection, so a student's identity churns and a reconnect looks like a
+  // stranger arriving. Worth retrying: the free tier can be slow to wake.
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const resp = await fetch(`${API_BASE}/api/visitor-token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ token: stored })
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        visitorToken = data.token || '';
+        try { localStorage.setItem(VISITOR_TOKEN_KEY, visitorToken); } catch (e) {}
+        return visitorToken;
+      }
+    } catch (e) {
+      console.warn(`Could not obtain a visitor token (attempt ${attempt + 1})`, e);
     }
-  } catch (e) {
-    console.warn('Could not obtain a visitor token', e);
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+    }
   }
-  // Fall back to whatever we had: the server re-issues on the next attempt, and
-  // a connection without one simply gets a fresh anonymous identity.
+  // Keep whatever we had rather than nothing: a stored token still identifies
+  // this student even if refreshing it failed.
   visitorToken = stored;
   return visitorToken;
 }
@@ -711,7 +719,7 @@ function submitGameCode() {
   }
 }
 
-function joinAsPlayer() {
+async function joinAsPlayer() {
   const name = $('#nickname-input').value.trim();
   const studentNum = $('#student-number-input').value.trim();
   if (!name || !studentNum) return;
@@ -721,6 +729,10 @@ function joinAsPlayer() {
   if (errEl) errEl.hidden = true;
   $('#btn-join').disabled = true;
   $('#btn-join').textContent = 'Joining...';
+
+  // Make sure this browser has a signed identity before it joins, so a later
+  // reconnect is recognised as the same student.
+  await ensureVisitorToken();
 
   connectWS(() => {
     send({

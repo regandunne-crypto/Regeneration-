@@ -1706,6 +1706,10 @@ class GameRoom:
         self.game_code_enabled = False
         if clear_players:
             self.players = {}
+            # Everyone who has taken part in this session, keyed by student
+            # identity. Kept even if their live record goes away, so a student
+            # who drops out mid-quiz is never mistaken for a new joiner.
+            self.session_roster = {}
             self.current_token = ""
         self.host_ws = None
         self.host_visitor = None
@@ -2720,6 +2724,20 @@ def is_participating_player(room: GameRoom, player: dict[str, Any] | None) -> bo
     return bool(player and player.get("game_code_verified"))
 
 
+def student_identity_key(student_number: str, name: str) -> str:
+    """A stable key for one student within a session.
+
+    Matching used to be an exact string comparison of the student number, so
+    "221 012 345" and "221012345" looked like two different people and a
+    returning student was treated as a stranger. Spaces, dashes and case are
+    ignored here.
+    """
+    number = re.sub(r"[^0-9a-z]", "", (student_number or "").lower())
+    if number:
+        return f"number:{number}"
+    return "name:" + re.sub(r"\s+", " ", (name or "").strip().lower())
+
+
 def find_existing_player(
     room: GameRoom,
     *,
@@ -2727,15 +2745,11 @@ def find_existing_player(
     name: str,
     student_number: str
 ) -> tuple[str | None, dict[str, Any] | None]:
-    name_lower = name.lower()
-    match_by_student = bool(student_number)
+    wanted = student_identity_key(student_number, name)
     for vid, player in room.players.items():
         if vid == visitor_id:
             continue
-        if match_by_student:
-            if player.get("student_number") == student_number:
-                return vid, player
-        elif player.get("name", "").lower() == name_lower:
+        if student_identity_key(player.get("student_number", ""), player.get("name", "")) == wanted:
             return vid, player
     return None, None
 
@@ -2985,7 +2999,7 @@ async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
     room.paused = False
 
     if keep_players:
-        for player in room.players.values():
+        for player in list(room.players.values()) + list(room.session_roster.values()):
             player["score"] = 0
             player["streak"] = 0
             player["answers"] = []
@@ -3003,6 +3017,7 @@ async def return_room_to_lobby(room: GameRoom, *, keep_players: bool) -> None:
             "activeTest": get_active_test_meta(room)
         })
         room.players = {}
+        room.session_roster = {}
 
     await send_to_host(room, {
         "type": "host_joined",
@@ -3108,6 +3123,7 @@ async def force_end_game(room: GameRoom) -> None:
         except Exception:
             pass
     room.players = {}
+    room.session_roster = {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3313,8 +3329,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     name=name,
                     student_number=student_number
                 )
+                student_key = student_identity_key(student_number, name)
+                # A student who has already taken part in this session is not a
+                # new player, even if their live record has gone (they left, or
+                # their browser identity changed after a reconnect). Without
+                # this they were told "the game is already in progress" and had
+                # no way back in.
+                roster_player = None
+                if existing_player is None and visitor_id not in room.players:
+                    roster_player = room.session_roster.get(student_key)
                 required_room_token = (room.current_token or "").strip().upper()
-                is_known_player = visitor_id in room.players or existing_player is not None
+                is_known_player = (
+                    visitor_id in room.players
+                    or existing_player is not None
+                    or roster_player is not None
+                )
                 # Reject on expired/invalid token only for players not already in the room.
                 # Known players (already mid-game) must always be allowed to reconnect.
                 if token and not subject_code_from_token and not is_known_player:
@@ -3372,6 +3401,18 @@ async def websocket_endpoint(websocket: WebSocket):
                         or provided_code == room.game_code
                     )
                     room.players[visitor_id] = existing_player
+                elif roster_player is not None:
+                    # Returning after their record left room.players. Reusing the
+                    # same record keeps their score and answers so far.
+                    roster_player["name"] = name
+                    roster_player["student_number"] = student_number
+                    roster_player["ws"] = websocket
+                    roster_player["game_code_verified"] = (
+                        is_participating_player(room, roster_player)
+                        or not room.game_code_enabled
+                        or provided_code == room.game_code
+                    )
+                    room.players[visitor_id] = roster_player
                 elif visitor_id in room.players:
                     room.players[visitor_id]["ws"] = websocket
                     room.players[visitor_id]["name"] = name
@@ -3391,6 +3432,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         "ws": websocket,
                         "game_code_verified": (not room.game_code_enabled or provided_code == room.game_code)
                     }
+                # Remember them for the rest of the session, whatever happens
+                # to their live connection from here on.
+                room.session_roster[student_key] = room.players[visitor_id]
                 await websocket.send_text(json.dumps(build_joined_payload(room, visitor_id)))
                 await push_room_update(room)
                 await sync_answer_count(room)
@@ -3540,10 +3584,10 @@ async def run_game_start(room: GameRoom, *, shuffle: bool, use_code: bool) -> No
         random.shuffle(room.questions)
     room.phase = "get_ready"
     room.current_q = 0
-    for vid in room.players:
-        room.players[vid]["score"] = 0
-        room.players[vid]["streak"] = 0
-        room.players[vid]["answers"] = []
+    for player in list(room.players.values()) + list(room.session_roster.values()):
+        player["score"] = 0
+        player["streak"] = 0
+        player["answers"] = []
     await broadcast_to_players(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q}, participant_only=True)
     await send_to_host(room, {"type": "get_ready", "qNum": 1, "totalQ": room.total_q})
     await asyncio.sleep(GET_READY_SECONDS)
